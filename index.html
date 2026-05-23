@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lite Editor</title>
+    <link rel="stylesheet" href="/src/styles/main.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="sidebar">
+        <div id="sidebar-header">
+          <span class="sidebar-title">Explorer</span>
+          <button id="btn-locate-file" title="Scroll to Source">⊕</button>
+        </div>
+        <div id="file-tree"></div>
+      </div>
+      <div id="main">
+        <div id="tabs-bar"></div>
+        <div id="editor-container"></div>
+      </div>
+      <div id="panel">
+        <div id="panel-tabs">
+          <button class="panel-tab active" data-panel="usages">Find Usages</button>
+          <button class="panel-tab" data-panel="maven">Maven</button>
+        </div>
+        <div id="panel-content">
+          <div id="usages-panel" class="panel-view active">
+            <div class="panel-placeholder">Select a symbol and press Shift+F12 to find usages</div>
+          </div>
+          <div id="maven-panel" class="panel-view">
+            <div id="maven-tree"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
