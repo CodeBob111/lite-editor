@@ -11,9 +11,16 @@
       <div id="sidebar">
         <div id="sidebar-header">
           <span class="sidebar-title">Explorer</span>
-          <button id="btn-locate-file" title="Scroll to Source">⊕</button>
+          <div class="sidebar-actions">
+            <button id="btn-open-folder" title="Open Folder">+</button>
+            <button id="btn-locate-file" title="Scroll to Source">&#8982;</button>
+          </div>
         </div>
-        <div id="file-tree"></div>
+        <div id="file-tree">
+          <div class="panel-placeholder" style="padding: 20px 12px;">
+            Click <strong>+</strong> to open a folder
+          </div>
+        </div>
       </div>
       <div id="main">
         <div id="tabs-bar"></div>
@@ -30,9 +37,13 @@
           </div>
           <div id="maven-panel" class="panel-view">
             <div id="maven-tree"></div>
+            <pre id="maven-output" class="maven-output-area"></pre>
           </div>
         </div>
       </div>
+    </div>
+    <div id="status-bar">
+      <span id="status-text">Ready</span>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

@@ -2,6 +2,7 @@ interface OpenTab {
   path: string;
   name: string;
   content: string;
+  dirty: boolean;
 }
 
 export class TabManager {
@@ -21,15 +22,34 @@ export class TabManager {
   openFile(path: string, content?: string) {
     const existing = this.tabs.findIndex((t) => t.path === path);
     if (existing >= 0) {
+      if (content !== undefined) {
+        this.tabs[existing].content = content;
+      }
       this.activateTab(existing);
       return;
     }
 
     const name = path.split("/").pop() || path;
-    const fileContent = content ?? `// Content of ${name}\n// (file loading via Tauri IPC - not yet connected)\n`;
+    const fileContent = content ?? "";
 
-    this.tabs.push({ path, name, content: fileContent });
+    this.tabs.push({ path, name, content: fileContent, dirty: false });
     this.activateTab(this.tabs.length - 1);
+  }
+
+  markSaved(path: string) {
+    const tab = this.tabs.find((t) => t.path === path);
+    if (tab) {
+      tab.dirty = false;
+      this.render();
+    }
+  }
+
+  markDirty(path: string) {
+    const tab = this.tabs.find((t) => t.path === path);
+    if (tab && !tab.dirty) {
+      tab.dirty = true;
+      this.render();
+    }
   }
 
   closeTab(index: number) {
@@ -67,7 +87,7 @@ export class TabManager {
       el.className = `tab${i === this.activeIndex ? " active" : ""}`;
 
       const label = document.createElement("span");
-      label.textContent = tab.name;
+      label.textContent = tab.dirty ? `● ${tab.name}` : tab.name;
       el.appendChild(label);
 
       const close = document.createElement("span");

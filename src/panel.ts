@@ -40,9 +40,13 @@ export class PanelManager {
   }
 
   showMavenModules(modules: { name: string; groupId: string; artifactId: string }[]) {
-    const panel = document.getElementById("maven-panel")!;
     const tree = document.getElementById("maven-tree")!;
     tree.innerHTML = "";
+
+    if (modules.length === 0) {
+      tree.innerHTML = '<div class="panel-placeholder">No Maven modules found</div>';
+      return;
+    }
 
     for (const mod of modules) {
       const el = document.createElement("div");
@@ -61,6 +65,13 @@ export class PanelManager {
       `;
       tree.appendChild(el);
     }
+  }
+
+  showMavenOutput(module: string, goal: string, output: string) {
+    this.switchTo("maven");
+    const outputEl = document.getElementById("maven-output")!;
+    outputEl.textContent = `=== mvn ${goal} (${module}) ===\n\n${output}`;
+    outputEl.scrollTop = outputEl.scrollHeight;
   }
 
   private switchTo(panelId: string) {

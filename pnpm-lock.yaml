@@ -38,13 +38,16 @@ importers:
       '@codemirror/view':
         specifier: ^6.35.0
         version: 6.43.0
+      '@tauri-apps/api':
+        specifier: ^2.0.0
+        version: 2.11.0
+      '@tauri-apps/plugin-dialog':
+        specifier: ^2.0.0
+        version: 2.7.1
       codemirror:
         specifier: ^6.0.0
         version: 6.0.2
     devDependencies:
-      '@tauri-apps/api':
-        specifier: ^2.0.0
-        version: 2.11.0
       '@tauri-apps/cli':
         specifier: ^2.0.0
         version: 2.11.2
@@ -466,6 +469,9 @@ packages:
     engines: {node: '>= 10'}
     hasBin: true
 
+  '@tauri-apps/plugin-dialog@2.7.1':
+    resolution: {integrity: sha512-OK1UBXYt+ojcmxMktzzuyonYIFta8CmAASpX+CA+DTGK24KlHjhYI6x2iOJ/TjZF4N7/ACK1oFmEOjIY9IhzOQ==}
+
   '@types/estree@1.0.8':
     resolution: {integrity: sha512-dWHzHa2WqEXI/O1E9OjrocMTKJl2mSrEolh1Iomrv6U+JuNwaHXsXx9bLu5gG7BUWFIN0skIQJQ/L1rIex4X6w==}
 
@@ -883,6 +889,10 @@ snapshots:
       '@tauri-apps/cli-win32-arm64-msvc': 2.11.2
       '@tauri-apps/cli-win32-ia32-msvc': 2.11.2
       '@tauri-apps/cli-win32-x64-msvc': 2.11.2
+
+  '@tauri-apps/plugin-dialog@2.7.1':
+    dependencies:
+      '@tauri-apps/api': 2.11.0
 
   '@types/estree@1.0.8': {}
 

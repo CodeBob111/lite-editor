@@ -30,7 +30,24 @@ html, body {
   display: grid;
   grid-template-columns: 260px 1fr;
   grid-template-rows: 1fr 200px;
-  height: 100vh;
+  height: calc(100vh - 24px);
+}
+
+/* Status bar */
+#status-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 24px;
+  background: var(--bg-tertiary);
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  font-size: 11px;
+  color: var(--text-muted);
+  z-index: 100;
 }
 
 /* Sidebar */
@@ -60,17 +77,23 @@ html, body {
   color: var(--text-secondary);
 }
 
-#btn-locate-file {
+.sidebar-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.sidebar-actions button {
   background: none;
   border: none;
   color: var(--text-secondary);
   cursor: pointer;
   font-size: 16px;
-  padding: 2px 4px;
+  padding: 2px 6px;
   border-radius: 4px;
+  line-height: 1;
 }
 
-#btn-locate-file:hover {
+.sidebar-actions button:hover {
   background: var(--hover);
   color: var(--accent);
 }
@@ -320,6 +343,20 @@ html, body {
 .maven-action:hover {
   background: var(--hover);
   color: var(--text-primary);
+}
+
+.maven-output-area {
+  margin: 8px;
+  padding: 8px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-y: auto;
+  max-height: 120px;
 }
 
 /* Scrollbar */
