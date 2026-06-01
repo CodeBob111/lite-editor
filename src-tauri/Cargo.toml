@@ -23,4 +23,11 @@ serde_json = "1"
 walkdir = "2"
 quick-xml = "0.36"
 tokio = { version = "1", features = ["full"] }
-lsp-types = "0.97"
+notify = "6"
+rayon = "1"
+portable-pty = "0.8"
+libc = "0.2"
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+md-5 = "0.10"
+hex = "0.4"
+dirs = "5"

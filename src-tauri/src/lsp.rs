@@ -1,27 +1,38 @@
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
-use std::process::{ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::Mutex;
-use tauri::State;
-
-// ---- Public state ----
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+use tauri::{Emitter, State};
 
 #[derive(Default)]
 pub struct LspState {
-    servers: Mutex<HashMap<String, LspServer>>,
+    servers: Mutex<HashMap<(String, String), Arc<LspServer>>>,
+}
+
+impl Drop for LspState {
+    fn drop(&mut self) {
+        if let Ok(mut servers) = self.servers.lock() {
+            for (_, server) in servers.drain() {
+                if let Ok(mut process) = server.process.lock() {
+                    let _ = process.kill();
+                }
+            }
+        }
+    }
 }
 
 struct LspServer {
-    stdin: Mutex<ChildStdin>,
-    stdout: Mutex<BufReader<ChildStdout>>,
+    stdin: Arc<Mutex<std::io::BufWriter<ChildStdin>>>,
+    response_rx: Mutex<mpsc::Receiver<serde_json::Value>>,
     next_id: AtomicI64,
     #[allow(dead_code)]
     root_uri: String,
+    process: Mutex<Child>,
+    ready: Arc<AtomicBool>,
 }
-
-// ---- Tauri commands ----
 
 #[derive(Serialize, Clone)]
 pub struct LspUsage {
@@ -31,46 +42,261 @@ pub struct LspUsage {
     text: String,
 }
 
+// ---- Tauri commands ----
+
 #[tauri::command]
-pub fn start_lsp(
+pub async fn start_lsp(
     language: String,
     root_path: String,
+    app: tauri::AppHandle,
     state: State<'_, LspState>,
 ) -> Result<(), String> {
-    let mut servers = state.servers.lock().map_err(|e| e.to_string())?;
+    let key = (language.clone(), root_path.clone());
 
-    if servers.contains_key(&language) {
-        return Ok(());
+    {
+        let mut servers = state.servers.lock().map_err(|e| e.to_string())?;
+
+        if let Some(server) = servers.get(&key) {
+            let mut process = server.process.lock().map_err(|e| e.to_string())?;
+            if let Ok(None) = process.try_wait() {
+                return Ok(());
+            }
+            drop(process);
+        }
+        servers.remove(&key);
     }
 
-    let (cmd, args): (&str, Vec<&str>) = match language.as_str() {
-        "python" => ("pyright-langserver", vec!["--stdio"]),
-        "typescript" | "javascript" => ("typescript-language-server", vec!["--stdio"]),
-        "java" => ("jdtls", vec![]),
+    let lang = language.clone();
+    let rp = root_path.clone();
+    let app_handle = app.clone();
+    let server = tokio::task::spawn_blocking(move || {
+        start_lsp_blocking(lang, rp, app_handle)
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
+
+    let mut servers = state.servers.lock().map_err(|e| e.to_string())?;
+    servers.insert(key, Arc::new(server));
+    Ok(())
+}
+
+fn start_lsp_blocking(
+    language: String,
+    root_path: String,
+    app: tauri::AppHandle,
+) -> Result<LspServer, String> {
+    let jdtls_data_dir;
+    let (cmd, args): (&str, Vec<String>) = match language.as_str() {
+        "python" => ("pyright-langserver", vec!["--stdio".into()]),
+        "typescript" | "javascript" => ("typescript-language-server", vec!["--stdio".into()]),
+        "java" => {
+            let hash = root_path.replace('/', "_");
+            jdtls_data_dir = format!(
+                "{}/Library/Caches/lite-editor/jdtls/{}",
+                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
+                hash
+            );
+            let _ = std::fs::create_dir_all(&jdtls_data_dir);
+            ("jdtls", vec![
+                "--jvm-arg=-Xmx1536m".into(),
+                "-data".into(),
+                jdtls_data_dir.clone(),
+            ])
+        }
         _ => return Err(format!("Unsupported language: {}", language)),
     };
 
-    let mut process = Command::new(cmd)
+    let mut command = Command::new(cmd);
+    command
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to start {} ({}): {}. Is it installed?", cmd, language, e))?;
+        .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    if language == "java" {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                Ok(())
+            });
+        }
+    }
+
+    let mut process = command.spawn().map_err(|e| {
+        format!(
+            "Failed to start {} ({}): {}. Is it installed?",
+            cmd, language, e
+        )
+    })?;
 
     let stdin = process.stdin.take().ok_or("Failed to capture LSP stdin")?;
-    let stdout = process.stdout.take().ok_or("Failed to capture LSP stdout")?;
+    let stdout = process
+        .stdout
+        .take()
+        .ok_or("Failed to capture LSP stdout")?;
+
+    if let Some(stderr) = process.stderr.take() {
+        let lang_for_log = language.clone();
+        std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            let log_path = format!("/tmp/{}-stderr.log", lang_for_log);
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                use std::io::Write;
+                for line in reader.lines() {
+                    if let Ok(line) = line {
+                        let _ = writeln!(file, "{}", line);
+                    }
+                }
+            }
+        });
+    }
 
     let root_uri = format!("file://{}", root_path);
 
+    let (tx, rx) = mpsc::channel::<serde_json::Value>();
+
+    let ready_flag = Arc::new(AtomicBool::new(false));
+    let ready_clone = ready_flag.clone();
+    let lang_clone = language.clone();
+    let app_handle = app.clone();
+    let stdin_for_reader = Arc::new(Mutex::new(std::io::BufWriter::new(stdin)));
+    let stdin_for_server = stdin_for_reader.clone();
+
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_next_message(&mut reader) {
+                Ok(msg) => {
+                    let has_id = msg.get("id").is_some();
+                    let method = msg.get("method").and_then(|m| m.as_str()).map(String::from);
+
+                    if has_id && method.is_some() {
+                        if let Some(id) = msg.get("id") {
+                            let method_str = method.as_deref().unwrap_or("");
+                            let result = match method_str {
+                                "workspace/configuration" => {
+                                    let items_arr = msg
+                                        .get("params")
+                                        .and_then(|p| p.get("items"))
+                                        .and_then(|i| i.as_array());
+                                    let home =
+                                        std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                                    let maven_settings = format!("{}/.m2/settings.xml", home);
+                                    let java_settings = serde_json::json!({
+                                        "import": {
+                                            "maven": { "enabled": true },
+                                            "gradle": { "enabled": true }
+                                        },
+                                        "autobuild": { "enabled": true },
+                                        "configuration": {
+                                            "updateBuildConfiguration": "automatic",
+                                            "maven": {
+                                                "userSettings": maven_settings
+                                            }
+                                        },
+                                        "maven": {
+                                            "downloadSources": true
+                                        },
+                                        "referencesCodeLens": { "enabled": false },
+                                        "implementationsCodeLens": { "enabled": false }
+                                    });
+                                    let items: Vec<serde_json::Value> = if let Some(arr) = items_arr
+                                    {
+                                        arr.iter()
+                                            .map(|item| {
+                                                let section = item
+                                                    .get("section")
+                                                    .and_then(|s| s.as_str())
+                                                    .unwrap_or("");
+                                                if section == "java" || section.starts_with("java.")
+                                                {
+                                                    java_settings.clone()
+                                                } else {
+                                                    serde_json::json!({})
+                                                }
+                                            })
+                                            .collect()
+                                    } else {
+                                        vec![java_settings]
+                                    };
+                                    serde_json::Value::Array(items)
+                                }
+                                _ => serde_json::Value::Null,
+                            };
+                            let resp = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": result
+                            });
+                            let body = serde_json::to_string(&resp).unwrap_or_default();
+                            let header = format!("Content-Length: {}\r\n\r\n", body.len());
+                            if let Ok(mut w) = stdin_for_reader.lock() {
+                                use std::io::Write;
+                                let _ = w.write_all(header.as_bytes());
+                                let _ = w.write_all(body.as_bytes());
+                                let _ = w.flush();
+                            }
+                        }
+                    } else if has_id {
+                        if tx.send(msg).is_err() {
+                            break;
+                        }
+                    } else if let Some(method) = method {
+                        match method.as_str() {
+                            "textDocument/publishDiagnostics" => {
+                                if let Some(params) = msg.get("params") {
+                                    let _ = app_handle.emit("lsp-diagnostics", params.clone());
+                                }
+                            }
+                            "$/progress" => {
+                                if let Some(params) = msg.get("params") {
+                                    let value = params.get("value").cloned().unwrap_or_default();
+                                    let kind =
+                                        value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                                    let message =
+                                        value.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                                    let percentage =
+                                        value.get("percentage").and_then(|p| p.as_u64());
+
+                                    let _ = app_handle.emit(
+                                        "lsp-progress",
+                                        serde_json::json!({
+                                            "language": lang_clone,
+                                            "kind": kind,
+                                            "message": message,
+                                            "percentage": percentage,
+                                        }),
+                                    );
+
+                                    if kind == "end" {
+                                        ready_clone.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
     let server = LspServer {
-        stdin: Mutex::new(stdin),
-        stdout: Mutex::new(BufReader::new(stdout)),
-        next_id: AtomicI64::new(2), // 1 used for initialize
+        stdin: stdin_for_server,
+        response_rx: Mutex::new(rx),
+        next_id: AtomicI64::new(2),
         root_uri: root_uri.clone(),
+        process: Mutex::new(process),
+        ready: ready_flag,
     };
 
-    // Send initialize request
     let init_params = serde_json::json!({
         "processId": std::process::id(),
         "rootUri": root_uri,
@@ -78,39 +304,105 @@ pub fn start_lsp(
             "textDocument": {
                 "references": { "dynamicRegistration": false },
                 "definition": { "dynamicRegistration": false },
+                "publishDiagnostics": { "relatedInformation": false },
                 "synchronization": {
                     "didSave": true,
                     "willSave": false,
                     "willSaveWaitUntil": false
                 }
+            },
+            "workspace": {
+                "configuration": true,
+                "didChangeConfiguration": { "dynamicRegistration": true },
+                "workspaceFolders": true
+            },
+            "window": {
+                "workDoneProgress": true
             }
         },
-        "workspaceFolders": [{
-            "uri": root_uri,
-            "name": root_path.split('/').last().unwrap_or("project")
-        }]
+        "initializationOptions": if language == "java" {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+            let maven_settings = format!("{}/.m2/settings.xml", home);
+            serde_json::json!({
+                "settings": {
+                    "java": {
+                        "import": {
+                            "maven": { "enabled": true },
+                            "gradle": { "enabled": true }
+                        },
+                        "autobuild": { "enabled": true },
+                        "configuration": {
+                            "updateBuildConfiguration": "automatic",
+                            "maven": {
+                                "userSettings": maven_settings
+                            }
+                        },
+                        "maven": {
+                            "downloadSources": true
+                        }
+                    }
+                }
+            })
+        } else {
+            serde_json::json!({})
+        },
+        "workspaceFolders": build_workspace_folders(&root_path, &root_uri)
     });
 
-    send_request(&server, 1, "initialize", init_params)?;
-    let _init_result = read_response(&server)?;
-
-    // Send initialized notification
+    let _init_result = request_and_wait(
+        &server,
+        1,
+        "initialize",
+        init_params,
+        Duration::from_secs(30),
+    )?;
     send_notification(&server, "initialized", serde_json::json!({}))?;
 
-    servers.insert(language, server);
+    if language != "java" {
+        server.ready.store(true, Ordering::Relaxed);
+    }
+
+    Ok(server)
+}
+
+#[tauri::command]
+pub fn stop_lsp(
+    language: String,
+    root_path: String,
+    state: State<'_, LspState>,
+) -> Result<(), String> {
+    let server = {
+        let mut servers = state.servers.lock().map_err(|e| e.to_string())?;
+        servers.remove(&(language, root_path))
+    };
+    if let Some(server) = server {
+        let id = server.next_id.fetch_add(1, Ordering::Relaxed);
+        let _ = request_and_wait(
+            &server,
+            id,
+            "shutdown",
+            serde_json::Value::Null,
+            Duration::from_secs(3),
+        );
+        let _ = send_notification(&server, "exit", serde_json::Value::Null);
+        if let Ok(mut proc) = server.process.lock() {
+            let _ = proc.kill();
+        }
+    }
     Ok(())
 }
 
 #[tauri::command]
-pub fn stop_lsp(language: String, state: State<'_, LspState>) -> Result<(), String> {
-    let mut servers = state.servers.lock().map_err(|e| e.to_string())?;
-    if let Some(server) = servers.remove(&language) {
-        let id = server.next_id.fetch_add(1, Ordering::Relaxed);
-        let _ = send_request(&server, id, "shutdown", serde_json::Value::Null);
-        let _ = send_notification(&server, "exit", serde_json::Value::Null);
-        // stdin/stdout drop here, process will be cleaned up
-    }
-    Ok(())
+pub fn lsp_is_ready(file_path: String, state: State<'_, LspState>) -> Result<bool, String> {
+    let lang = detect_language(&file_path);
+    let server = {
+        let servers = state.servers.lock().map_err(|e| e.to_string())?;
+        match find_server_for_file(&servers, &file_path, &lang) {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        }
+    };
+    Ok(server.ready.load(Ordering::Relaxed))
 }
 
 #[tauri::command]
@@ -120,8 +412,10 @@ pub fn lsp_did_open(
     content: String,
     state: State<'_, LspState>,
 ) -> Result<(), String> {
-    let servers = state.servers.lock().map_err(|e| e.to_string())?;
-    let server = find_server(&servers, &language_id)?;
+    let server = {
+        let servers = state.servers.lock().map_err(|e| e.to_string())?;
+        find_server_for_file(&servers, &file_path, &language_id)?
+    };
 
     let params = serde_json::json!({
         "textDocument": {
@@ -132,7 +426,7 @@ pub fn lsp_did_open(
         }
     });
 
-    send_notification(server, "textDocument/didOpen", params)
+    send_notification(&server, "textDocument/didOpen", params)
 }
 
 #[tauri::command]
@@ -141,11 +435,13 @@ pub fn lsp_did_change(
     content: String,
     state: State<'_, LspState>,
 ) -> Result<(), String> {
-    let servers = state.servers.lock().map_err(|e| e.to_string())?;
     let lang = detect_language(&file_path);
-    let server = match find_server(&servers, &lang) {
-        Ok(s) => s,
-        Err(_) => return Ok(()), // No server for this language, silently skip
+    let server = {
+        let servers = state.servers.lock().map_err(|e| e.to_string())?;
+        match find_server_for_file(&servers, &file_path, &lang) {
+            Ok(s) => s,
+            Err(_) => return Ok(()),
+        }
     };
 
     let params = serde_json::json!({
@@ -155,19 +451,21 @@ pub fn lsp_did_change(
         },
         "contentChanges": [{ "text": content }]
     });
-    send_notification(server, "textDocument/didChange", params)
+    send_notification(&server, "textDocument/didChange", params)
 }
 
 #[tauri::command]
-pub fn lsp_find_references(
+pub async fn lsp_find_references(
     file_path: String,
     line: u32,
     character: u32,
     state: State<'_, LspState>,
 ) -> Result<Vec<LspUsage>, String> {
-    let servers = state.servers.lock().map_err(|e| e.to_string())?;
     let lang = detect_language(&file_path);
-    let server = find_server(&servers, &lang)?;
+    let server = {
+        let servers = state.servers.lock().map_err(|e| e.to_string())?;
+        find_server_for_file(&servers, &file_path, &lang)?
+    };
 
     let id = server.next_id.fetch_add(1, Ordering::Relaxed);
     let params = serde_json::json!({
@@ -176,22 +474,29 @@ pub fn lsp_find_references(
         "context": { "includeDeclaration": true }
     });
 
-    send_request(server, id, "textDocument/references", params)?;
-    let response = read_response(server)?;
-
+    let response = request_and_wait_on_worker(
+        server,
+        id,
+        "textDocument/references",
+        params,
+        Duration::from_secs(8),
+    )
+    .await?;
     parse_locations(response)
 }
 
 #[tauri::command]
-pub fn lsp_goto_definition(
+pub async fn lsp_goto_definition(
     file_path: String,
     line: u32,
     character: u32,
     state: State<'_, LspState>,
 ) -> Result<Option<LspUsage>, String> {
-    let servers = state.servers.lock().map_err(|e| e.to_string())?;
     let lang = detect_language(&file_path);
-    let server = find_server(&servers, &lang)?;
+    let server = {
+        let servers = state.servers.lock().map_err(|e| e.to_string())?;
+        find_server_for_file(&servers, &file_path, &lang)?
+    };
 
     let id = server.next_id.fetch_add(1, Ordering::Relaxed);
     let params = serde_json::json!({
@@ -199,28 +504,85 @@ pub fn lsp_goto_definition(
         "position": { "line": line, "character": character }
     });
 
-    send_request(server, id, "textDocument/definition", params)?;
-    let response = read_response(server)?;
-
+    let response = request_and_wait_on_worker(
+        server,
+        id,
+        "textDocument/definition",
+        params,
+        Duration::from_secs(5),
+    )
+    .await?;
     let locations = parse_locations(response)?;
     Ok(locations.into_iter().next())
 }
 
 // ---- Internals ----
 
-fn find_server<'a>(
-    servers: &'a HashMap<String, LspServer>,
+fn build_workspace_folders(root_path: &str, root_uri: &str) -> serde_json::Value {
+    let root = std::path::Path::new(root_path);
+    let has_root_pom = root.join("pom.xml").exists() || root.join("build.gradle").exists();
+    if has_root_pom {
+        return serde_json::json!([{
+            "uri": root_uri,
+            "name": root.file_name().and_then(|n| n.to_str()).unwrap_or("project")
+        }]);
+    }
+    let mut folders = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir()
+                && (path.join("pom.xml").exists() || path.join("build.gradle").exists())
+            {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("project");
+                let uri = format!("file://{}", path.display());
+                folders.push(serde_json::json!({ "uri": uri, "name": name }));
+            }
+        }
+    }
+    if folders.is_empty() {
+        serde_json::json!([{
+            "uri": root_uri,
+            "name": root.file_name().and_then(|n| n.to_str()).unwrap_or("project")
+        }])
+    } else {
+        serde_json::Value::Array(folders)
+    }
+}
+
+fn find_server_for_file(
+    servers: &HashMap<(String, String), Arc<LspServer>>,
+    file_path: &str,
     language: &str,
-) -> Result<&'a LspServer, String> {
-    let key = match language {
+) -> Result<Arc<LspServer>, String> {
+    let key_lang = match language {
         "python" | "py" => "python",
         "typescript" | "ts" | "tsx" | "javascript" | "js" | "jsx" => "typescript",
         "java" => "java",
         other => other,
     };
-    servers
-        .get(key)
-        .ok_or_else(|| format!("No LSP server running for '{}'. Start one first.", key))
+
+    for ((lang, root), server) in servers.iter() {
+        if lang == key_lang {
+            let root_path = root.as_str();
+            if file_path.starts_with(root_path) {
+                if let Ok(mut proc) = server.process.lock() {
+                    if let Ok(Some(_)) = proc.try_wait() {
+                        continue;
+                    }
+                }
+                return Ok(Arc::clone(server));
+            }
+        }
+    }
+
+    Err(format!(
+        "No LSP server running for '{}' in project containing '{}'",
+        key_lang, file_path
+    ))
 }
 
 fn detect_language(path: &str) -> String {
@@ -237,7 +599,12 @@ fn detect_language(path: &str) -> String {
     }
 }
 
-fn send_request(server: &LspServer, id: i64, method: &str, params: serde_json::Value) -> Result<(), String> {
+fn send_request(
+    server: &LspServer,
+    id: i64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<(), String> {
     let msg = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -247,7 +614,11 @@ fn send_request(server: &LspServer, id: i64, method: &str, params: serde_json::V
     send_message(server, &msg)
 }
 
-fn send_notification(server: &LspServer, method: &str, params: serde_json::Value) -> Result<(), String> {
+fn send_notification(
+    server: &LspServer,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<(), String> {
     let msg = serde_json::json!({
         "jsonrpc": "2.0",
         "method": method,
@@ -260,67 +631,108 @@ fn send_message(server: &LspServer, msg: &serde_json::Value) -> Result<(), Strin
     let body = serde_json::to_string(msg).map_err(|e| e.to_string())?;
     let header = format!("Content-Length: {}\r\n\r\n", body.len());
 
-    let mut stdin = server.stdin.lock().map_err(|e| e.to_string())?;
-    stdin
+    let mut writer = server.stdin.lock().map_err(|e| e.to_string())?;
+    writer
         .write_all(header.as_bytes())
         .map_err(|e| format!("Failed to write to LSP stdin: {}", e))?;
-    stdin
+    writer
         .write_all(body.as_bytes())
         .map_err(|e| format!("Failed to write to LSP stdin: {}", e))?;
-    stdin
+    writer
         .flush()
         .map_err(|e| format!("Failed to flush LSP stdin: {}", e))?;
     Ok(())
 }
 
-fn read_response(server: &LspServer) -> Result<serde_json::Value, String> {
-    let mut reader = server.stdout.lock().map_err(|e| e.to_string())?;
-
-    // Loop to skip server-initiated notifications (they lack "id")
+fn read_next_message(reader: &mut BufReader<ChildStdout>) -> Result<serde_json::Value, String> {
+    let mut content_length: usize = 0;
     loop {
-        // Read headers
-        let mut content_length: usize = 0;
-        loop {
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .map_err(|e| format!("Failed to read LSP header: {}", e))?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                break;
-            }
-            if let Some(len_str) = trimmed.strip_prefix("Content-Length: ") {
-                content_length = len_str
-                    .parse()
-                    .map_err(|e| format!("Invalid Content-Length: {}", e))?;
-            }
+        let mut line = String::new();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("Failed to read LSP header: {}", e))?;
+        if bytes_read == 0 {
+            return Err("LSP stdout closed".into());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(len_str) = trimmed.strip_prefix("Content-Length: ") {
+            content_length = len_str
+                .parse()
+                .map_err(|e| format!("Invalid Content-Length: {}", e))?;
+        }
+    }
+
+    if content_length == 0 {
+        return Err("Missing Content-Length header".into());
+    }
+
+    let mut body = vec![0u8; content_length];
+    reader
+        .read_exact(&mut body)
+        .map_err(|e| format!("Failed to read LSP body: {}", e))?;
+
+    serde_json::from_slice(&body).map_err(|e| format!("Invalid JSON from LSP: {}", e))
+}
+
+fn request_and_wait(
+    server: &LspServer,
+    id: i64,
+    method: &str,
+    params: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let rx = server.response_rx.lock().map_err(|e| e.to_string())?;
+
+    // Drain stale responses left by previous timed-out requests
+    while rx.try_recv().is_ok() {}
+
+    send_request(server, id, method, params)?;
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "LSP {} timed out, please try again in a moment",
+                method
+            ));
         }
 
-        if content_length == 0 {
-            return Err("Missing Content-Length header in LSP response".into());
+        let response = rx
+            .recv_timeout(remaining)
+            .map_err(|_| format!("LSP {} timed out, please try again in a moment", method))?;
+
+        let resp_id = response.get("id").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if resp_id != id {
+            continue; // skip stale response from a previous request
         }
 
-        // Read body
-        let mut body = vec![0u8; content_length];
-        reader
-            .read_exact(&mut body)
-            .map_err(|e| format!("Failed to read LSP body: {}", e))?;
-
-        let response: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|e| format!("Invalid JSON from LSP: {}", e))?;
-
-        // Skip notifications (no "id" field) — keep reading
-        if response.get("id").is_none() {
-            continue;
-        }
-
-        // Check for error
         if let Some(error) = response.get("error") {
             return Err(format!("LSP error: {}", error));
         }
 
-        return Ok(response.get("result").cloned().unwrap_or(serde_json::Value::Null));
+        return Ok(response
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null));
     }
+}
+
+async fn request_and_wait_on_worker(
+    server: Arc<LspServer>,
+    id: i64,
+    method: &'static str,
+    params: serde_json::Value,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        request_and_wait(&server, id, method, params, timeout)
+    })
+    .await
+    .map_err(|e| format!("LSP worker failed: {}", e))?
 }
 
 fn parse_locations(result: serde_json::Value) -> Result<Vec<LspUsage>, String> {
@@ -342,12 +754,8 @@ fn parse_locations(result: serde_json::Value) -> Result<Vec<LspUsage>, String> {
         let range = loc.get("range").cloned().unwrap_or_default();
         let start = range.get("start").cloned().unwrap_or_default();
         let line = start.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let character = start
-            .get("character")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        let character = start.get("character").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-        // Try to read the source line for context
         let file_path = uri.strip_prefix("file://").unwrap_or(&uri);
         let text = read_source_line(file_path, line);
 
@@ -372,4 +780,232 @@ fn read_source_line(path: &str, line: u32) -> String {
                 .map(|s| s.trim().to_string())
         })
         .unwrap_or_default()
+}
+
+#[derive(Serialize)]
+pub struct DecompiledClass {
+    pub path: String,
+    pub content: String,
+}
+
+#[tauri::command]
+pub async fn find_class_in_maven(fqn: String) -> Result<Option<DecompiledClass>, String> {
+    tokio::task::spawn_blocking(move || find_class_in_maven_blocking(&fqn))
+        .await
+        .map_err(|e| format!("Task failed: {}", e))?
+}
+
+fn find_class_in_maven_blocking(fqn: &str) -> Result<Option<DecompiledClass>, String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let m2_repo = format!("{}/.m2/repository", home);
+    let class_path = fqn.replace('.', "/") + ".class";
+
+    let source_jar = find_source_jar(&m2_repo, &class_path);
+    if let Some(jar_path) = &source_jar {
+        let java_path = fqn.replace('.', "/") + ".java";
+        if let Ok(content) = extract_from_jar(jar_path, &java_path) {
+            let cache_dir = format!("{}/Library/Caches/lite-editor/decompiled", home);
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let file_name = fqn.split('.').last().unwrap_or("Unknown");
+            let cache_path = format!("{}/{}.java", cache_dir, file_name);
+            let _ = std::fs::write(&cache_path, &content);
+            return Ok(Some(DecompiledClass {
+                path: cache_path,
+                content,
+            }));
+        }
+    }
+
+    let class_jar = find_class_jar(&m2_repo, &class_path);
+    if let Some(jar_path) = class_jar {
+        if let Ok(content) = decompile_class(&jar_path, fqn) {
+            let cache_dir = format!("{}/Library/Caches/lite-editor/decompiled", home);
+            let _ = std::fs::create_dir_all(&cache_dir);
+            let file_name = fqn.split('.').last().unwrap_or("Unknown");
+            let cache_path = format!("{}/{}.java", cache_dir, file_name);
+            let _ = std::fs::write(&cache_path, &content);
+            return Ok(Some(DecompiledClass {
+                path: cache_path,
+                content,
+            }));
+        }
+    }
+
+    if let Some(content) = find_class_in_jdk_src(fqn) {
+        let cache_dir = format!("{}/Library/Caches/lite-editor/decompiled", home);
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let file_name = fqn.split('.').last().unwrap_or("Unknown");
+        let cache_path = format!("{}/{}.java", cache_dir, file_name);
+        let _ = std::fs::write(&cache_path, &content);
+        return Ok(Some(DecompiledClass {
+            path: cache_path,
+            content,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn find_java_home() -> Option<String> {
+    if let Ok(home) = std::env::var("JAVA_HOME") {
+        if !home.is_empty() {
+            return Some(home);
+        }
+    }
+    let output = Command::new("/usr/libexec/java_home").output().ok()?;
+    if output.status.success() {
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !s.is_empty() { Some(s) } else { None }
+    } else {
+        None
+    }
+}
+
+fn find_class_in_jdk_src(fqn: &str) -> Option<String> {
+    let java_home = find_java_home()?;
+    let src_zip = format!("{}/lib/src.zip", java_home);
+    if !std::path::Path::new(&src_zip).exists() {
+        return None;
+    }
+    let java_path = fqn.replace('.', "/") + ".java";
+    let pattern = format!("*/{}", java_path);
+    let output = Command::new("unzip")
+        .args(["-p", &src_zip, &pattern])
+        .output()
+        .ok()?;
+    if output.status.success() && !output.stdout.is_empty() {
+        return Some(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    let output = Command::new("unzip")
+        .args(["-p", &src_zip, &java_path])
+        .output()
+        .ok()?;
+    if output.status.success() && !output.stdout.is_empty() {
+        Some(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        None
+    }
+}
+
+fn find_source_jar(m2_repo: &str, class_path: &str) -> Option<String> {
+    let parts: Vec<&str> = class_path.rsplitn(2, '/').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let package_dir = parts[1];
+    let package_parts: Vec<&str> = package_dir.split('/').collect();
+
+    for depth in (2..=package_parts.len().min(5)).rev() {
+        let group_path = package_parts[..depth].join("/");
+        let search_dir = format!("{}/{}", m2_repo, group_path);
+        if let Ok(entries) = std::fs::read_dir(&search_dir) {
+            for entry in entries.flatten() {
+                let artifact_dir = entry.path();
+                if !artifact_dir.is_dir() {
+                    continue;
+                }
+                if let Ok(versions) = std::fs::read_dir(&artifact_dir) {
+                    for ver in versions.flatten() {
+                        let ver_dir = ver.path();
+                        if !ver_dir.is_dir() {
+                            continue;
+                        }
+                        if let Ok(files) = std::fs::read_dir(&ver_dir) {
+                            for file in files.flatten() {
+                                let name = file.file_name().to_string_lossy().to_string();
+                                if name.ends_with("-sources.jar") {
+                                    let jar_path = file.path().to_string_lossy().to_string();
+                                    let java_path = class_path.replace(".class", ".java");
+                                    if jar_contains(&jar_path, &java_path) {
+                                        return Some(jar_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_class_jar(m2_repo: &str, class_path: &str) -> Option<String> {
+    let parts: Vec<&str> = class_path.rsplitn(2, '/').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let package_dir = parts[1];
+    let package_parts: Vec<&str> = package_dir.split('/').collect();
+
+    for depth in (2..=package_parts.len().min(5)).rev() {
+        let group_path = package_parts[..depth].join("/");
+        let search_dir = format!("{}/{}", m2_repo, group_path);
+        if let Ok(entries) = std::fs::read_dir(&search_dir) {
+            for entry in entries.flatten() {
+                let artifact_dir = entry.path();
+                if !artifact_dir.is_dir() {
+                    continue;
+                }
+                if let Ok(versions) = std::fs::read_dir(&artifact_dir) {
+                    for ver in versions.flatten() {
+                        let ver_dir = ver.path();
+                        if !ver_dir.is_dir() {
+                            continue;
+                        }
+                        if let Ok(files) = std::fs::read_dir(&ver_dir) {
+                            for file in files.flatten() {
+                                let name = file.file_name().to_string_lossy().to_string();
+                                if name.ends_with(".jar")
+                                    && !name.ends_with("-sources.jar")
+                                    && !name.ends_with("-javadoc.jar")
+                                {
+                                    let jar_path = file.path().to_string_lossy().to_string();
+                                    if jar_contains(&jar_path, class_path) {
+                                        return Some(jar_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn jar_contains(jar_path: &str, entry_path: &str) -> bool {
+    let output = Command::new("jar").args(["tf", jar_path]).output();
+    match output {
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            stdout.lines().any(|l| l == entry_path)
+        }
+        Err(_) => false,
+    }
+}
+
+fn extract_from_jar(jar_path: &str, entry_path: &str) -> Result<String, String> {
+    let output = Command::new("unzip")
+        .args(["-p", jar_path, entry_path])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err("Failed to extract from jar".into())
+    }
+}
+
+fn decompile_class(jar_path: &str, fqn: &str) -> Result<String, String> {
+    let output = Command::new("javap")
+        .args(["-p", "-c", "-cp", jar_path, fqn])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
 }

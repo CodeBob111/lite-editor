@@ -7,43 +7,251 @@
     <link rel="stylesheet" href="/src/styles/main.css" />
   </head>
   <body>
+    <!-- Project tabs bar (like IDEA) -->
+    <div id="project-bar">
+      <div id="project-bar-tabs"></div>
+    </div>
+
     <div id="app">
       <div id="sidebar">
         <div id="sidebar-header">
           <span class="sidebar-title">Explorer</span>
           <div class="sidebar-actions">
-            <button id="btn-open-folder" title="Open Folder">+</button>
             <button id="btn-locate-file" title="Scroll to Source">&#8982;</button>
           </div>
         </div>
-        <div id="file-tree">
-          <div class="panel-placeholder" style="padding: 20px 12px;">
-            Click <strong>+</strong> to open a folder
+        <div id="file-tree"></div>
+      </div>
+      <div id="resize-handle-sidebar" class="resize-handle-v"></div>
+      <div id="main">
+        <div id="tabs-header">
+          <div id="tabs-bar"></div>
+          <div id="tabs-actions">
+            <button id="btn-md-preview" class="tabs-action-btn hidden" title="Preview Markdown">&#9776;</button>
           </div>
         </div>
+        <div id="editor-area">
+          <div id="editor-container"></div>
+          <div id="md-split-handle"></div>
+          <div id="md-preview"></div>
+          <div id="dep-analyzer" style="display:none">
+            <div id="dep-analyzer-toolbar"></div>
+            <div id="dep-analyzer-content"></div>
+          </div>
+        </div>
+        <div id="editor-sub-tabs" style="display:none">
+          <button class="editor-sub-tab active" data-sub="text">Text</button>
+          <button class="editor-sub-tab" data-sub="dep">Dependency Analyzer</button>
+        </div>
+        <div id="diff-wrapper" class="hidden">
+          <div id="diff-header">
+            <span id="diff-title"></span>
+            <button id="diff-close" title="Close Diff">&times;</button>
+          </div>
+          <div id="diff-container"></div>
+        </div>
       </div>
-      <div id="main">
-        <div id="tabs-bar"></div>
-        <div id="editor-container"></div>
+      <div id="resize-handle-astore" class="resize-handle-v"></div>
+      <div id="astore-sidebar">
+        <div id="astore-sidebar-header">
+          <span class="sidebar-title">Astore</span>
+        </div>
+        <div id="astore-panel-content"></div>
       </div>
+      <div id="resize-handle-panel" class="resize-handle-h"></div>
       <div id="panel">
         <div id="panel-tabs">
-          <button class="panel-tab active" data-panel="usages">Find Usages</button>
-          <button class="panel-tab" data-panel="maven">Maven</button>
+          <button class="panel-tab" data-panel="terminal">Terminal</button>
+          <button class="panel-tab" data-panel="git">Git</button>
+          <button class="panel-tab" data-panel="changes">Changes</button>
+          <button class="panel-tab" data-panel="astore-msg">Astore Message</button>
+          <button class="panel-tab active" data-panel="maven">Maven</button>
         </div>
         <div id="panel-content">
-          <div id="usages-panel" class="panel-view active">
-            <div class="panel-placeholder">Select a symbol and press Shift+F12 to find usages</div>
+          <div id="terminal-panel" class="panel-view">
+            <div id="terminal-tab-bar">
+              <div id="terminal-tabs"></div>
+              <button id="terminal-add" class="terminal-add-btn" title="New Terminal">+</button>
+            </div>
+            <div id="terminal-container"></div>
           </div>
-          <div id="maven-panel" class="panel-view">
+          <div id="git-panel" class="panel-view">
+            <div id="git-toolbar">
+              <button id="git-refresh" class="maven-toolbar-btn" title="Refresh">&#x21bb;</button>
+              <span id="git-log-title"></span>
+            </div>
+            <div id="git-content">
+              <div id="git-branches"></div>
+              <div id="git-log"></div>
+            </div>
+          </div>
+          <div id="changes-panel" class="panel-view">
+            <div id="changes-toolbar">
+              <button id="changes-refresh" class="maven-toolbar-btn" title="Refresh">&#x21bb;</button>
+              <span id="changes-selected-count"></span>
+            </div>
+            <div id="changes-list"></div>
+            <div id="changes-commit-area">
+              <textarea id="changes-commit-msg" placeholder="Commit message" rows="3"></textarea>
+              <div id="changes-commit-buttons">
+                <button id="changes-btn-commit" class="changes-btn" disabled>Commit</button>
+                <button id="changes-btn-commit-push" class="changes-btn changes-btn-primary" disabled>Commit and Push</button>
+              </div>
+            </div>
+          </div>
+          <div id="astore-msg-panel" class="panel-view">
+            <div id="astore-msg-content" class="astore-msg-content"></div>
+          </div>
+          <div id="maven-panel" class="panel-view active">
+            <div id="maven-toolbar">
+              <button id="maven-sync" class="maven-toolbar-btn" title="Reload All Maven Projects">&#x21bb;</button>
+              <button id="maven-generate" class="maven-toolbar-btn" title="Generate Sources and Update Folders">&#x2699;</button>
+            </div>
             <div id="maven-tree"></div>
             <pre id="maven-output" class="maven-output-area"></pre>
           </div>
         </div>
       </div>
     </div>
+
+    <!-- Quick open overlay -->
+    <div id="quick-open-overlay" class="overlay hidden">
+      <div id="quick-open-dialog">
+        <input id="quick-open-input" type="text" placeholder="Type to search files..." spellcheck="false" autocomplete="off" />
+        <div id="quick-open-results"></div>
+      </div>
+    </div>
+
+    <!-- Recent projects overlay -->
+    <div id="recent-projects-overlay" class="overlay hidden">
+      <div id="recent-projects-dialog">
+        <div class="recent-projects-header">
+          <span>Recent Projects</span>
+          <button id="recent-projects-close" title="Close">&times;</button>
+        </div>
+        <div id="recent-projects-list"></div>
+      </div>
+    </div>
+
+    <!-- Global search overlay -->
+    <div id="search-overlay" class="overlay hidden">
+      <div id="search-dialog">
+        <div id="search-dialog-bar">
+          <input id="search-dialog-input" type="text" placeholder="Search in files..." spellcheck="false" autocomplete="off" />
+          <label id="search-dialog-case" title="Match Case"><input type="checkbox" /> Aa</label>
+        </div>
+        <div id="search-dialog-results"></div>
+        <div id="search-preview" class="search-preview"></div>
+      </div>
+    </div>
+
+    <!-- VCS Clone overlay -->
+    <div id="vcs-clone-overlay" class="overlay hidden">
+      <div id="vcs-clone-dialog">
+        <div class="vcs-clone-header">
+          <span>Get from Version Control</span>
+          <button id="vcs-clone-close" title="Close">&times;</button>
+        </div>
+        <div class="vcs-clone-body">
+          <label class="vcs-clone-label">URL</label>
+          <input id="vcs-clone-url" type="text" placeholder="https://github.com/user/repo.git" spellcheck="false" autocomplete="off" />
+          <label class="vcs-clone-label">Directory</label>
+          <input id="vcs-clone-dir" type="text" spellcheck="false" autocomplete="off" />
+          <div id="vcs-clone-error" class="vcs-clone-error hidden"></div>
+          <div id="vcs-clone-progress" class="vcs-clone-progress hidden">Cloning...</div>
+          <div class="vcs-clone-actions">
+            <button id="vcs-clone-btn" class="vcs-clone-btn">Clone</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Find Usages popup (IDEA-style floating) -->
+    <div id="usages-popup" class="usages-popup hidden">
+      <div class="usages-popup-header">
+        <span id="usages-popup-title"></span>
+        <span id="usages-popup-count"></span>
+      </div>
+      <div id="usages-popup-list"></div>
+      <div id="usages-popup-path" class="usages-popup-path"></div>
+    </div>
+
+    <!-- Git branch context menu -->
+    <div id="git-context-menu" class="context-menu hidden">
+      <div class="context-menu-item" data-action="git-checkout">Checkout</div>
+      <div class="context-menu-item" data-action="git-new-branch">New Branch from...</div>
+      <div class="context-menu-separator"></div>
+      <div class="context-menu-item" data-action="git-merge">Merge into Current</div>
+      <div class="context-menu-item" data-action="git-rebase">Rebase Current onto...</div>
+      <div class="context-menu-separator"></div>
+      <div class="context-menu-item" data-action="git-push">Push...</div>
+      <div class="context-menu-item" data-action="git-pull">Update (Pull)</div>
+      <div class="context-menu-item" data-action="git-pull-merge-master">Pull & Merge Master</div>
+      <div class="context-menu-separator"></div>
+      <div class="context-menu-item" data-action="git-rename">Rename...</div>
+      <div class="context-menu-item context-menu-danger" data-action="git-delete">Delete</div>
+    </div>
+
+    <!-- Git commit context menu -->
+    <div id="git-commit-context-menu" class="context-menu hidden">
+      <div class="context-menu-item" data-action="commit-copy-hash">Copy Revision Number</div>
+      <div class="context-menu-item" data-action="commit-create-patch">Create Patch...</div>
+      <div class="context-menu-item" data-action="commit-cherry-pick">Cherry-Pick</div>
+      <div class="context-menu-separator"></div>
+      <div class="context-menu-item" data-action="commit-checkout">Checkout Revision</div>
+      <div class="context-menu-item" data-action="commit-copy-patch">Copy Patch</div>
+      <div class="context-menu-separator"></div>
+      <div class="context-menu-item context-menu-danger" data-action="commit-revert">Revert Commit</div>
+      <div class="context-menu-separator"></div>
+      <div class="context-menu-item" data-action="commit-new-branch">New Branch...</div>
+    </div>
+
+    <!-- Editor context menu -->
+    <div id="editor-context-menu" class="context-menu hidden">
+      <div class="context-menu-item" data-action="toggle-blame">Annotate with Git Blame</div>
+      <div id="arthas-menu-section">
+        <div class="context-menu-separator"></div>
+        <div class="context-menu-submenu">
+          <div class="context-menu-item context-menu-submenu-trigger" id="arthas-submenu-trigger">
+            Arthas <span class="context-menu-arrow">▸</span>
+          </div>
+          <div class="context-menu context-menu-sub" id="arthas-submenu">
+            <div class="context-menu-item" data-action="arthas-watch">Watch</div>
+            <div class="context-menu-item" data-action="arthas-trace">Trace</div>
+            <div class="context-menu-item" data-action="arthas-stack">Stack</div>
+            <div class="context-menu-separator"></div>
+            <div class="context-menu-item" data-action="arthas-monitor">Monitor</div>
+            <div class="context-menu-item" data-action="arthas-tt">TimeTunnel</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Context menu -->
+    <div id="context-menu" class="context-menu hidden">
+      <div class="context-menu-item" data-action="new-file">New File</div>
+      <div class="context-menu-item" data-action="new-folder">New Folder</div>
+      <div class="context-menu-separator"></div>
+      <div class="context-menu-item" data-action="rename">Rename</div>
+      <div class="context-menu-item context-menu-danger" data-action="delete">Delete</div>
+    </div>
+
     <div id="status-bar">
       <span id="status-text">Ready</span>
+      <div id="lsp-progress" class="lsp-progress hidden">
+        <span id="lsp-progress-text"></span>
+        <div class="lsp-progress-bar"><div id="lsp-progress-fill" class="lsp-progress-fill"></div></div>
+      </div>
+    </div>
+    <div id="app-dialog-overlay" class="app-dialog-overlay hidden">
+      <div class="app-dialog">
+        <div id="app-dialog-message" class="app-dialog-message"></div>
+        <input id="app-dialog-input" class="app-dialog-input" type="text" spellcheck="false" />
+        <div class="app-dialog-buttons">
+          <button id="app-dialog-cancel" class="app-dialog-btn">Cancel</button>
+          <button id="app-dialog-ok" class="app-dialog-btn app-dialog-btn-primary">OK</button>
+        </div>
+      </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
   </body>

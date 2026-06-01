@@ -1,387 +1,594 @@
-import { EditorState } from "@codemirror/state";
-import { EditorView, keymap, ViewUpdate } from "@codemirror/view";
-import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
-import { autocompletion, completionKeymap } from "@codemirror/autocomplete";
-import {
-  syntaxHighlighting,
-  defaultHighlightStyle,
-  bracketMatching,
-  foldGutter,
-  foldKeymap,
-} from "@codemirror/language";
-import { oneDark } from "@codemirror/theme-one-dark";
-import { java } from "@codemirror/lang-java";
-import { python } from "@codemirror/lang-python";
-import { javascript } from "@codemirror/lang-javascript";
+import { EditorView } from "@codemirror/view";
+import { forceLinting } from "@codemirror/lint";
 
-import { FileTree, type FileNode } from "./file-tree";
+import { FileTree } from "./file-tree";
 import { TabManager } from "./tabs";
 import { PanelManager } from "./panel";
 import {
-  openFolderDialog,
-  readDirTree,
-  readFile,
-  writeFile,
-  toFrontendNode,
-  parseMavenModules,
-  runMavenCommand,
-  startLsp,
-  lspDidOpen,
-  lspDidChange,
-  lspFindReferences,
-  lspGotoDefinition,
-  type LspUsage,
+  app, destroyCachedView,
+} from "./state";
+import { showStatus, getLanguageId } from "./utils";
+import { initFileOps, openFile, navigateBack, navigateForward } from "./file-ops";
+import { flashLine } from "./flash-line";
+import {
+  gotoDefinitionAtCursor, debouncedLspDidChange,
+  hideUsagesPopup, usagesPopupNavigate, usagesPopupConfirm,
+  setRevealDirectoryHandler,
+} from "./lsp-navigation";
+import { initGitPanel, loadGitBranches } from "./git-panel";
+import { initChangesPanel, loadChanges, closeDiff } from "./changes-panel";
+import { initContextMenu, showContextMenu } from "./context-menu";
+import { setupResizeHandles } from "./resize";
+import { initMdPreview, toggleMdPreview, showPreviewButtonForFile, hideMdPreview, isMdPreviewActive } from "./md-preview";
+import { showSubTabsForFile, showDepAnalyzer, hideDepAnalyzer, isDepAnalyzerActive } from "./maven-helper";
+import { initLongTaskObserver, formatReport, record } from "./perf-monitor";
+import { initAstorePanel, onProjectChanged as astoreProjectChanged, toggleAstorePanel } from "./astore-panel";
+import {
+  openFolderDialog, lspDidOpen,
+  onLspDiagnostics, onFileChanged, onMenuAction,
+  writeFile, runMavenCommand,
+  type FileChangeEvent,
 } from "./tauri-api";
 
-// ---- State ----
+import { hydrateEditorLanguage } from "./editor-language";
+import { isDiffTab, diffDataStore, destroyActiveDiff, renderDiffInEditor, openDiffAsTab, initDiffTabs } from "./diff-tabs";
+import { initRecentProjects, showRecentProjects, hideRecentProjects } from "./recent-projects";
+import { createEditorState, saveCurrentFile, initEditorSetup } from "./editor-setup";
+import { ensureJavaLspForFile, initLspManager, initJavaIndex, loadMavenModules, lastMavenModules, isJavaIndexBuilding } from "./lsp-manager";
+import {
+  addProject, switchProject, closeProject, renderProjectBar,
+  refreshTree, loadSession, saveSession, debouncedSaveSession,
+  syncActiveEditorToTab, welcomeContent,
+  initProjectManager,
+} from "./project-manager";
 
-let currentProjectPath: string | null = null;
-let currentFilePath: string | null = null;
-let editorView: EditorView | null = null;
-let saveTimeout: ReturnType<typeof setTimeout> | null = null;
-
-// ---- Language detection ----
-
-function getLanguageExtension(filename: string) {
-  if (filename.endsWith(".java")) return java();
-  if (filename.endsWith(".py")) return python();
-  if (filename.endsWith(".ts") || filename.endsWith(".tsx"))
-    return javascript({ typescript: true, jsx: true });
-  if (filename.endsWith(".js") || filename.endsWith(".jsx"))
-    return javascript({ jsx: true });
-  return [];
-}
-
-function getLanguageId(filename: string): string {
-  if (filename.endsWith(".java")) return "java";
-  if (filename.endsWith(".py")) return "python";
-  if (filename.endsWith(".ts") || filename.endsWith(".tsx")) return "typescript";
-  if (filename.endsWith(".js") || filename.endsWith(".jsx")) return "javascript";
-  return "plaintext";
-}
-
-// ---- Editor creation ----
-
-function createEditorState(content: string, filename: string): EditorState {
-  return EditorState.create({
-    doc: content,
-    extensions: [
-      history(),
-      foldGutter(),
-      bracketMatching(),
-      highlightSelectionMatches(),
-      autocompletion(),
-      syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
-      keymap.of([
-        ...defaultKeymap,
-        ...historyKeymap,
-        ...searchKeymap,
-        ...completionKeymap,
-        ...foldKeymap,
-        // Cmd+S / Ctrl+S → save
-        {
-          key: "Mod-s",
-          run: () => {
-            saveCurrentFile();
-            return true;
-          },
-        },
-        // Shift+F12 → Find Usages
-        {
-          key: "Shift-F12",
-          run: (view) => {
-            findUsagesAtCursor(view);
-            return true;
-          },
-        },
-        // F12 → Go to Definition
-        {
-          key: "F12",
-          run: (view) => {
-            gotoDefinitionAtCursor(view);
-            return true;
-          },
-        },
-      ]),
-      oneDark,
-      EditorView.lineWrapping,
-      getLanguageExtension(filename),
-      // Track changes for LSP didChange
-      EditorView.updateListener.of((update: ViewUpdate) => {
-        if (update.docChanged && currentFilePath) {
-          debouncedLspDidChange(currentFilePath, update.state.doc.toString());
-        }
-      }),
-    ],
-  });
-}
-
-// ---- Save ----
-
-async function saveCurrentFile() {
-  if (!currentFilePath || !editorView) return;
-  const content = editorView.state.doc.toString();
-  try {
-    await writeFile(currentFilePath, content);
-    tabManager.markSaved(currentFilePath);
-    showStatus(`Saved ${currentFilePath.split("/").pop()}`);
-  } catch (e) {
-    showStatus(`Save failed: ${e}`, true);
-  }
-}
-
-// ---- LSP helpers ----
-
-function debouncedLspDidChange(path: string, content: string) {
-  if (saveTimeout) clearTimeout(saveTimeout);
-  saveTimeout = setTimeout(() => {
-    lspDidChange(path, content).catch(() => {});
-  }, 300);
-}
-
-async function findUsagesAtCursor(view: EditorView) {
-  if (!currentFilePath) return;
-  const pos = view.state.selection.main.head;
-  const line = view.state.doc.lineAt(pos);
-  const lineNumber = line.number - 1; // LSP is 0-indexed
-  const character = pos - line.from; // offset within line
-
-  showStatus("Finding usages...");
-  try {
-    const usages = await lspFindReferences(currentFilePath, lineNumber, character);
-    const word = getWordAtPos(view, pos);
-    panelManager.showUsages(
-      word,
-      usages.map((u) => ({
-        file: u.uri.replace("file://", ""),
-        line: u.line + 1, // display as 1-indexed
-        text: u.text,
-      })),
-      (file, line) => openFileAtLine(file, line)
-    );
-    showStatus(`${usages.length} usage(s) found`);
-  } catch (e) {
-    showStatus(`Find Usages: ${e}`, true);
-  }
-}
-
-async function gotoDefinitionAtCursor(view: EditorView) {
-  if (!currentFilePath) return;
-  const pos = view.state.selection.main.head;
-  const line = view.state.doc.lineAt(pos);
-  const lineNumber = line.number - 1;
-  const character = pos - line.from;
-
-  showStatus("Going to definition...");
-  try {
-    const def = await lspGotoDefinition(currentFilePath, lineNumber, character);
-    if (def) {
-      const file = def.uri.replace("file://", "");
-      openFileAtLine(file, def.line + 1);
-      showStatus(`Jumped to ${file.split("/").pop()}:${def.line + 1}`);
-    } else {
-      showStatus("No definition found");
-    }
-  } catch (e) {
-    showStatus(`Go to Definition: ${e}`, true);
-  }
-}
-
-function getWordAtPos(view: EditorView, pos: number): string {
-  const line = view.state.doc.lineAt(pos);
-  const text = line.text;
-  const col = pos - line.from;
-  let start = col, end = col;
-  while (start > 0 && /\w/.test(text[start - 1])) start--;
-  while (end < text.length && /\w/.test(text[end])) end++;
-  return text.slice(start, end) || "symbol";
-}
-
-// ---- File operations ----
-
-async function openFileAtLine(filePath: string, line: number) {
-  try {
-    const content = await readFile(filePath);
-    tabManager.openFile(filePath, content);
-    // Scroll to line after editor is created
-    setTimeout(() => {
-      if (editorView) {
-        const targetLine = editorView.state.doc.line(Math.min(line, editorView.state.doc.lines));
-        editorView.dispatch({
-          selection: { anchor: targetLine.from },
-          scrollIntoView: true,
-        });
-      }
-    }, 50);
-  } catch (e) {
-    showStatus(`Failed to open ${filePath}: ${e}`, true);
-  }
-}
-
-async function openFile(filePath: string) {
-  try {
-    const content = await readFile(filePath);
-    tabManager.openFile(filePath, content);
-  } catch (e) {
-    showStatus(`Failed to open ${filePath}: ${e}`, true);
-  }
-}
-
-// ---- Project open ----
-
-async function openProject(folderPath: string) {
-  currentProjectPath = folderPath;
-  showStatus(`Opening ${folderPath}...`);
-
-  try {
-    const tree = await readDirTree(folderPath);
-    const frontendTree = toFrontendNode(tree);
-    fileTree.setRoot(frontendTree);
-    showStatus(`Opened ${frontendTree.name}`);
-
-    // Update window title
-    document.title = `${frontendTree.name} — Lite Editor`;
-
-    // Auto-detect and start LSP servers
-    autoStartLsp(folderPath);
-
-    // Load Maven modules if applicable
-    loadMavenModules(folderPath);
-  } catch (e) {
-    showStatus(`Failed to open folder: ${e}`, true);
-  }
-}
-
-async function autoStartLsp(rootPath: string) {
-  // Try starting language servers — failures are silent (server may not be installed)
-  const attempts = [
-    { lang: "python", check: ".py" },
-    { lang: "typescript", check: ".ts" },
-  ];
-
-  for (const { lang } of attempts) {
-    startLsp(lang, rootPath).catch(() => {
-      // Server not installed, that's fine
-    });
-  }
-}
-
-async function loadMavenModules(projectPath: string) {
-  try {
-    const modules = await parseMavenModules(projectPath);
-    if (modules.length > 0) {
-      panelManager.showMavenModules(
-        modules.map((m) => ({
-          name: m.name,
-          groupId: m.group_id,
-          artifactId: m.artifact_id,
-        }))
-      );
-      // Wire up maven action buttons
-      document.querySelectorAll(".maven-action").forEach((btn) => {
-        btn.addEventListener("click", async (e) => {
-          const target = e.target as HTMLElement;
-          const cmd = target.dataset.cmd!;
-          const mod = target.dataset.module!;
-          // Find the module's pom directory
-          const module = modules.find((m) => m.artifact_id === mod);
-          if (module && currentProjectPath) {
-            const pomDir = module.pom_path.replace(/\/pom\.xml$/, "");
-            showStatus(`Running mvn ${cmd} on ${mod}...`);
-            try {
-              const output = await runMavenCommand(pomDir, [cmd]);
-              panelManager.showMavenOutput(mod, cmd, output);
-              showStatus(`mvn ${cmd} completed`);
-            } catch (e) {
-              panelManager.showMavenOutput(mod, cmd, `ERROR:\n${e}`);
-              showStatus(`mvn ${cmd} failed`, true);
-            }
-          }
-        });
-      });
-    }
-  } catch {
-    // No Maven project, that's fine
-  }
-}
-
-// ---- Status bar ----
-
-function showStatus(message: string, isError = false) {
-  const el = document.getElementById("status-text")!;
-  el.textContent = message;
-  el.style.color = isError ? "#f38ba8" : "var(--text-muted)";
-  if (!isError) {
-    setTimeout(() => {
-      if (el.textContent === message) el.textContent = "Ready";
-    }, 3000);
-  }
-}
-
-// ---- Wire up components ----
+// ---- Construct singletons ----
 
 const editorContainer = document.getElementById("editor-container")!;
 
 const tabManager = new TabManager(
   document.getElementById("tabs-bar")!,
   (filePath, content) => {
-    currentFilePath = filePath;
-    if (editorView) {
-      editorView.destroy();
-    }
-    const state = createEditorState(content, filePath);
-    editorView = new EditorView({ state, parent: editorContainer });
+    const t0 = performance.now();
 
-    // Notify LSP about the opened file
-    const langId = getLanguageId(filePath);
-    lspDidOpen(filePath, langId, content).catch(() => {});
+    if (isDiffTab(filePath)) {
+      if (isDepAnalyzerActive()) hideDepAnalyzer();
+      if (app.editorView) {
+        const previousPath = app.currentFilePath;
+        const previousView = app.editorView;
+        if (previousPath && app.editorViewCache.get(previousPath) === previousView) {
+          previousView.dom.remove();
+        } else {
+          syncActiveEditorToTab();
+          previousView.destroy();
+        }
+        app.editorView = null;
+      }
+      app.currentFilePath = filePath;
+      renderDiffInEditor(filePath);
+      return;
+    }
+
+    destroyActiveDiff();
+
+    if (app.currentFilePath === filePath && app.editorView) {
+      fileTree.highlightFile(filePath);
+      showSubTabsForFile(filePath);
+      return;
+    }
+
+    if (app.editorView) {
+      const previousPath = app.currentFilePath;
+      const previousView = app.editorView;
+      if (previousPath && app.editorViewCache.get(previousPath) === previousView) {
+        previousView.dom.remove();
+      } else {
+        syncActiveEditorToTab();
+        previousView.destroy();
+      }
+    }
+
+    app.currentFilePath = filePath;
+
+    const cached = app.editorViewCache.get(filePath);
+    if (cached) {
+      app.editorView = cached;
+      editorContainer.appendChild(cached.dom);
+      cached.requestMeasure();
+      hydrateEditorLanguage(cached, filePath);
+      record({ ts: Date.now(), kind: "ui", label: "tab-switch-cached", ms: performance.now() - t0, args: filePath });
+      if (getLanguageId(filePath) === "java") {
+        ensureJavaLspForFile(filePath).catch(() => {});
+      }
+    } else {
+      const state = createEditorState(content, filePath);
+      app.editorView = new EditorView({ state, parent: editorContainer });
+      app.editorViewCache.set(filePath, app.editorView);
+      hydrateEditorLanguage(app.editorView, filePath);
+      record({ ts: Date.now(), kind: "ui", label: "tab-switch-new", ms: performance.now() - t0, args: filePath });
+      const langId = getLanguageId(filePath);
+      if (langId === "java") {
+        ensureJavaLspForFile(filePath)
+          .then((started) => {
+            if (started) return lspDidOpen(filePath, langId, content);
+          })
+          .catch(() => {});
+      } else {
+        lspDidOpen(filePath, langId, content).catch(() => {});
+      }
+    }
+
+    if (app.pendingScrollLine !== null) {
+      const scrollTarget = app.pendingScrollLine;
+      app.pendingScrollLine = null;
+      const view = app.editorView;
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          const line = Math.min(scrollTarget, view.state.doc.lines);
+          const tl = view.state.doc.line(line);
+          view.dispatch({
+            selection: { anchor: tl.from },
+            effects: EditorView.scrollIntoView(tl.from, { y: "center" }),
+          });
+          flashLine(view, line);
+        });
+      });
+    }
 
     fileTree.highlightFile(filePath);
-  }
+    if (isMdPreviewActive()) hideMdPreview();
+    showPreviewButtonForFile(filePath);
+    showSubTabsForFile(filePath);
+  },
+  () => debouncedSaveSession(),
+  (closedPath) => {
+    if (isDiffTab(closedPath)) {
+      diffDataStore.delete(closedPath);
+      destroyActiveDiff();
+    } else {
+      destroyCachedView(closedPath);
+    }
+  },
 );
 
 const fileTree = new FileTree(
   document.getElementById("file-tree")!,
-  (filePath) => openFile(filePath)
+  (filePath) => openFile(filePath),
 );
+
+fileTree.setContextMenuHandler((node, x, y) => showContextMenu(node, x, y));
+setRevealDirectoryHandler((path) => fileTree.revealFile(path));
 
 const panelManager = new PanelManager(
   document.getElementById("panel-tabs")!,
-  document.getElementById("panel-content")!
+  document.getElementById("panel-content")!,
 );
 
-// ---- Toolbar buttons ----
+// ---- Lazy modules ----
 
-document.getElementById("btn-open-folder")!.addEventListener("click", async () => {
-  const folder = await openFolderDialog();
-  if (folder) {
-    openProject(folder);
+type SearchModule = typeof import("./search");
+type TerminalPanelModule = typeof import("./terminal-panel");
+
+let searchModulePromise: Promise<SearchModule> | null = null;
+let searchInitialized = false;
+let terminalPanelModulePromise: Promise<TerminalPanelModule> | null = null;
+let terminalPanelModule: TerminalPanelModule | null = null;
+let terminalPanelInitialized = false;
+
+async function ensureSearchModule(): Promise<SearchModule> {
+  if (!searchModulePromise) searchModulePromise = import("./search");
+  const mod = await searchModulePromise;
+  if (!searchInitialized) {
+    mod.initSearch(fileTree);
+    searchInitialized = true;
+  }
+  return mod;
+}
+
+async function ensureTerminalPanelModule(): Promise<TerminalPanelModule> {
+  if (!terminalPanelModulePromise) terminalPanelModulePromise = import("./terminal-panel");
+  const mod = await terminalPanelModulePromise;
+  terminalPanelModule = mod;
+  if (!terminalPanelInitialized) {
+    mod.initTerminalPanel();
+    terminalPanelInitialized = true;
+  }
+  return mod;
+}
+
+function openTerminalPanelLazy() {
+  ensureTerminalPanelModule()
+    .then((mod) => mod.openTerminalPanel())
+    .catch((err) => showStatus(`Terminal failed to load: ${err}`, true));
+}
+
+function syncTerminalPanelProjectLazy() {
+  if (terminalPanelModule) {
+    terminalPanelModule.syncTerminalProject();
+  }
+}
+
+function refreshActivePanelForProject() {
+  switch (panelManager.getActivePanel()) {
+    case "git":
+      loadGitBranches();
+      break;
+    case "changes":
+      closeDiff();
+      loadChanges(true);
+      break;
+    case "maven":
+      if (app.currentProjectPath) loadMavenModules(app.currentProjectPath);
+      break;
+    case "terminal":
+      syncTerminalPanelProjectLazy();
+      openTerminalPanelLazy();
+      break;
+  }
+}
+
+// ---- Init all modules ----
+
+initEditorSetup(tabManager);
+initDiffTabs(editorContainer, tabManager);
+initRecentProjects((path) => addProject(path));
+initLspManager(panelManager);
+initProjectManager({
+  tabManager,
+  fileTree,
+  panelManager,
+  editorContainer,
+  onRefreshActivePanel: refreshActivePanelForProject,
+});
+
+initFileOps(tabManager);
+initGitPanel();
+initChangesPanel(
+  (path) => openFile(path),
+  (repoPath, change, original, modified) => openDiffAsTab(repoPath, change, original, modified),
+);
+panelManager.onSwitch("changes", () => {
+  requestAnimationFrame(() => {
+    window.setTimeout(() => { loadChanges(); }, 0);
+  });
+});
+panelManager.onSwitch("terminal", () => openTerminalPanelLazy());
+initContextMenu(tabManager, refreshTree);
+setupResizeHandles();
+initMdPreview();
+initLongTaskObserver();
+initAstorePanel(
+  document.getElementById("astore-panel-content")!,
+  document.getElementById("astore-msg-content")!,
+);
+
+// ---- Helper functions ----
+
+function exportPerfReport() {
+  const report = formatReport();
+  const dest = (app.currentProjectPath || "/tmp") + "/perf-report.txt";
+  writeFile(dest, report).then(() => {
+    showStatus(`Perf report → ${dest}`);
+  }).catch((err) => {
+    showStatus(`Perf save failed: ${err}`, true);
+  });
+}
+
+function openVcsCloneLazy() {
+  import("./vcs-clone").then((mod) => {
+    mod.showVcsClone((dir) => addProject(dir));
+  }).catch((err) => showStatus(`VCS Clone failed to load: ${err}`, true));
+}
+
+function openSearchOverlayLazy() {
+  ensureSearchModule()
+    .then((mod) => mod.showSearchOverlay())
+    .catch((err) => showStatus(`Search failed to load: ${err}`, true));
+}
+
+function openQuickOpenLazy() {
+  ensureSearchModule()
+    .then((mod) => mod.showQuickOpen())
+    .catch((err) => showStatus(`Quick Open failed to load: ${err}`, true));
+}
+
+// ---- UI event listeners ----
+
+document.getElementById("btn-md-preview")!.addEventListener("click", () => {
+  if (app.currentFilePath?.endsWith(".md")) {
+    const content = app.editorView?.state.doc.toString();
+    toggleMdPreview(app.currentFilePath, content);
+  }
+});
+
+document.getElementById("editor-sub-tabs")!.addEventListener("click", (e) => {
+  const btn = (e.target as HTMLElement).closest<HTMLElement>(".editor-sub-tab");
+  if (!btn) return;
+  const sub = btn.dataset.sub;
+  if (sub === "dep" && app.currentFilePath) {
+    showDepAnalyzer(app.currentFilePath);
+  } else if (sub === "text") {
+    hideDepAnalyzer();
   }
 });
 
 document.getElementById("btn-locate-file")!.addEventListener("click", () => {
   const current = tabManager.getActiveFile();
-  if (current) {
-    fileTree.revealFile(current);
+  if (current) fileTree.revealFile(current);
+});
+
+document.getElementById("recent-projects-close")?.addEventListener("click", hideRecentProjects);
+document.getElementById("recent-projects-overlay")?.addEventListener("click", (event) => {
+  if (event.target === event.currentTarget) hideRecentProjects();
+});
+
+document.addEventListener("mousedown", (e) => {
+  const popup = document.getElementById("usages-popup")!;
+  if (!popup.classList.contains("hidden") && !popup.contains(e.target as Node)) {
+    hideUsagesPopup();
   }
 });
 
-// ---- Welcome state ----
+let lastLeftShiftDownAt = 0;
+document.addEventListener("keydown", (e) => {
+  if (e.defaultPrevented) return;
 
-const welcomeContent = `// Welcome to Lite Editor
-//
-// A lightweight code editor built with Tauri + CodeMirror 6
-//
-// Shortcuts:
-//   Cmd+S         — Save file
-//   Shift+F12     — Find Usages (LSP)
-//   F12           — Go to Definition (LSP)
-//
-// Click "Open Folder" in the sidebar to get started.
-`;
+  const recentProjectsVisible = !document
+    .getElementById("recent-projects-overlay")!
+    .classList.contains("hidden");
+  if (recentProjectsVisible && e.key === "Escape") {
+    e.preventDefault();
+    hideRecentProjects();
+    return;
+  }
+
+  const vcsCloneVisible = !document
+    .getElementById("vcs-clone-overlay")!
+    .classList.contains("hidden");
+  if (vcsCloneVisible && e.key === "Escape") {
+    e.preventDefault();
+    import("./vcs-clone").then((mod) => mod.hideVcsClone());
+    return;
+  }
+
+  const usagesVisible = !document.getElementById("usages-popup")!.classList.contains("hidden");
+  if (usagesVisible) {
+    if (e.key === "ArrowDown") { e.preventDefault(); usagesPopupNavigate(1); return; }
+    if (e.key === "ArrowUp") { e.preventDefault(); usagesPopupNavigate(-1); return; }
+    if (e.key === "Enter") { e.preventDefault(); usagesPopupConfirm(); return; }
+    if (e.key === "Escape") { e.preventDefault(); hideUsagesPopup(); return; }
+  }
+
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "p" || e.key === "P")) {
+    e.preventDefault();
+    exportPerfReport();
+    return;
+  }
+
+  if (e.key === "Meta" && app.editorView) {
+    app.editorView.dom.classList.add("cmd-held");
+  }
+
+  if (!e.repeat && e.key === "Shift" && e.code === "ShiftLeft" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    const now = performance.now();
+    if (now - lastLeftShiftDownAt <= 420) {
+      e.preventDefault();
+      lastLeftShiftDownAt = 0;
+      openQuickOpenLazy();
+    } else {
+      lastLeftShiftDownAt = now;
+    }
+  }
+});
+
+document.addEventListener("keyup", (e) => {
+  if (e.key === "Meta" && app.editorView) {
+    app.editorView.dom.classList.remove("cmd-held");
+  }
+});
+window.addEventListener("blur", () => {
+  if (app.editorView) app.editorView.dom.classList.remove("cmd-held");
+});
+
+// ---- Native menu actions ----
+
+onMenuAction((id) => {
+  switch (id) {
+    case "open-folder":
+      openFolderDialog().then((folder) => { if (folder) addProject(folder); });
+      break;
+    case "recent-projects":
+      showRecentProjects();
+      break;
+    case "vcs-clone":
+      openVcsCloneLazy();
+      break;
+    case "save":
+      saveCurrentFile();
+      break;
+    case "close-tab":
+      tabManager.closeActiveTab();
+      break;
+    case "find-in-files":
+      openSearchOverlayLazy();
+      break;
+    case "quick-open":
+      openQuickOpenLazy();
+      break;
+    case "goto-definition":
+      if (app.editorView) gotoDefinitionAtCursor(app.editorView);
+      break;
+    case "navigate-back":
+      navigateBack();
+      break;
+    case "navigate-forward":
+      navigateForward();
+      break;
+    case "toggle-terminal":
+      panelManager.switchTo("terminal");
+      break;
+    case "toggle-git":
+      panelManager.switchTo("git");
+      loadGitBranches();
+      break;
+    case "toggle-astore":
+      toggleAstorePanel();
+      break;
+    case "export-perf":
+      exportPerfReport();
+      break;
+  }
+});
+
+// ---- Maven toolbar ----
+
+document.getElementById("maven-sync")!.addEventListener("click", async () => {
+  if (!app.currentProjectPath) return;
+  showStatus("Reloading Maven modules...");
+  await loadMavenModules(app.currentProjectPath);
+  showStatus("Maven modules reloaded");
+});
+
+document.getElementById("maven-generate")!.addEventListener("click", async () => {
+  if (!app.currentProjectPath) return;
+  panelManager.clearMavenOutput("=== mvn generate-sources ===");
+  showStatus("Generating sources...");
+  try {
+    await runMavenCommand(app.currentProjectPath, ["generate-sources"]);
+  } catch (err) {
+    panelManager.appendMavenLine(`ERROR: ${err}`);
+    showStatus("Generate sources failed", true);
+  }
+});
+
+document.getElementById("maven-tree")!.addEventListener("click", async (e) => {
+  const target = (e.target as HTMLElement).closest(".maven-action") as HTMLElement | null;
+  if (!target) return;
+  const cmd = target.dataset.cmd!;
+  const mod = target.dataset.module!;
+  const module = lastMavenModules.find((m) => m.artifact_id === mod);
+  if (module && app.currentProjectPath) {
+    const pomDir = module.pom_path.replace(/\/pom\.xml$/, "");
+    panelManager.clearMavenOutput(`=== mvn ${cmd} (${mod}) ===`);
+    showStatus(`Running mvn ${cmd} on ${mod}...`);
+    try {
+      await runMavenCommand(pomDir, [cmd]);
+    } catch (err) {
+      panelManager.appendMavenLine(`ERROR: ${err}`);
+      showStatus(`mvn ${cmd} failed`, true);
+    }
+  }
+});
+
+// ---- LSP diagnostics ----
+
+let lintRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+onLspDiagnostics((params) => {
+  app.diagnosticsMap.set(params.uri, params.diagnostics);
+  if (app.currentFilePath && params.uri === `file://${app.currentFilePath}` && app.editorView) {
+    if (lintRefreshTimer === null) {
+      lintRefreshTimer = setTimeout(() => {
+        lintRefreshTimer = null;
+        if (app.editorView) forceLinting(app.editorView);
+      }, 300);
+    }
+  }
+});
+
+// ---- File watcher ----
+
+let fileChangeDebounce: ReturnType<typeof setTimeout> | null = null;
+let indexRebuildDebounce: ReturnType<typeof setTimeout> | null = null;
+let changesRefreshDebounce: ReturnType<typeof setTimeout> | null = null;
+onFileChanged((evt: FileChangeEvent) => {
+  if (evt.project === app.currentProjectPath) {
+    if (evt.hasStructural) {
+      if (fileChangeDebounce) clearTimeout(fileChangeDebounce);
+      fileChangeDebounce = setTimeout(() => refreshTree(), 500);
+    }
+
+    const changesActive = document.querySelector('.panel-tab[data-panel="changes"].active');
+    if (changesActive) {
+      if (changesRefreshDebounce) clearTimeout(changesRefreshDebounce);
+      changesRefreshDebounce = setTimeout(() => loadChanges(), 3000);
+    }
+
+    if (app.javaIndexReady && !isJavaIndexBuilding(evt.project)) {
+      if (indexRebuildDebounce) clearTimeout(indexRebuildDebounce);
+      indexRebuildDebounce = setTimeout(async () => {
+        try {
+          await initJavaIndex(evt.project);
+        } catch { /* ignore */ }
+      }, 5000);
+    }
+  }
+});
+
+window.addEventListener("beforeunload", () => {
+  saveSession();
+});
+
+// ---- Performance monitor (dev only) ----
+
+if (import.meta.env.DEV) {
+  const hud = document.createElement("div");
+  hud.id = "perf-hud";
+  hud.style.cssText = "position:fixed;top:4px;right:4px;z-index:99999;background:rgba(0,0,0,0.75);color:#0f0;font:11px/1.3 monospace;padding:4px 8px;border-radius:4px;pointer-events:none;white-space:pre";
+  document.body.appendChild(hud);
+
+  let frameTimes: number[] = [];
+  let lastFrame = performance.now();
+  let totalRealDrops = 0;
+  let totalFrames = 0;
+  const measureFrame = () => {
+    const now = performance.now();
+    const dt = now - lastFrame;
+    frameTimes.push(dt);
+    lastFrame = now;
+    totalFrames++;
+    if (dt > 33) totalRealDrops++;
+    if (frameTimes.length >= 120) {
+      frameTimes.sort((a, b) => a - b);
+      const p50 = frameTimes[Math.floor(frameTimes.length * 0.5)];
+      const p95 = frameTimes[Math.floor(frameTimes.length * 0.95)];
+      const p99 = frameTimes[Math.floor(frameTimes.length * 0.99)];
+      const jank = frameTimes.filter(t => t > 33).length;
+      const color = jank > 3 ? "#f44" : jank > 0 ? "#fa0" : "#0f0";
+      hud.style.color = color;
+      hud.textContent = `p50=${p50.toFixed(1)} p95=${p95.toFixed(1)} p99=${p99.toFixed(1)}\njank=${jank}/120 total=${totalRealDrops}/${totalFrames}\ncache=${app.editorViewCache.size}`;
+      const entry = `${new Date().toISOString()} p50=${p50.toFixed(1)} p95=${p95.toFixed(1)} p99=${p99.toFixed(1)} jank=${jank}/120 total=${totalRealDrops}/${totalFrames} cache=${app.editorViewCache.size}`;
+      console.log(`[perf] ${entry}`);
+      try {
+        const log = JSON.parse(localStorage.getItem("perf-log") || "[]") as string[];
+        log.push(entry);
+        if (log.length > 500) log.splice(0, log.length - 500);
+        localStorage.setItem("perf-log", JSON.stringify(log));
+      } catch { /* quota exceeded */ }
+      frameTimes = [];
+    }
+    requestAnimationFrame(measureFrame);
+  };
+  requestAnimationFrame(measureFrame);
+}
+
+// ---- Dev globals ----
+
+if (import.meta.env.DEV) {
+  (window as any).__app = app;
+  (window as any).__createEditorState = createEditorState;
+}
+
+// ---- Startup ----
 
 const state = createEditorState(welcomeContent, "welcome.ts");
-editorView = new EditorView({ state, parent: editorContainer });
+app.editorView = new EditorView({ state, parent: editorContainer });
 
-showStatus("Ready");
+showStatus("Restoring session...");
+loadSession().then(() => {
+  if (app.projects.length === 0) {
+    showStatus("Ready");
+  }
+  if (app.currentProjectPath) {
+    astoreProjectChanged(app.currentProjectPath);
+  }
+});

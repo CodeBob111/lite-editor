@@ -1,42 +1,18 @@
-export interface UsageItem {
-  file: string;
-  line: number;
-  text: string;
-}
-
 export class PanelManager {
   private tabsContainer: HTMLElement;
   private contentContainer: HTMLElement;
-  private activePanel: string = "usages";
+  private mavenLines: string[] = [];
+  private readonly MAX_MAVEN_LINES = 5000;
+  private mavenOutputFrame: number | null = null;
+  private onSwitchCallbacks: Map<string, () => void> = new Map();
+  private onLeaveCallbacks: Map<string, () => void> = new Map();
+  private activePanelId: string | null = null;
 
   constructor(tabsContainer: HTMLElement, contentContainer: HTMLElement) {
     this.tabsContainer = tabsContainer;
     this.contentContainer = contentContainer;
+    this.activePanelId = this.tabsContainer.querySelector<HTMLElement>(".panel-tab.active")?.dataset.panel ?? null;
     this.bindTabs();
-  }
-
-  showUsages(symbol: string, usages: UsageItem[], onNavigate: (file: string, line: number) => void) {
-    this.switchTo("usages");
-    const panel = document.getElementById("usages-panel")!;
-
-    if (usages.length === 0) {
-      panel.innerHTML = `<div class="panel-placeholder">No usages found for "${symbol}"</div>`;
-      return;
-    }
-
-    panel.innerHTML = `<div style="padding: 4px 8px; color: var(--text-muted); font-size: 11px;">${usages.length} usages of <strong>${symbol}</strong></div>`;
-
-    for (const usage of usages) {
-      const item = document.createElement("div");
-      item.className = "usage-item";
-      item.innerHTML = `
-        <span class="usage-file">${usage.file.split("/").pop()}</span>
-        <span class="usage-line">${usage.line}</span>
-        <span class="usage-text">${this.escapeHtml(usage.text)}</span>
-      `;
-      item.addEventListener("click", () => onNavigate(usage.file, usage.line));
-      panel.appendChild(item);
-    }
   }
 
   showMavenModules(modules: { name: string; groupId: string; artifactId: string }[]) {
@@ -67,21 +43,62 @@ export class PanelManager {
     }
   }
 
-  showMavenOutput(module: string, goal: string, output: string) {
-    this.switchTo("maven");
+  appendMavenLine(line: string) {
+    this.mavenLines.push(line);
+    if (this.mavenLines.length > this.MAX_MAVEN_LINES) {
+      this.mavenLines = this.mavenLines.slice(-this.MAX_MAVEN_LINES);
+    }
+    this.scheduleMavenOutputRender();
+  }
+
+  private scheduleMavenOutputRender() {
+    if (this.mavenOutputFrame !== null) return;
+    this.mavenOutputFrame = requestAnimationFrame(() => {
+      this.mavenOutputFrame = null;
+      this.renderMavenOutput();
+    });
+  }
+
+  private renderMavenOutput() {
     const outputEl = document.getElementById("maven-output")!;
-    outputEl.textContent = `=== mvn ${goal} (${module}) ===\n\n${output}`;
+    outputEl.textContent = this.mavenLines.join("\n");
     outputEl.scrollTop = outputEl.scrollHeight;
   }
 
-  private switchTo(panelId: string) {
-    this.activePanel = panelId;
+  clearMavenOutput(header: string) {
+    this.switchTo("maven");
+    this.mavenLines = [header];
+    this.renderMavenOutput();
+  }
+
+  onSwitch(panelId: string, callback: () => void) {
+    this.onSwitchCallbacks.set(panelId, callback);
+  }
+
+  onLeave(panelId: string, callback: () => void) {
+    this.onLeaveCallbacks.set(panelId, callback);
+  }
+
+  getActivePanel(): string | null {
+    return this.activePanelId;
+  }
+
+  switchTo(panelId: string) {
+    if (this.activePanelId === panelId) return;
+
+    if (this.activePanelId) {
+      this.onLeaveCallbacks.get(this.activePanelId)?.();
+    }
+
+    this.activePanelId = panelId;
     this.tabsContainer.querySelectorAll(".panel-tab").forEach((tab) => {
       tab.classList.toggle("active", (tab as HTMLElement).dataset.panel === panelId);
     });
     this.contentContainer.querySelectorAll(".panel-view").forEach((view) => {
       view.classList.toggle("active", view.id === `${panelId}-panel`);
     });
+    const cb = this.onSwitchCallbacks.get(panelId);
+    if (cb) cb();
   }
 
   private bindTabs() {
