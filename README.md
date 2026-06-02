@@ -41,8 +41,6 @@ A near-complete Git UI driven by native `git` commands:
 - Multiple project roots, a recent-projects list, a file tree with full CRUD (create / rename / copy / delete), fuzzy **quick-open**, and **find-in-files**.
 - A built-in **performance monitor** with an exportable report.
 
-> **Internal integration — Astore.** The `astore` module integrates with an Alibaba-internal code/asset hosting platform (SSO login, project detection, code sync, and publish). It only functions inside that corporate environment and is inert elsewhere.
-
 ---
 
 ## Tech stack
@@ -78,8 +76,7 @@ lite-editor/
 │   │   ├── git.rs          # Git command surface
 │   │   ├── lsp.rs          # Language Server Protocol bridge
 │   │   ├── java_index.rs   # Java class indexer
-│   │   ├── terminal.rs     # PTY management
-│   │   └── astore.rs       # Internal platform integration
+│   │   └── terminal.rs     # PTY management
 │   └── tests/              # Rust integration tests
 └── package.json
 ```
@@ -128,7 +125,7 @@ cd src-tauri && cargo test
 | Navigate back / forward | `Cmd/Ctrl` + `[` / `]` |
 | Export performance report | `Cmd/Ctrl` + `Shift` + `P` |
 
-Terminal, Git, and Astore panels are toggled from the **View** menu.
+Terminal and Git panels are toggled from the **View** menu.
 
 ---
 

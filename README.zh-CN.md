@@ -41,8 +41,6 @@
 - 多项目根目录、最近项目列表、带完整增删改查（创建 / 重命名 / 复制 / 删除）的文件树、模糊**快速打开**、以及**全局文件搜索**。
 - 内置**性能监视器**，报告可导出。
 
-> **内部集成 —— Astore。** `astore` 模块对接阿里巴巴内部的代码/资产托管平台（SSO 登录、项目识别、代码同步与发布）。它仅在该企业内网环境中可用，在其他环境下不生效。
-
 ---
 
 ## 技术栈
@@ -78,8 +76,7 @@ lite-editor/
 │   │   ├── git.rs          # Git 命令面
 │   │   ├── lsp.rs          # Language Server Protocol 桥接
 │   │   ├── java_index.rs   # Java 类索引器
-│   │   ├── terminal.rs     # PTY 管理
-│   │   └── astore.rs       # 内部平台集成
+│   │   └── terminal.rs     # PTY 管理
 │   └── tests/              # Rust 集成测试
 └── package.json
 ```
@@ -128,7 +125,7 @@ cd src-tauri && cargo test
 | 后退 / 前进导航 | `Cmd/Ctrl` + `[` / `]` |
 | 导出性能报告 | `Cmd/Ctrl` + `Shift` + `P` |
 
-终端、Git、Astore 面板从 **View（视图）** 菜单切换。
+终端、Git 面板从 **View（视图）** 菜单切换。
 
 ---
 
