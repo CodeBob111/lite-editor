@@ -1,8 +1,10 @@
 import { app } from "./state";
 import { escapeHtml, showStatus } from "./utils";
+import { appConfirm } from "./dialog";
+import { showConflictsDialog } from "./merge-conflict";
 import {
   gitDiscoverRepos, gitStatusBatch, gitShowFile, gitShowStaged, readFile,
-  gitCommit, gitPush, gitCurrentBranch,
+  gitCommit, gitPush, gitCurrentBranch, gitDiscardChanges,
   type GitChange,
 } from "./tauri-api";
 
@@ -360,6 +362,17 @@ async function openChangedFile(repoPath: string, change: GitChange) {
     return;
   }
 
+  // A conflicted file opens the 3-way merge resolver instead of a plain diff.
+  if (change.status === "Unmerged") {
+    try {
+      const branch = await gitCurrentBranch(repoPath);
+      await showConflictsDialog(repoPath, branch);
+    } catch (e) {
+      showStatus(`Failed to open conflicts: ${e}`, true);
+    }
+    return;
+  }
+
   try {
     showStatus("Loading diff...");
 
@@ -491,6 +504,60 @@ function handleChangesClick(e: MouseEvent) {
   }
 }
 
+function handleChangesContextMenu(e: MouseEvent) {
+  const row = (e.target as HTMLElement).closest<HTMLElement>(".changes-file");
+  if (!row) return;
+  e.preventDefault();
+  const repoIndex = Number(row.dataset.repoIndex);
+  const repo = Number.isInteger(repoIndex) ? repoChanges[repoIndex] : null;
+  if (!repo) return;
+  const changeIndex = Number(row.dataset.changeIndex);
+  const change = Number.isInteger(changeIndex) ? repo.changes[changeIndex] : null;
+  if (!change) return;
+  showChangesContextMenu(repo.path, change, e.clientX, e.clientY);
+}
+
+// Built with createElement/textContent (never innerHTML) so file paths can't
+// inject markup and the security hook stays happy.
+function showChangesContextMenu(repoPath: string, change: GitChange, x: number, y: number) {
+  document.querySelectorAll(".changes-ctx-menu").forEach((m) => m.remove());
+  const menu = document.createElement("div");
+  menu.className = "changes-ctx-menu";
+  menu.style.cssText = `position:fixed;left:${x}px;top:${y}px;z-index:9999;`;
+
+  const addItem = (label: string, onClick: () => void) => {
+    const item = document.createElement("div");
+    item.className = "changes-ctx-item";
+    item.textContent = label;
+    item.addEventListener("click", () => { menu.remove(); onClick(); });
+    menu.appendChild(item);
+  };
+
+  if (change.status === "Unmerged") {
+    addItem("Resolve Conflict", () => openChangedFile(repoPath, change));
+  } else {
+    addItem("Show Diff", () => openChangedFile(repoPath, change));
+    addItem("Rollback", () => rollbackChange(repoPath, change));
+  }
+
+  document.body.appendChild(menu);
+  const dismiss = () => { menu.remove(); document.removeEventListener("click", dismiss); };
+  setTimeout(() => document.addEventListener("click", dismiss), 0);
+}
+
+async function rollbackChange(repoPath: string, change: GitChange) {
+  const ok = await appConfirm(`Rollback local changes to "${change.path}"? This cannot be undone.`);
+  if (!ok) return;
+  try {
+    await gitDiscardChanges(repoPath, change.path, change.status);
+    selectedFiles.delete(fileKey(repoPath, change.path));
+    showStatus(`Rolled back: ${change.path}`);
+    loadChanges(true);
+  } catch (e) {
+    showStatus(`Rollback failed: ${e}`, true);
+  }
+}
+
 async function doCommit(andPush: boolean) {
   const msgEl = document.getElementById("changes-commit-msg") as HTMLTextAreaElement;
   const message = msgEl.value.trim();
@@ -544,6 +611,7 @@ export function initChangesPanel(
   changesContainer = document.getElementById("changes-list")!;
   changesContainer.addEventListener("scroll", scheduleVisibleRowsUpdate, { passive: true });
   changesContainer.addEventListener("click", handleChangesClick);
+  changesContainer.addEventListener("contextmenu", handleChangesContextMenu);
   document.getElementById("changes-refresh")!.addEventListener("click", () => loadChanges(true));
   document.getElementById("changes-btn-commit")!.addEventListener("click", () => doCommit(false));
   document.getElementById("changes-btn-commit-push")!.addEventListener("click", () => doCommit(true));

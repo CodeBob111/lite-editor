@@ -51,6 +51,36 @@ function showContextMenu(inst: TermInstance, x: number, y: number) {
   setTimeout(() => document.addEventListener("click", dismiss), 0);
 }
 
+// Read the system clipboard and feed it to the terminal. Goes through
+// xterm.paste() (not raw writeTerminal) so bracketed-paste mode in vim/shells is
+// honored — a raw write would corrupt multi-line pastes there.
+async function pasteIntoTerminal(xterm: Terminal) {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) xterm.paste(text);
+  } catch {
+    showStatus("Paste failed: clipboard unavailable", true);
+  }
+}
+
+function showTerminalContextMenu(xterm: Terminal, x: number, y: number) {
+  document.querySelectorAll(".term-ctx-menu").forEach((m) => m.remove());
+  const menu = document.createElement("div");
+  menu.className = "term-ctx-menu";
+  menu.style.cssText = `position:fixed;left:${x}px;top:${y}px;z-index:9999;`;
+  const item = document.createElement("div");
+  item.className = "term-ctx-item";
+  item.textContent = "Paste";
+  item.addEventListener("click", () => {
+    menu.remove();
+    pasteIntoTerminal(xterm);
+  });
+  menu.appendChild(item);
+  document.body.appendChild(menu);
+  const dismiss = () => { menu.remove(); document.removeEventListener("click", dismiss); };
+  setTimeout(() => document.addEventListener("click", dismiss), 0);
+}
+
 function currentTerminalProject() {
   return app.currentProjectPath || "__global__";
 }
@@ -108,6 +138,25 @@ async function createNewTerminal() {
   container.appendChild(wrapper);
   xterm.open(wrapper);
 
+  // Primary paste path: ride the native paste: → DOM `paste` event. Capture-phase
+  // + stopPropagation runs us BEFORE xterm's own textarea handler, so we paste
+  // exactly once regardless of whether xterm's built-in handler also fires.
+  wrapper.addEventListener("paste", (e) => {
+    const text = e.clipboardData?.getData("text/plain");
+    if (text) {
+      xterm.paste(text);
+      e.preventDefault();
+      e.stopPropagation();
+    }
+  }, true);
+
+  // Fallback paste path: right-click → Paste, a guaranteed user-gesture route
+  // through the Clipboard API in case the OS routes Cmd+V where no paste event fires.
+  wrapper.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    showTerminalContextMenu(xterm, e.clientX, e.clientY);
+  });
+
   await new Promise((r) => setTimeout(r, 50));
   fitAddon.fit();
 
@@ -163,7 +212,11 @@ function switchTerminal(index: number) {
   else activeTermByProject.delete(currentTerminalProject());
   renderTerminalTabs();
   if (next) {
-    setTimeout(() => { next.fitAddon.fit(); next.xterm.focus(); }, 10);
+    setTimeout(() => {
+      next.fitAddon.fit();
+      resizeTerminal(next.id, next.xterm.cols, next.xterm.rows).catch(() => {});
+      next.xterm.focus();
+    }, 10);
   }
 }
 
@@ -216,7 +269,11 @@ export function initTerminalPanel() {
     if (!active) createNewTerminal();
     else {
       syncTerminalProject();
-      setTimeout(() => { active.fitAddon.fit(); active.xterm.focus(); }, 50);
+      setTimeout(() => {
+        active.fitAddon.fit();
+        resizeTerminal(active.id, active.xterm.cols, active.xterm.rows).catch(() => {});
+        active.xterm.focus();
+      }, 50);
     }
   });
 
@@ -252,5 +309,9 @@ export async function openTerminalPanel() {
   const active = activeTermForCurrentProject();
   if (!active) { await createNewTerminal(); return; }
   syncTerminalProject();
-  setTimeout(() => { active.fitAddon.fit(); active.xterm.focus(); }, 50);
+  setTimeout(() => {
+    active.fitAddon.fit();
+    resizeTerminal(active.id, active.xterm.cols, active.xterm.rows).catch(() => {});
+    active.xterm.focus();
+  }, 50);
 }

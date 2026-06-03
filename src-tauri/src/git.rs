@@ -321,16 +321,38 @@ pub fn git_pull(
             local_branch
         )),
         (None, _) => {
-            let upstream = run_git(
+            match run_git(
                 &cwd,
                 &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
-            )
-            .map_err(|_| {
-                "Current branch has no upstream. Set an upstream before pulling.".to_string()
-            })?;
-            let (remote, remote_branch) = parse_upstream(&upstream)?;
-            ensure_remote_branch_exists(&cwd, remote, remote_branch)?;
-            run_git_with_timeout(&cwd, &["pull", "--no-rebase"], Duration::from_secs(60))
+            ) {
+                Ok(upstream) => {
+                    let (remote, remote_branch) = parse_upstream(&upstream)?;
+                    ensure_remote_branch_exists(&cwd, remote, remote_branch)?;
+                    run_git_with_timeout(&cwd, &["pull", "--no-rebase"], Duration::from_secs(60))
+                }
+                // No upstream configured. If origin has a same-named branch, adopt
+                // it as the upstream and pull; otherwise there's nothing to pull.
+                Err(_) => {
+                    let branch = run_git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+                    if branch.is_empty() || branch == "HEAD" {
+                        return Err("Detached HEAD has no upstream to pull from.".to_string());
+                    }
+                    let remote = "origin";
+                    // Fetching the matching branch both verifies it exists on the
+                    // remote (clear error if not) and creates the remote-tracking
+                    // ref that --set-upstream-to requires.
+                    run_git_with_timeout(
+                        &cwd,
+                        &["fetch", remote, branch.as_str()],
+                        Duration::from_secs(60),
+                    )?;
+                    run_git(
+                        &cwd,
+                        &["branch", &format!("--set-upstream-to={}/{}", remote, branch)],
+                    )?;
+                    run_git_with_timeout(&cwd, &["pull", "--no-rebase"], Duration::from_secs(60))
+                }
+            }
         }
     }
 }
@@ -376,9 +398,94 @@ pub fn git_push(cwd: String, branch: String) -> Result<String, String> {
     run_git_with_timeout(&cwd, &["push", "origin", &branch], Duration::from_secs(60))
 }
 
+#[derive(Serialize)]
+pub struct MergeResult {
+    pub success: bool,
+    pub message: String,
+    pub conflicts: Vec<String>,
+}
+
 #[tauri::command]
-pub fn git_merge(cwd: String, branch: String) -> Result<String, String> {
-    run_git_with_timeout(&cwd, &["merge", &branch], Duration::from_secs(30))
+pub fn git_merge(cwd: String, branch: String) -> Result<MergeResult, String> {
+    match run_git_with_timeout(&cwd, &["merge", &branch], Duration::from_secs(30)) {
+        Ok(msg) => Ok(MergeResult { success: true, message: msg, conflicts: vec![] }),
+        Err(e) => {
+            let conflicts = list_unmerged_files(&cwd);
+            if !conflicts.is_empty() {
+                Ok(MergeResult { success: false, message: e, conflicts })
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+fn list_unmerged_files(cwd: &str) -> Vec<String> {
+    run_git(cwd, &["diff", "--name-only", "--diff-filter=U"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
+#[tauri::command]
+pub fn git_merge_conflicts(cwd: String) -> Result<Vec<String>, String> {
+    Ok(list_unmerged_files(&cwd))
+}
+
+#[tauri::command]
+pub fn git_show_conflict_version(cwd: String, rel_path: String, stage: u32) -> Result<String, String> {
+    if !(1..=3).contains(&stage) {
+        return Err("stage must be 1 (base), 2 (ours), or 3 (theirs)".into());
+    }
+    run_git_raw(&cwd, &["show", &format!(":{}:{}", stage, rel_path)])
+}
+
+#[tauri::command]
+pub fn git_merge_abort(cwd: String) -> Result<String, String> {
+    run_git(&cwd, &["merge", "--abort"])
+}
+
+#[tauri::command]
+pub fn git_resolve_conflict_file(cwd: String, rel_path: String, content: String) -> Result<String, String> {
+    let abs_path = Path::new(&cwd).join(&rel_path);
+    std::fs::write(&abs_path, &content)
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+    run_git(&cwd, &["add", "--", &rel_path])
+}
+
+#[tauri::command]
+pub fn git_checkout_conflict_side(cwd: String, rel_path: String, side: String) -> Result<String, String> {
+    let flag = match side.as_str() {
+        "ours" => "--ours",
+        "theirs" => "--theirs",
+        _ => return Err("side must be 'ours' or 'theirs'".into()),
+    };
+    run_git(&cwd, &["checkout", flag, "--", &rel_path])?;
+    run_git(&cwd, &["add", "--", &rel_path])
+}
+
+/// Discard local changes to a single path (IDEA's "Rollback").
+/// - Untracked: no committed version exists, so rolling back removes the file.
+/// - Added (staged-new): unstage, then remove from the working tree.
+/// - Tracked (Modified/Deleted/...): restore both index and working tree from HEAD.
+#[tauri::command]
+pub fn git_discard_changes(cwd: String, rel_path: String, status: String) -> Result<String, String> {
+    match status.as_str() {
+        "Untracked" => {
+            std::fs::remove_file(Path::new(&cwd).join(&rel_path))
+                .map_err(|e| format!("Failed to delete file: {}", e))?;
+            Ok(String::new())
+        }
+        "Added" => {
+            run_git(&cwd, &["reset", "--quiet", "HEAD", "--", &rel_path])?;
+            std::fs::remove_file(Path::new(&cwd).join(&rel_path))
+                .map_err(|e| format!("Failed to delete file: {}", e))?;
+            Ok(String::new())
+        }
+        _ => run_git(&cwd, &["checkout", "HEAD", "--", &rel_path]),
+    }
 }
 
 #[tauri::command]

@@ -130,8 +130,20 @@ export class FileTree {
 
     document.addEventListener("keydown", (e) => {
       if (!(e.metaKey || e.ctrlKey)) return;
-      const active = document.activeElement;
-      if (active?.closest(".cm-editor") || active?.closest("#search-panel")) return;
+      // Only hijack Cmd+C/V/Z/Backspace for file ops when focus is NOT in an
+      // editable surface. Otherwise these steal the keystroke from whatever is
+      // focused — e.g. Cmd+V in the terminal (xterm's textarea) was pasting a
+      // file into the tree instead of reaching the shell, and preventDefault
+      // killed the terminal's own paste event.
+      const active = document.activeElement as HTMLElement | null;
+      if (
+        active?.tagName === "INPUT" ||
+        active?.tagName === "TEXTAREA" ||
+        active?.isContentEditable ||
+        active?.closest(".cm-editor") ||
+        active?.closest("#search-panel") ||
+        active?.closest(".terminal-wrapper")
+      ) return;
 
       if ((e.key === "Backspace" || e.key === "Delete") && this.selectedPaths.size > 0) {
         e.preventDefault();

@@ -10,6 +10,7 @@ import {
   gitLog, gitCommitPatch, gitCherryPick, gitCheckoutRevision, gitRevertCommit, gitNewBranchAtCommit,
   type GitBranch, type GitCommit, type GitRepo,
 } from "./tauri-api";
+import { showConflictsDialog } from "./merge-conflict";
 
 let gitRepos: GitRepo[] = [];
 let gitExpandedRepos = new Set<string>();
@@ -541,11 +542,17 @@ export function initGitPanel() {
           }
           break;
         }
-        case "git-merge":
+        case "git-merge": {
           showStatus(`[${repoName}] Merging ${branch}...`);
-          await gitMerge(repo, branch);
-          showStatus(`[${repoName}] Merged ${branch}`);
+          const mergeResult = await gitMerge(repo, branch);
+          if (mergeResult.success) {
+            showStatus(`[${repoName}] Merged ${branch}`);
+          } else {
+            showStatus(`[${repoName}] Merge conflicts detected`, true);
+            showConflictsDialog(repo, branch);
+          }
           break;
+        }
         case "git-rebase":
           showStatus(`[${repoName}] Rebasing onto ${branch}...`);
           await gitRebase(repo, branch);
@@ -583,8 +590,13 @@ export function initGitPanel() {
           showStatus(`[${repoName}] Fetching master...`);
           await gitFetchBranch(repo, "origin", "master");
           showStatus(`[${repoName}] Merging origin/master...`);
-          await gitMerge(repo, "origin/master");
-          showStatus(`[${repoName}] Pulled and merged master`);
+          const pullMergeResult = await gitMerge(repo, "origin/master");
+          if (pullMergeResult.success) {
+            showStatus(`[${repoName}] Pulled and merged master`);
+          } else {
+            showStatus(`[${repoName}] Merge conflicts detected`, true);
+            showConflictsDialog(repo, "origin/master");
+          }
           break;
         }
         case "git-rename": {

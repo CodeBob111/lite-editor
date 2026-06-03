@@ -1,4 +1,4 @@
-import { EditorState } from "@codemirror/state";
+import { EditorState, Annotation, Transaction } from "@codemirror/state";
 import { EditorView, keymap, ViewUpdate } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
@@ -30,6 +30,12 @@ let _tabManager: TabManager;
 export function initEditorSetup(tabManager: TabManager) {
   _tabManager = tabManager;
 }
+
+// Marks a transaction as a programmatic reload of externally-changed disk
+// content, so the updateListener below skips marking the tab dirty / autosaving
+// / re-notifying the LSP for it. Without this, reloading the editor would look
+// like a user edit and immediately overwrite the disk change back.
+export const externalReload = Annotation.define<boolean>();
 
 function diagnosticSource(view: EditorView): Diagnostic[] {
   if (!app.currentFilePath) return [];
@@ -111,6 +117,7 @@ export function createEditorState(content: string, filename: string): EditorStat
         },
       }),
       EditorView.updateListener.of((update: ViewUpdate) => {
+        if (update.transactions.some((tr) => tr.annotation(externalReload))) return;
         if (update.docChanged && app.currentFilePath) {
           _tabManager.markDirty(app.currentFilePath);
           const filePath = app.currentFilePath;
@@ -134,11 +141,34 @@ export async function saveCurrentFile() {
   const content = app.editorView.state.doc.toString();
   try {
     await writeFile(app.currentFilePath, content);
+    // Remember what we just wrote so the file watcher's echo of our own save
+    // isn't mistaken for an external change while the user keeps typing.
+    app.savedContentCache.set(app.currentFilePath, content);
     _tabManager.markSaved(app.currentFilePath);
     showStatus(`Saved ${app.currentFilePath.split("/").pop()}`);
-    const changesActive = document.querySelector('.panel-tab[data-panel="changes"].active');
+    const changesActive = document.getElementById("commit-view")?.classList.contains("active");
     if (changesActive) loadChanges();
   } catch (e) {
     showStatus(`Save failed: ${e}`, true);
   }
+}
+
+/**
+ * Replace a view's whole document with externally-changed disk content without
+ * tripping the autosave/dirty/LSP updateListener (the externalReload annotation
+ * makes that listener skip this transaction). The cursor is clamped into the new
+ * document so a shorter reloaded file doesn't throw a stale out-of-range head.
+ * Works on detached cached views too (their DOM is re-attached on tab switch).
+ *
+ * addToHistory:false keeps the reload OUT of the undo stack — otherwise a single
+ * Cmd-Z after a reload would revert to the pre-reload content, mark the tab dirty,
+ * and let autosave silently overwrite the external change back onto disk.
+ */
+export function applyExternalContent(view: EditorView, content: string) {
+  const head = Math.min(view.state.selection.main.head, content.length);
+  view.dispatch({
+    changes: { from: 0, to: view.state.doc.length, insert: content },
+    selection: { anchor: head },
+    annotations: [externalReload.of(true), Transaction.addToHistory.of(false)],
+  });
 }

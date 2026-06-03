@@ -17,23 +17,24 @@ import {
 } from "./lsp-navigation";
 import { initGitPanel, loadGitBranches } from "./git-panel";
 import { initChangesPanel, loadChanges, closeDiff } from "./changes-panel";
+import { initMergeConflict } from "./merge-conflict";
 import { initContextMenu, showContextMenu } from "./context-menu";
 import { setupResizeHandles } from "./resize";
-import { initMdPreview, toggleMdPreview, showPreviewButtonForFile, hideMdPreview, isMdPreviewActive } from "./md-preview";
+import { initMdPreview, toggleMdPreview, showPreviewButtonForFile, hideMdPreview, isMdPreviewActive, refreshMdPreview } from "./md-preview";
 import { showSubTabsForFile, showDepAnalyzer, hideDepAnalyzer, isDepAnalyzerActive } from "./maven-helper";
 import { initLongTaskObserver, formatReport, record } from "./perf-monitor";
 import { initAstorePanel, onProjectChanged as astoreProjectChanged, toggleAstorePanel } from "./astore-panel";
 import {
   openFolderDialog, lspDidOpen,
   onLspDiagnostics, onFileChanged, onMenuAction,
-  writeFile, runMavenCommand,
+  writeFile, runMavenCommand, readFile,
   type FileChangeEvent,
 } from "./tauri-api";
 
 import { hydrateEditorLanguage } from "./editor-language";
 import { isDiffTab, diffDataStore, destroyActiveDiff, renderDiffInEditor, openDiffAsTab, initDiffTabs } from "./diff-tabs";
 import { initRecentProjects, showRecentProjects, hideRecentProjects } from "./recent-projects";
-import { createEditorState, saveCurrentFile, initEditorSetup } from "./editor-setup";
+import { createEditorState, saveCurrentFile, initEditorSetup, applyExternalContent } from "./editor-setup";
 import { ensureJavaLspForFile, initLspManager, initJavaIndex, loadMavenModules, lastMavenModules, isJavaIndexBuilding } from "./lsp-manager";
 import {
   addProject, switchProject, closeProject, renderProjectBar,
@@ -208,14 +209,35 @@ function syncTerminalPanelProjectLazy() {
   }
 }
 
+// Wire the IDEA-style activity bar: clicking an icon switches the sidebar body
+// between the Explorer and Commit views.
+function initActivityBar() {
+  const buttons = Array.from(document.querySelectorAll<HTMLElement>(".activity-btn"));
+  const views = Array.from(document.querySelectorAll<HTMLElement>(".sidebar-view"));
+  for (const btn of buttons) {
+    btn.addEventListener("click", () => {
+      const view = btn.dataset.view;
+      buttons.forEach((b) => b.classList.toggle("active", b === btn));
+      views.forEach((v) => v.classList.toggle("active", v.id === `${view}-view`));
+      if (view === "commit") {
+        // The view was display:none until the toggle above; defer one frame so
+        // #changes-list has a real clientHeight before the virtualizer measures it.
+        requestAnimationFrame(() => loadChanges());
+      }
+    });
+  }
+}
+
 function refreshActivePanelForProject() {
+  // The Commit view lives in the left sidebar now, independent of the bottom
+  // panel, so refresh it whenever it's the active sidebar view.
+  if (document.getElementById("commit-view")?.classList.contains("active")) {
+    closeDiff();
+    loadChanges(true);
+  }
   switch (panelManager.getActivePanel()) {
     case "git":
       loadGitBranches();
-      break;
-    case "changes":
-      closeDiff();
-      loadChanges(true);
       break;
     case "maven":
       if (app.currentProjectPath) loadMavenModules(app.currentProjectPath);
@@ -247,15 +269,12 @@ initChangesPanel(
   (path) => openFile(path),
   (repoPath, change, original, modified) => openDiffAsTab(repoPath, change, original, modified),
 );
-panelManager.onSwitch("changes", () => {
-  requestAnimationFrame(() => {
-    window.setTimeout(() => { loadChanges(); }, 0);
-  });
-});
+initActivityBar();
 panelManager.onSwitch("terminal", () => openTerminalPanelLazy());
 initContextMenu(tabManager, refreshTree);
 setupResizeHandles();
 initMdPreview();
+initMergeConflict();
 initLongTaskObserver();
 initAstorePanel(
   document.getElementById("astore-panel-content")!,
@@ -500,14 +519,67 @@ onLspDiagnostics((params) => {
 let fileChangeDebounce: ReturnType<typeof setTimeout> | null = null;
 let indexRebuildDebounce: ReturnType<typeof setTimeout> | null = null;
 let changesRefreshDebounce: ReturnType<typeof setTimeout> | null = null;
+let reloadCheckDebounce: ReturnType<typeof setTimeout> | null = null;
+
+// Re-read every open file under `projectPath` from disk and, when it differs
+// from what the editor is showing, reload it so external edits become visible.
+// Path-agnostic on purpose: the watcher event's path is canonicalized
+// (/private/... on macOS) and atomic saves rename through a temp file, so
+// matching the event's path would miss real changes. Re-checking the bounded
+// set of open tabs (LRU cap 30) is cheap and robust.
+async function recheckOpenFilesAgainstDisk(projectPath: string | null) {
+  if (!projectPath) return;
+  for (const tab of tabManager.getTabs()) {
+    if (isDiffTab(tab.path)) continue;
+    if (!tab.path.startsWith(projectPath + "/")) continue;
+
+    let disk: string;
+    try {
+      disk = await readFile(tab.path);
+    } catch {
+      continue; // deleted/unreadable — structural tree refresh handles removal
+    }
+
+    const view = app.editorViewCache.get(tab.path);
+    const current = view ? view.state.doc.toString() : tab.content;
+    if (disk === current) continue;                       // already in sync
+    if (disk === app.savedContentCache.get(tab.path)) continue; // echo of our own save
+
+    if (tab.dirty) {
+      // External change collides with unsaved local edits — never clobber them.
+      showStatus(`${tab.name} changed on disk — kept your unsaved edits`, true);
+      continue;
+    }
+
+    if (view) applyExternalContent(view, disk);
+    tabManager.setContent(tab.path, disk);
+    debouncedLspDidChange(tab.path, () => disk);
+    if (tab.path === app.currentFilePath) {
+      if (isMdPreviewActive()) refreshMdPreview(disk);
+      showStatus(`Reloaded ${tab.name} (changed on disk)`);
+    }
+  }
+}
+
+function scheduleReloadCheck(projectPath: string | null) {
+  if (reloadCheckDebounce) clearTimeout(reloadCheckDebounce);
+  reloadCheckDebounce = setTimeout(() => recheckOpenFilesAgainstDisk(projectPath), 200);
+}
+
+// Returning to the window catches changes the backend throttle may have dropped
+// (mirrors how editors re-check on focus after you edit a file elsewhere).
+window.addEventListener("focus", () => recheckOpenFilesAgainstDisk(app.currentProjectPath));
+
 onFileChanged((evt: FileChangeEvent) => {
   if (evt.project === app.currentProjectPath) {
+    scheduleReloadCheck(evt.project);
+
     if (evt.hasStructural) {
       if (fileChangeDebounce) clearTimeout(fileChangeDebounce);
       fileChangeDebounce = setTimeout(() => refreshTree(), 500);
     }
 
-    const changesActive = document.querySelector('.panel-tab[data-panel="changes"].active');
+    const changesActive = document.getElementById("commit-view")?.classList.contains("active");
     if (changesActive) {
       if (changesRefreshDebounce) clearTimeout(changesRefreshDebounce);
       changesRefreshDebounce = setTimeout(() => loadChanges(), 3000);

@@ -14,13 +14,36 @@
 
     <div id="app">
       <div id="sidebar">
-        <div id="sidebar-header">
-          <span class="sidebar-title">Explorer</span>
-          <div class="sidebar-actions">
-            <button id="btn-locate-file" title="Scroll to Source">&#8982;</button>
+        <div id="activity-bar">
+          <button class="activity-btn active" data-view="explorer" title="Explorer">&#9776;</button>
+          <button class="activity-btn" data-view="commit" title="Commit">&#10003;</button>
+        </div>
+        <div id="sidebar-body">
+          <div id="explorer-view" class="sidebar-view active">
+            <div id="sidebar-header">
+              <span class="sidebar-title">Explorer</span>
+              <div class="sidebar-actions">
+                <button id="btn-locate-file" title="Scroll to Source">&#8982;</button>
+              </div>
+            </div>
+            <div id="file-tree"></div>
+          </div>
+          <div id="commit-view" class="sidebar-view">
+            <div id="changes-toolbar">
+              <span class="sidebar-title">Commit</span>
+              <button id="changes-refresh" class="maven-toolbar-btn" title="Refresh">&#x21bb;</button>
+              <span id="changes-selected-count"></span>
+            </div>
+            <div id="changes-list"></div>
+            <div id="changes-commit-area">
+              <textarea id="changes-commit-msg" placeholder="Commit message" rows="3"></textarea>
+              <div id="changes-commit-buttons">
+                <button id="changes-btn-commit" class="changes-btn" disabled>Commit</button>
+                <button id="changes-btn-commit-push" class="changes-btn changes-btn-primary" disabled>Commit and Push</button>
+              </div>
+            </div>
           </div>
         </div>
-        <div id="file-tree"></div>
       </div>
       <div id="resize-handle-sidebar" class="resize-handle-v"></div>
       <div id="main">
@@ -63,7 +86,6 @@
         <div id="panel-tabs">
           <button class="panel-tab" data-panel="terminal">Terminal</button>
           <button class="panel-tab" data-panel="git">Git</button>
-          <button class="panel-tab" data-panel="changes">Changes</button>
           <button class="panel-tab" data-panel="astore-msg">Astore Message</button>
           <button class="panel-tab active" data-panel="maven">Maven</button>
         </div>
@@ -83,20 +105,6 @@
             <div id="git-content">
               <div id="git-branches"></div>
               <div id="git-log"></div>
-            </div>
-          </div>
-          <div id="changes-panel" class="panel-view">
-            <div id="changes-toolbar">
-              <button id="changes-refresh" class="maven-toolbar-btn" title="Refresh">&#x21bb;</button>
-              <span id="changes-selected-count"></span>
-            </div>
-            <div id="changes-list"></div>
-            <div id="changes-commit-area">
-              <textarea id="changes-commit-msg" placeholder="Commit message" rows="3"></textarea>
-              <div id="changes-commit-buttons">
-                <button id="changes-btn-commit" class="changes-btn" disabled>Commit</button>
-                <button id="changes-btn-commit-push" class="changes-btn changes-btn-primary" disabled>Commit and Push</button>
-              </div>
             </div>
           </div>
           <div id="astore-msg-panel" class="panel-view">
@@ -234,6 +242,49 @@
       <div class="context-menu-separator"></div>
       <div class="context-menu-item" data-action="rename">Rename</div>
       <div class="context-menu-item context-menu-danger" data-action="delete">Delete</div>
+    </div>
+
+    <!-- Merge Conflicts dialog -->
+    <div id="merge-conflicts-overlay" class="overlay hidden">
+      <div id="merge-conflicts-dialog">
+        <div class="merge-conflicts-header">
+          <span id="merge-conflicts-title">Merge Conflicts</span>
+          <button id="merge-conflicts-close" title="Close">&times;</button>
+        </div>
+        <div id="merge-conflicts-list"></div>
+        <div class="merge-conflicts-footer">
+          <button id="merge-conflicts-abort" class="merge-conflicts-btn merge-conflicts-btn-danger">Abort Merge</button>
+          <button id="merge-conflicts-apply" class="merge-conflicts-btn merge-conflicts-btn-primary" disabled>Apply</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 3-way merge editor (fullscreen overlay) -->
+    <div id="merge-editor-overlay" class="hidden">
+      <div id="merge-editor-toolbar">
+        <span id="merge-editor-title"></span>
+        <div id="merge-editor-actions">
+          <button id="merge-editor-prev" class="merge-editor-nav" title="Previous Conflict">&uarr;</button>
+          <span id="merge-editor-counter"></span>
+          <button id="merge-editor-next" class="merge-editor-nav" title="Next Conflict">&darr;</button>
+          <button id="merge-editor-save" class="merge-conflicts-btn merge-conflicts-btn-primary">Save</button>
+          <button id="merge-editor-cancel" class="merge-conflicts-btn">Cancel</button>
+        </div>
+      </div>
+      <div id="merge-editor-panels">
+        <div class="merge-editor-pane">
+          <div class="merge-editor-pane-header">Yours</div>
+          <div id="merge-editor-ours" class="merge-editor-pane-content"></div>
+        </div>
+        <div class="merge-editor-pane">
+          <div class="merge-editor-pane-header">Theirs</div>
+          <div id="merge-editor-theirs" class="merge-editor-pane-content"></div>
+        </div>
+        <div class="merge-editor-pane">
+          <div class="merge-editor-pane-header">Result</div>
+          <div id="merge-editor-result" class="merge-editor-pane-content"></div>
+        </div>
+      </div>
     </div>
 
     <div id="status-bar">

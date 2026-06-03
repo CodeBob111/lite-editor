@@ -370,8 +370,38 @@ export async function gitCommit(cwd: string, files: string[], message: string): 
   return invoke<string>("git_commit", { cwd, files, message });
 }
 
-export async function gitMerge(cwd: string, branch: string): Promise<string> {
-  return invoke<string>("git_merge", { cwd, branch });
+export interface MergeResult {
+  success: boolean;
+  message: string;
+  conflicts: string[];
+}
+
+export async function gitMerge(cwd: string, branch: string): Promise<MergeResult> {
+  return invoke<MergeResult>("git_merge", { cwd, branch });
+}
+
+export async function gitMergeConflicts(cwd: string): Promise<string[]> {
+  return invoke<string[]>("git_merge_conflicts", { cwd });
+}
+
+export async function gitShowConflictVersion(cwd: string, relPath: string, stage: number): Promise<string> {
+  return invoke<string>("git_show_conflict_version", { cwd, relPath, stage });
+}
+
+export async function gitMergeAbort(cwd: string): Promise<string> {
+  return invoke<string>("git_merge_abort", { cwd });
+}
+
+export async function gitResolveConflictFile(cwd: string, relPath: string, content: string): Promise<string> {
+  return invoke<string>("git_resolve_conflict_file", { cwd, relPath, content });
+}
+
+export async function gitCheckoutConflictSide(cwd: string, relPath: string, side: "ours" | "theirs"): Promise<string> {
+  return invoke<string>("git_checkout_conflict_side", { cwd, relPath, side });
+}
+
+export async function gitDiscardChanges(cwd: string, relPath: string, status: string): Promise<string> {
+  return invoke<string>("git_discard_changes", { cwd, relPath, status });
 }
 
 export async function gitRebase(cwd: string, branch: string): Promise<string> {

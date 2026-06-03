@@ -101,6 +101,9 @@ export const app = {
   currentFilePath: null as string | null,
   editorView: null as EditorView | null,
   editorViewCache: new LruEditorCache(),
+  // Last content we wrote to disk per path; lets the file watcher distinguish
+  // an external change from the echo of our own autosave.
+  savedContentCache: new Map<string, string>(),
   diagnosticsMap: new BoundedDiagnosticsMap(),
   isRestoring: true,
   javaIndexReady: false,
@@ -117,10 +120,12 @@ export function currentProject(): ProjectState | null {
 
 export function destroyAllCachedViews() {
   app.editorViewCache.clear();
+  app.savedContentCache.clear();
 }
 
 export function destroyCachedView(path: string) {
   app.editorViewCache.delete(path);
+  app.savedContentCache.delete(path);
 }
 
 export function destroyCachedViewsByPrefix(prefix: string) {
@@ -129,4 +134,7 @@ export function destroyCachedViewsByPrefix(prefix: string) {
     if (p === prefix || p.startsWith(prefix + "/")) toDelete.push(p);
   }
   for (const p of toDelete) app.editorViewCache.delete(p);
+  for (const p of [...app.savedContentCache.keys()]) {
+    if (p === prefix || p.startsWith(prefix + "/")) app.savedContentCache.delete(p);
+  }
 }
