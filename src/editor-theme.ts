@@ -2,66 +2,79 @@ import { EditorView } from "@codemirror/view";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
 
+const ui = {
+  bg: "#101314",
+  panel: "#171a1c",
+  card: "#1d2224",
+  border: "#2b3336",
+  text: "#dde3e7",
+  textSubtle: "#a7b0b6",
+  muted: "#69737b",
+  accent: "#66b7bd",
+  selection: "rgba(102, 183, 189, 0.24)",
+  search: "rgba(214, 164, 87, 0.28)",
+};
+
 const baseTheme = EditorView.theme(
   {
     "&": {
-      color: "#e0e0e0",
-      backgroundColor: "#0e0e0e",
+      color: ui.text,
+      backgroundColor: ui.bg,
     },
     ".cm-content": {
-      caretColor: "#808080",
+      caretColor: ui.accent,
     },
     ".cm-cursor, .cm-dropCursor": {
-      borderLeftColor: "#808080",
+      borderLeftColor: ui.accent,
     },
     "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection":
       {
-        backgroundColor: "rgba(160, 160, 160, 0.2)",
+        backgroundColor: ui.selection,
       },
     ".cm-panels": {
-      backgroundColor: "#161616",
-      color: "#e0e0e0",
+      backgroundColor: ui.panel,
+      color: ui.text,
     },
     ".cm-panels.cm-panels-top": {
-      borderBottom: "1px solid #2a2a2a",
+      borderBottom: `1px solid ${ui.border}`,
     },
     ".cm-panels.cm-panels-bottom": {
-      borderTop: "1px solid #2a2a2a",
+      borderTop: `1px solid ${ui.border}`,
     },
     ".cm-searchMatch": {
-      backgroundColor: "rgba(160, 160, 160, 0.2)",
-      outline: "1px solid rgba(160, 160, 160, 0.35)",
+      backgroundColor: ui.search,
+      outline: "1px solid rgba(214, 164, 87, 0.42)",
     },
     ".cm-searchMatch.cm-searchMatch-selected": {
-      backgroundColor: "rgba(160, 160, 160, 0.4)",
+      backgroundColor: "rgba(214, 164, 87, 0.46)",
     },
     ".cm-activeLine": {
-      backgroundColor: "rgba(40, 40, 40, 0.5)",
+      backgroundColor: "rgba(102, 183, 189, 0.055)",
     },
     ".cm-selectionMatch": {
-      backgroundColor: "rgba(160, 160, 160, 0.12)",
+      backgroundColor: "rgba(102, 183, 189, 0.14)",
     },
     "&.cm-focused .cm-matchingBracket, &.cm-focused .cm-nonmatchingBracket": {
-      backgroundColor: "rgba(160, 160, 160, 0.25)",
+      backgroundColor: "rgba(102, 183, 189, 0.22)",
     },
     ".cm-gutters": {
-      backgroundColor: "#0e0e0e",
-      color: "#5a5a5a",
+      backgroundColor: ui.bg,
+      color: ui.muted,
       border: "none",
-      borderRight: "1px solid #2a2a2a",
+      borderRight: `1px solid ${ui.border}`,
     },
     ".cm-activeLineGutter": {
-      backgroundColor: "rgba(40, 40, 40, 0.5)",
-      color: "#a0a0a0",
+      backgroundColor: "rgba(102, 183, 189, 0.07)",
+      color: ui.textSubtle,
     },
     ".cm-foldPlaceholder": {
       backgroundColor: "transparent",
       border: "none",
-      color: "#5a5a5a",
+      color: ui.muted,
     },
     ".cm-tooltip": {
-      border: "1px solid #2a2a2a",
-      backgroundColor: "#1c1c1c",
+      border: `1px solid ${ui.border}`,
+      backgroundColor: ui.card,
       borderRadius: "6px",
       boxShadow: "0 8px 32px rgba(0,0,0,0.6)",
     },
@@ -70,13 +83,13 @@ const baseTheme = EditorView.theme(
       borderBottomColor: "transparent",
     },
     ".cm-tooltip .cm-tooltip-arrow:after": {
-      borderTopColor: "#1c1c1c",
-      borderBottomColor: "#1c1c1c",
+      borderTopColor: ui.card,
+      borderBottomColor: ui.card,
     },
     ".cm-tooltip-autocomplete": {
       "& > ul > li[aria-selected]": {
-        backgroundColor: "rgba(160, 160, 160, 0.12)",
-        color: "#e0e0e0",
+        backgroundColor: "rgba(102, 183, 189, 0.14)",
+        color: ui.text,
       },
     },
   },
@@ -84,22 +97,24 @@ const baseTheme = EditorView.theme(
 );
 
 const highlightStyle = HighlightStyle.define([
-  { tag: tags.keyword, color: "#c586c0" },
-  { tag: [tags.name, tags.deleted, tags.character, tags.propertyName, tags.macroName], color: "#d4d4d4" },
-  { tag: [tags.function(tags.variableName), tags.labelName], color: "#dcdcaa" },
-  { tag: [tags.color, tags.constant(tags.name), tags.standard(tags.name)], color: "#c586c0" },
-  { tag: [tags.definition(tags.name), tags.separator], color: "#d4d4d4" },
-  { tag: [tags.typeName, tags.className, tags.number, tags.changed, tags.annotation, tags.modifier, tags.self, tags.namespace], color: "#4ec9b0" },
-  { tag: [tags.operator, tags.operatorKeyword, tags.url, tags.escape, tags.regexp, tags.link, tags.special(tags.string)], color: "#d4d4d4" },
-  { tag: [tags.meta, tags.comment], color: "#6a9955" },
+  { tag: tags.keyword, color: "#b997d2" },
+  { tag: [tags.name, tags.deleted, tags.character, tags.macroName], color: "#d7dee3" },
+  { tag: tags.propertyName, color: "#9ccfd8" },
+  { tag: [tags.function(tags.variableName), tags.labelName], color: "#d7c985" },
+  { tag: [tags.color, tags.constant(tags.name), tags.standard(tags.name)], color: "#d7a65f" },
+  { tag: [tags.definition(tags.name), tags.separator], color: "#d7dee3" },
+  { tag: [tags.typeName, tags.className, tags.changed, tags.self, tags.namespace], color: "#6fc3b2" },
+  { tag: [tags.number, tags.annotation, tags.modifier], color: "#d7a65f" },
+  { tag: [tags.operator, tags.operatorKeyword, tags.url, tags.escape, tags.regexp, tags.link, tags.special(tags.string)], color: "#bac4ca" },
+  { tag: [tags.meta, tags.comment], color: "#7f916f", fontStyle: "italic" },
   { tag: tags.strong, fontWeight: "bold" },
   { tag: tags.emphasis, fontStyle: "italic" },
   { tag: tags.strikethrough, textDecoration: "line-through" },
-  { tag: tags.link, color: "#569cd6", textDecoration: "underline" },
-  { tag: tags.heading, fontWeight: "bold", color: "#569cd6" },
-  { tag: [tags.atom, tags.bool, tags.special(tags.variableName)], color: "#569cd6" },
-  { tag: [tags.processingInstruction, tags.string, tags.inserted], color: "#ce9178" },
-  { tag: tags.invalid, color: "#d45555" },
+  { tag: tags.link, color: "#7faedb", textDecoration: "underline" },
+  { tag: tags.heading, fontWeight: "bold", color: "#7faedb" },
+  { tag: [tags.atom, tags.bool, tags.special(tags.variableName)], color: "#7faedb" },
+  { tag: [tags.processingInstruction, tags.string, tags.inserted], color: "#d89a74" },
+  { tag: tags.invalid, color: "#df6b73" },
 ]);
 
 export const warmEarthTheme = [baseTheme, syntaxHighlighting(highlightStyle)];

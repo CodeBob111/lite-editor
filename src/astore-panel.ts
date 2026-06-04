@@ -31,6 +31,7 @@ export function toggleAstorePanel() {
   const appEl = document.getElementById("app");
   if (!appEl) return;
   appEl.classList.toggle("astore-visible");
+  if (!appEl.classList.contains("astore-visible")) leaveAstoreMsgTabIfActive();
 }
 
 export function showAstorePanel() {
@@ -41,6 +42,15 @@ export function showAstorePanel() {
 export function hideAstorePanel() {
   const appEl = document.getElementById("app");
   if (appEl) appEl.classList.remove("astore-visible");
+  leaveAstoreMsgTabIfActive();
+}
+
+// Astore Message tab 会随 astore-visible 一起隐藏；若当前正停在该面板上，
+// 切回 Maven，避免留下「已激活但不可见」的空面板。
+function leaveAstoreMsgTabIfActive() {
+  if (document.getElementById("astore-msg-panel")?.classList.contains("active")) {
+    document.querySelector<HTMLElement>('.panel-tab[data-panel="maven"]')?.click();
+  }
 }
 
 export async function onProjectChanged(projectPath: string) {

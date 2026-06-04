@@ -7,7 +7,7 @@ export function escapeHtml(text: string): string {
 export function showStatus(message: string, isError = false) {
   const el = document.getElementById("status-text")!;
   el.textContent = message;
-  el.style.color = isError ? "#f38ba8" : "var(--text-muted)";
+  el.style.color = isError ? "var(--danger)" : "var(--text-muted)";
   if (!isError) {
     setTimeout(() => {
       if (el.textContent === message) el.textContent = "Ready";

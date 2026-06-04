@@ -1,5 +1,6 @@
 import { readDirTree, deletePath, copyPath, type FileNode } from "./tauri-api";
 import { showStatus } from "./utils";
+import { fileIconMeta } from "./file-icons";
 
 export type { FileNode };
 
@@ -517,10 +518,15 @@ export class FileTree {
       let el = this.pool.pop();
       if (!el) {
         el = document.createElement("div");
+        // 三槽：[折叠箭头][类型图标][名称]。文件夹有箭头+文件夹图标，
+        // 文件箭头槽留空（仍占宽），使各行类型图标对齐成一列。
+        const chevron = document.createElement("span");
+        chevron.className = "tree-chevron";
         const icon = document.createElement("span");
         icon.className = "tree-icon";
         const label = document.createElement("span");
         label.className = "tree-label";
+        el.appendChild(chevron);
         el.appendChild(icon);
         el.appendChild(label);
       }
@@ -542,9 +548,22 @@ export class FileTree {
       style.paddingLeft = `${10 + depth * 16}px`;
       style.height = `${ITEM_HEIGHT}px`;
       style.width = `${cw}px`;
-      const iconEl = el.children[0] as HTMLElement;
-      const labelEl = el.children[1] as HTMLElement;
-      iconEl.textContent = node.isDir ? (node.expanded ? "▾" : "▸") : this.getFileIcon(node.name);
+      const chevronEl = el.children[0] as HTMLElement;
+      const iconEl = el.children[1] as HTMLElement;
+      const labelEl = el.children[2] as HTMLElement;
+      if (node.isDir) {
+        chevronEl.textContent = node.expanded ? "▾" : "▸";
+        iconEl.textContent = "▤";
+        // inline 着色：覆盖 .tree-item.active 的继承色，选中/打开时颜色不丢。
+        iconEl.style.color = "#d6a457";
+        labelEl.style.color = "";
+      } else {
+        chevronEl.textContent = "";
+        const meta = fileIconMeta(node.name);
+        iconEl.textContent = meta.glyph;
+        iconEl.style.color = meta.color;
+        labelEl.style.color = meta.dim ? "var(--text-muted)" : "";
+      }
       labelEl.textContent = node.name;
     }
 
@@ -563,22 +582,10 @@ export class FileTree {
   private estimateContentWidth(): number {
     let max = this.container.clientWidth;
     for (const { node, depth } of this.flatList) {
-      const width = 10 + depth * 16 + 16 + 4 + node.name.length * 8 + 28;
+      const width = 10 + depth * 16 + 16 + 16 + 4 + node.name.length * 8 + 28;
       if (width > max) max = width;
     }
     return Math.max(max, this.container.clientWidth);
   }
 
-  private getFileIcon(name: string): string {
-    if (name.endsWith(".java")) return "J";
-    if (name.endsWith(".py")) return "P";
-    if (name.endsWith(".ts") || name.endsWith(".tsx")) return "T";
-    if (name.endsWith(".js") || name.endsWith(".jsx")) return "J";
-    if (name.endsWith(".json")) return "{}";
-    if (name.endsWith(".xml") || name.endsWith(".pom")) return "X";
-    if (name.endsWith(".md")) return "M";
-    if (name.endsWith(".css") || name.endsWith(".scss")) return "#";
-    if (name.endsWith(".html")) return "H";
-    return "~";
-  }
 }

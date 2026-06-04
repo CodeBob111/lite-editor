@@ -34,16 +34,18 @@ function formatDate(ts: number): string {
 }
 
 function heatColor(heat: number): string {
-  const r = Math.round(40 + heat * 30);
-  const g = Math.round(45 + heat * 40);
-  const b = Math.round(70 + heat * 110);
-  const a = 0.15 + heat * 0.55;
+  const r = Math.round(42 + heat * 65);
+  const g = Math.round(51 + heat * 132);
+  const b = Math.round(54 + heat * 135);
+  const a = 0.16 + heat * 0.42;
   return `rgba(${r},${g},${b},${a})`;
 }
 
 function textColor(heat: number): string {
-  const v = Math.round(120 + heat * 100);
-  return `rgb(${v},${Math.round(v * 0.95)},${Math.round(v * 1.1)})`;
+  const r = Math.round(118 + heat * 25);
+  const g = Math.round(132 + heat * 78);
+  const b = Math.round(138 + heat * 75);
+  return `rgb(${r},${g},${b})`;
 }
 
 class BlameMarker extends GutterMarker {
@@ -86,8 +88,8 @@ const blameGutter = gutter({
 
 const blameTheme = EditorView.theme({
   ".cm-blame-gutter": {
-    backgroundColor: "#111111",
-    borderRight: "1px solid #2a2a2a",
+    backgroundColor: "#101314",
+    borderRight: "1px solid #2b3336",
   },
   ".cm-blame-gutter .cm-gutterElement": {
     minWidth: "160px",

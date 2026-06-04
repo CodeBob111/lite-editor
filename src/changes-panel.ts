@@ -1,5 +1,6 @@
 import { app } from "./state";
 import { escapeHtml, showStatus } from "./utils";
+import { fileIconMeta } from "./file-icons";
 import { appConfirm } from "./dialog";
 import { showConflictsDialog } from "./merge-conflict";
 import {
@@ -52,13 +53,13 @@ const ROW_HEIGHT = {
 };
 
 const statusColors: Record<string, string> = {
-  Modified: "#6897bb",
-  Added: "#6a8759",
-  Deleted: "#cc7832",
-  Renamed: "#ffc66d",
-  Untracked: "#808080",
-  Copied: "#6897bb",
-  Unmerged: "#d45555",
+  Modified: "#7faedb",
+  Added: "#8fbc8f",
+  Deleted: "#df6b73",
+  Renamed: "#d6a457",
+  Untracked: "#69737b",
+  Copied: "#7faedb",
+  Unmerged: "#df6b73",
 };
 
 const statusLetters: Record<string, string> = {
@@ -97,22 +98,8 @@ function selectAllFiles() {
 }
 
 function getFileIcon(filename: string): [string, string] {
-  const ext = filename.split(".").pop()?.toLowerCase() || "";
-  const map: Record<string, [string, string]> = {
-    java: ["J", "#cc7832"],
-    xml: ["X", "#9876aa"],
-    md: ["M", "#6897bb"],
-    ts: ["T", "#519aba"],
-    tsx: ["T", "#519aba"],
-    js: ["J", "#cbcb41"],
-    json: ["{}", "#cbcb41"],
-    css: ["#", "#56b6c2"],
-    html: ["H", "#e37933"],
-    properties: ["P", "#a0a0a0"],
-    yml: ["Y", "#a0a0a0"],
-    yaml: ["Y", "#a0a0a0"],
-  };
-  return map[ext] || ["·", "#a0a0a0"];
+  const m = fileIconMeta(filename);
+  return [m.glyph, m.color];
 }
 
 export async function loadChanges(force = false) {
@@ -428,7 +415,7 @@ function renderChangeItem(c: GitChange, repoIndex: number, changeIndex: number, 
   const repo = repoChanges[repoIndex];
   const filename = c.path.split("/").pop() || c.path;
   const dir = c.path.includes("/") ? c.path.substring(0, c.path.lastIndexOf("/")) : "";
-  const color = statusColors[c.status] || "#a0a0a0";
+  const color = statusColors[c.status] || "#a7b0b6";
   const letter = statusLetters[c.status] || "?";
   const [iconLetter, iconColor] = getFileIcon(filename);
   const checked = selectedFiles.has(fileKey(repo.path, c.path)) ? "checked" : "";

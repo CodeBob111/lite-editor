@@ -1,28 +1,34 @@
 :root {
-  --bg-primary: #0e0e0e;
-  --bg-secondary: #161616;
-  --bg-tertiary: #0a0a0a;
-  --bg-card: #1c1c1c;
-  --text-primary: #e0e0e0;
-  --text-secondary: #a0a0a0;
-  --text-muted: #5a5a5a;
-  --accent: #a0a0a0;
-  --accent-dim: rgba(160, 160, 160, 0.12);
-  --border: #2a2a2a;
-  --hover: #222222;
-  --active: #2e2e2e;
-  --danger: #d45555;
-  --warning: #d4944a;
-  --success: #6b8f71;
-  --info: #7aa3b5;
+  --bg-primary: #101314;
+  --bg-secondary: #171a1c;
+  --bg-tertiary: #090b0c;
+  --bg-card: #1d2224;
+  --bg-elevated: #242a2d;
+  --bg-main: var(--bg-primary);
+  --bg-hover: #202629;
+  --text-primary: #dde3e7;
+  --text-secondary: #a7b0b6;
+  --text-muted: #69737b;
+  --accent: #66b7bd;
+  --accent-strong: #8fd4d8;
+  --accent-dim: rgba(102, 183, 189, 0.14);
+  --border: #2b3336;
+  --hover: var(--bg-hover);
+  --active: #293237;
+  --danger: #df6b73;
+  --warning: #d6a457;
+  --success: #8fbc8f;
+  --info: #7faedb;
+  --selection: rgba(102, 183, 189, 0.24);
+  --search-match: rgba(214, 164, 87, 0.28);
   --sidebar-width: 260px;
   --panel-height: 200px;
   --project-bar-height: 40px;
   --radius-s: 6px;
   --radius-m: 10px;
   --radius-l: 14px;
-  --shadow-card: 0 2px 8px rgba(0, 0, 0, 0.25);
-  --shadow-popup: 0 8px 32px rgba(0, 0, 0, 0.5);
+  --shadow-card: 0 2px 10px rgba(0, 0, 0, 0.32);
+  --shadow-popup: 0 12px 42px rgba(0, 0, 0, 0.52);
   --transition: 150ms ease;
 }
 
@@ -375,12 +381,22 @@ html, body {
   flex-shrink: 0;
 }
 
+.tree-chevron {
+  width: 14px;
+  margin-right: 2px;
+  text-align: center;
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
 .tree-icon {
   width: 16px;
   margin-right: 4px;
   text-align: center;
   flex-shrink: 0;
   font-size: 12px;
+  font-weight: 600;
 }
 
 .tree-label {
@@ -495,7 +511,7 @@ html, body {
   left: 0;
   right: 0;
   height: 2px;
-  background: #4a8cc7;
+  background: var(--accent);
 }
 
 .tab-icon {
@@ -510,15 +526,15 @@ html, body {
   font-weight: 600;
 }
 
-.tab-icon-java { color: #cc7832; }
-.tab-icon-xml { color: #9876aa; }
-.tab-icon-md { color: #6897bb; }
-.tab-icon-ts { color: #519aba; }
-.tab-icon-js { color: #cbcb41; }
-.tab-icon-json { color: #cbcb41; }
-.tab-icon-css { color: #56b6c2; }
-.tab-icon-html { color: #e37933; }
-.tab-icon-diff { color: #6a8759; }
+.tab-icon-java { color: #d08a5c; }
+.tab-icon-xml { color: #b997d2; }
+.tab-icon-md { color: #7faedb; }
+.tab-icon-ts { color: #74b8d6; }
+.tab-icon-js { color: #d8bf6a; }
+.tab-icon-json { color: #d8bf6a; }
+.tab-icon-css { color: #66b7bd; }
+.tab-icon-html { color: #d88964; }
+.tab-icon-diff { color: #8fbc8f; }
 .tab-icon-default { color: var(--text-muted); }
 
 .tab-label {
@@ -666,17 +682,17 @@ html, body {
 
 .diff-styles .cm-merge-a .cm-changedLine,
 #diff-container .cm-merge-a .cm-changedLine {
-  background-color: rgba(204, 83, 83, 0.07);
+  background-color: color-mix(in srgb, var(--danger) 9%, transparent);
 }
 
 .diff-styles .cm-merge-b .cm-changedLine,
 #diff-container .cm-merge-b .cm-changedLine {
-  background-color: rgba(90, 170, 110, 0.07);
+  background-color: color-mix(in srgb, var(--success) 9%, transparent);
 }
 
 .diff-styles .cm-deletedChunk,
 #diff-container .cm-deletedChunk {
-  background-color: rgba(204, 83, 83, 0.08);
+  background-color: color-mix(in srgb, var(--danger) 10%, transparent);
 }
 
 .diff-styles .cm-insertedLine,
@@ -694,13 +710,13 @@ html, body {
 .diff-styles .cm-deletedChunk .cm-deletedText,
 #diff-container .cm-merge-a .cm-changedText,
 #diff-container .cm-deletedChunk .cm-deletedText {
-  background: rgba(204, 83, 83, 0.24);
+  background: color-mix(in srgb, var(--danger) 30%, transparent);
   border-radius: 2px;
 }
 
 .diff-styles .cm-merge-b .cm-changedText,
 #diff-container .cm-merge-b .cm-changedText {
-  background: rgba(90, 170, 110, 0.28);
+  background: color-mix(in srgb, var(--success) 32%, transparent);
   border-radius: 2px;
 }
 
@@ -932,12 +948,12 @@ html, body {
   line-height: 1;
 }
 .cc-badge.cc-work {
-  background: #a6e3a1;
-  color: #1e1e2e;
+  background: var(--success);
+  color: var(--bg-tertiary);
 }
 .cc-badge.cc-wait {
-  background: #585b70;
-  color: #cdd6f4;
+  background: var(--active);
+  color: var(--text-secondary);
 }
 
 .term-ctx-menu {
@@ -2110,7 +2126,7 @@ html, body {
 }
 
 .search-preview-code mark {
-  background: rgba(160, 160, 160, 0.35);
+  background: var(--search-match);
   color: var(--text-primary);
   border-radius: 2px;
   padding: 0 1px;
@@ -2203,7 +2219,7 @@ html, body {
   background: var(--active);
 }
 
-/* ========== CodeMirror theme overrides (warm earth tones) ========== */
+/* ========== CodeMirror theme overrides ========== */
 .cm-editor {
   background: var(--bg-primary) !important;
 }
@@ -2220,15 +2236,15 @@ html, body {
 }
 
 .cm-editor .cm-activeLine {
-  background: rgba(40, 40, 40, 0.4) !important;
+  background: rgba(102, 183, 189, 0.055) !important;
 }
 
 .cm-editor .cm-selectionBackground {
-  background: rgba(160, 160, 160, 0.2) !important;
+  background: var(--selection) !important;
 }
 
 .cm-editor.cm-focused .cm-selectionBackground {
-  background: rgba(160, 160, 160, 0.25) !important;
+  background: rgba(102, 183, 189, 0.28) !important;
 }
 
 .cm-editor .cm-cursor {
@@ -2236,17 +2252,17 @@ html, body {
 }
 
 .cm-editor .cm-matchingBracket {
-  background: rgba(160, 160, 160, 0.3) !important;
+  background: rgba(102, 183, 189, 0.22) !important;
   color: var(--text-primary) !important;
 }
 
 .cm-editor .cm-searchMatch {
-  background: rgba(160, 160, 160, 0.25) !important;
+  background: var(--search-match) !important;
   border-radius: 2px;
 }
 
 .cm-editor .cm-searchMatch.cm-searchMatch-selected {
-  background: rgba(160, 160, 160, 0.45) !important;
+  background: rgba(214, 164, 87, 0.46) !important;
 }
 
 .cm-editor .cm-foldGutter span {
@@ -2324,7 +2340,7 @@ html, body {
 #md-preview {
   display: none;
   overflow-y: auto;
-  background: #1a1a1a;
+  background: var(--bg-primary);
   padding: 0;
 }
 
@@ -2332,7 +2348,7 @@ html, body {
   max-width: 860px;
   margin: 0 auto;
   padding: 32px 48px 64px;
-  color: #d4d4d4;
+  color: var(--text-primary);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
   font-size: 15px;
   line-height: 1.7;
@@ -2343,28 +2359,28 @@ html, body {
   font-weight: 700;
   margin: 0.6em 0 0.4em;
   padding-left: 14px;
-  border-left: 4px solid #d19a66;
-  color: #e0e0e0;
+  border-left: 4px solid var(--warning);
+  color: var(--text-primary);
 }
 .md-body h2 {
   font-size: 1.5em;
   font-weight: 600;
   margin: 1.2em 0 0.4em;
   padding-bottom: 0.3em;
-  border-bottom: 1px solid #333;
-  color: #e0e0e0;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-primary);
 }
 .md-body h3 {
   font-size: 1.25em;
   font-weight: 600;
   margin: 1em 0 0.3em;
-  color: #ddd;
+  color: var(--text-primary);
 }
 .md-body h4, .md-body h5, .md-body h6 {
   font-size: 1em;
   font-weight: 600;
   margin: 0.8em 0 0.2em;
-  color: #ccc;
+  color: var(--text-secondary);
 }
 
 .md-body p {
@@ -2372,7 +2388,7 @@ html, body {
 }
 
 .md-body a {
-  color: #6ab0f3;
+  color: var(--info);
   text-decoration: none;
 }
 .md-body a:hover {
@@ -2380,16 +2396,16 @@ html, body {
 }
 
 .md-body strong {
-  color: #e8e8e8;
+  color: var(--text-primary);
   font-weight: 600;
 }
 
 .md-body blockquote {
   margin: 0.8em 0;
   padding: 8px 16px;
-  border-left: 4px solid #555;
-  background: #222;
-  color: #bbb;
+  border-left: 4px solid var(--border);
+  background: var(--bg-card);
+  color: var(--text-secondary);
   border-radius: 0 4px 4px 0;
 }
 .md-body blockquote p {
@@ -2408,19 +2424,19 @@ html, body {
 }
 
 .md-body code {
-  background: #2a2a2a;
+  background: var(--bg-elevated);
   padding: 2px 6px;
   border-radius: 4px;
   font-family: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
   font-size: 0.9em;
-  color: #e6c07b;
+  color: var(--warning);
 }
 
 .md-body pre {
   margin: 1em 0;
   padding: 16px 20px;
-  background: #1e1e1e;
-  border: 1px solid #333;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
   border-radius: 6px;
   overflow-x: auto;
 }
@@ -2428,7 +2444,7 @@ html, body {
   background: none;
   padding: 0;
   border-radius: 0;
-  color: #d4d4d4;
+  color: var(--text-primary);
   font-size: 13px;
   line-height: 1.5;
 }
@@ -2439,22 +2455,22 @@ html, body {
   width: 100%;
 }
 .md-body th, .md-body td {
-  border: 1px solid #444;
+  border: 1px solid var(--border);
   padding: 8px 12px;
   text-align: left;
 }
 .md-body th {
-  background: #252525;
+  background: var(--bg-card);
   font-weight: 600;
-  color: #e0e0e0;
+  color: var(--text-primary);
 }
 .md-body tr:nth-child(even) {
-  background: #1f1f1f;
+  background: var(--bg-card);
 }
 
 .md-body hr {
   border: none;
-  border-top: 1px solid #444;
+  border-top: 1px solid var(--border);
   margin: 1.5em 0;
 }
 
@@ -2659,7 +2675,7 @@ html, body {
   color: var(--danger);
   font-weight: 700;
   font-size: 13px;
-  background: rgba(212, 85, 85, 0.06);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
   border-left: 3px solid var(--danger);
 }
 
@@ -2685,13 +2701,13 @@ html, body {
 
 /* Navigation flash highlight */
 .cm-flash-line {
-  background-color: rgba(255, 213, 79, 0.3);
+  background-color: color-mix(in srgb, var(--warning) 32%, transparent);
   animation: flash-fade 1.5s ease-out forwards;
 }
 
 @keyframes flash-fade {
-  0% { background-color: rgba(255, 213, 79, 0.3); }
-  60% { background-color: rgba(255, 213, 79, 0.2); }
+  0% { background-color: color-mix(in srgb, var(--warning) 32%, transparent); }
+  60% { background-color: color-mix(in srgb, var(--warning) 22%, transparent); }
   100% { background-color: transparent; }
 }
 
@@ -2709,6 +2725,9 @@ html, body {
 .astore-visible #resize-handle-astore { display: block; }
 .astore-visible #main { border-radius: 0; }
 .astore-visible #tabs-header { border-radius: 0; }
+/* Astore Message tab 仅在 Astore 插件激活（检测到 Astore 项目）时出现 */
+.panel-tab[data-panel="astore-msg"] { display: none; }
+.astore-visible .panel-tab[data-panel="astore-msg"] { display: inline-block; }
 
 #resize-handle-astore {
   display: none;
@@ -2925,13 +2944,13 @@ html, body {
 }
 
 .merge-conflict-status.resolved {
-  background: rgba(78, 201, 176, 0.15);
-  color: #4ec9b0;
+  background: color-mix(in srgb, var(--success) 18%, transparent);
+  color: var(--success);
 }
 
 .merge-conflict-status.unresolved {
-  background: rgba(212, 85, 85, 0.15);
-  color: #d45555;
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
+  color: var(--danger);
 }
 
 .merge-conflict-actions {
@@ -2961,7 +2980,7 @@ html, body {
 }
 
 .merge-conflict-btn.merge-btn:hover {
-  background: rgba(86, 156, 214, 0.15);
+  background: color-mix(in srgb, var(--info) 18%, transparent);
 }
 
 .merge-conflicts-footer {
@@ -3008,7 +3027,7 @@ html, body {
 }
 
 .merge-conflicts-btn-danger:hover {
-  background: rgba(212, 85, 85, 0.15);
+  background: color-mix(in srgb, var(--danger) 18%, transparent);
 }
 
 /* ---- 3-Way Merge Editor ---- */
@@ -3109,13 +3128,13 @@ html, body {
 }
 
 /* Merge conflict highlights */
-.merge-ours-bg { background: rgba(78, 201, 176, 0.08); }
-.merge-theirs-bg { background: rgba(86, 156, 214, 0.08); }
-.merge-conflict-bg { background: rgba(212, 85, 85, 0.08); }
+.merge-ours-bg { background: color-mix(in srgb, var(--success) 10%, transparent); }
+.merge-theirs-bg { background: color-mix(in srgb, var(--info) 10%, transparent); }
+.merge-conflict-bg { background: color-mix(in srgb, var(--danger) 10%, transparent); }
 
-.merge-ours-line { background: rgba(78, 201, 176, 0.12); }
-.merge-theirs-line { background: rgba(86, 156, 214, 0.12); }
-.merge-conflict-line { background: rgba(212, 85, 85, 0.12); }
+.merge-ours-line { background: color-mix(in srgb, var(--success) 14%, transparent); }
+.merge-theirs-line { background: color-mix(in srgb, var(--info) 14%, transparent); }
+.merge-conflict-line { background: color-mix(in srgb, var(--danger) 14%, transparent); }
 
 /* Accept/reject buttons in merge editor gutters */
 .merge-accept-btn {
@@ -3133,19 +3152,19 @@ html, body {
 }
 
 .merge-accept-ours {
-  background: rgba(78, 201, 176, 0.25);
-  color: #4ec9b0;
+  background: color-mix(in srgb, var(--success) 28%, transparent);
+  color: var(--success);
 }
 
 .merge-accept-ours:hover {
-  background: rgba(78, 201, 176, 0.45);
+  background: color-mix(in srgb, var(--success) 48%, transparent);
 }
 
 .merge-accept-theirs {
-  background: rgba(86, 156, 214, 0.25);
-  color: #569cd6;
+  background: color-mix(in srgb, var(--info) 28%, transparent);
+  color: var(--info);
 }
 
 .merge-accept-theirs:hover {
-  background: rgba(86, 156, 214, 0.45);
+  background: color-mix(in srgb, var(--info) 48%, transparent);
 }
