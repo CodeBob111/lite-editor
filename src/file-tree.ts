@@ -1,4 +1,10 @@
-import { readDirTree, deletePath, copyPath, type FileNode } from "./tauri-api";
+import {
+  readDirTree,
+  deletePath,
+  copyPath,
+  copyFilesToClipboard,
+  type FileNode,
+} from "./tauri-api";
 import { showStatus } from "./utils";
 import { fileIconMeta } from "./file-icons";
 
@@ -197,8 +203,14 @@ export class FileTree {
   }
 
   private copySelected() {
-    this.clipboard = { paths: [...this.selectedPaths], cut: false };
-    showStatus(`Copied ${this.clipboard.paths.length} item(s)`);
+    const paths = [...this.selectedPaths];
+    // 1) 应用内剪贴板：供树内 Cmd+V 粘贴（复制文件副本）。
+    this.clipboard = { paths, cut: false };
+    // 2) 系统剪贴板：写入文件引用，可粘贴到 Finder / 其他 app。
+    copyFilesToClipboard(paths).catch((err) =>
+      showStatus(`Copy to clipboard failed: ${err}`, true),
+    );
+    showStatus(`Copied ${paths.length} item(s)`);
   }
 
   private async pasteClipboard() {

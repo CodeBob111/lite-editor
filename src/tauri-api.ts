@@ -78,6 +78,11 @@ export async function copyPath(src: string, dest: string): Promise<void> {
   return invoke<void>("copy_path", { src, dest });
 }
 
+// 把文件以「文件引用」写入系统剪贴板，可在 Finder / 其他 app 中粘贴出真正的文件。
+export async function copyFilesToClipboard(paths: string[]): Promise<void> {
+  return invoke<void>("copy_files_to_clipboard", { paths });
+}
+
 export async function renamePath(oldPath: string, newPath: string): Promise<void> {
   return invoke<void>("rename_path", { oldPath, newPath });
 }

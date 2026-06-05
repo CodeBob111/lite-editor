@@ -31,3 +31,8 @@ reqwest = { version = "0.12", features = ["json", "native-tls"] }
 md-5 = "0.10"
 hex = "0.4"
 dirs = "5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSPasteboard", "NSPasteboardItem"] }
+objc2-foundation = { version = "0.3.2", features = ["NSString", "NSArray", "NSURL"] }

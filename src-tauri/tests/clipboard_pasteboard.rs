@@ -1,0 +1,83 @@
+// Empirical check: does copy_files_to_clipboard actually put a *file reference*
+// (public.file-url) on the system pasteboard — the thing Finder/other apps read
+// on paste — not just plain text? This is the load-bearing assumption behind the
+// "Cmd+C copies the file" feature; if the pasteboard ends up holding text or a
+// `list`, no frontend wiring can make Finder paste the file.
+//
+// These tests mutate the REAL general pasteboard. They are not run by the build
+// (`tauri build` never invokes `cargo test`); run them with `cargo test`.
+
+#![cfg(target_os = "macos")]
+
+use lite_editor_lib::clipboard::copy_files_to_clipboard;
+use std::process::Command;
+
+fn make_temp_file(name: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("lite_editor_clip_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(name);
+    std::fs::write(&file, b"clip test\n").unwrap();
+    // Canonicalize so /tmp -> /private/tmp resolves the same way the pasteboard
+    // round-trip will report it, making exact comparison reliable.
+    std::fs::canonicalize(&file)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[test]
+fn single_file_lands_as_a_readable_file_url() {
+    let path = make_temp_file("readme.md");
+    copy_files_to_clipboard(vec![path.clone()]).expect("write to pasteboard");
+
+    // Read it back the way an app would: the clipboard must coerce to a file
+    // reference («class furl») and resolve to exactly the file we copied.
+    let out = Command::new("osascript")
+        .args(["-e", "POSIX path of (the clipboard as «class furl»)"])
+        .output()
+        .expect("run osascript");
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    assert!(
+        out.status.success(),
+        "clipboard did not hold a file reference: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // osascript reports the path with a trailing slash stripped; compare basenames
+    // plus full path to be robust against any trailing-slash normalization.
+    assert_eq!(got, path, "pasteboard file-url did not round-trip the path");
+}
+
+#[test]
+fn multiple_files_each_land_as_a_distinct_file_url() {
+    let a = make_temp_file("a.txt");
+    let b = make_temp_file("b.txt");
+    copy_files_to_clipboard(vec![a.clone(), b.clone()]).expect("write to pasteboard");
+
+    // Each NSURL becomes its own pasteboard item carrying public.file-url; verify
+    // the count via AppKit (osascript collapses multi-file to a useless `list`).
+    let count = pasteboard_file_url_item_count();
+    assert_eq!(count, 2, "expected 2 file-url pasteboard items, got {count}");
+}
+
+// Count pasteboard items that advertise the public.file-url type.
+fn pasteboard_file_url_item_count() -> usize {
+    use objc2_app_kit::NSPasteboard;
+    use objc2_foundation::NSString;
+
+    let pb = NSPasteboard::generalPasteboard();
+    let Some(items) = pb.pasteboardItems() else {
+        return 0;
+    };
+    let file_url_type = NSString::from_str("public.file-url");
+    let mut n = 0usize;
+    for item in items.iter() {
+        for ty in item.types().iter() {
+            if ty.isEqualToString(&file_url_type) {
+                n += 1;
+                break;
+            }
+        }
+    }
+    n
+}

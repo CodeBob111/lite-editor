@@ -1,4 +1,5 @@
 mod astore;
+pub mod clipboard;
 mod commands;
 pub mod git;
 mod java_index;
@@ -144,6 +145,7 @@ pub fn run() {
             commands::stop_file_watcher,
             commands::save_session,
             commands::load_session,
+            clipboard::copy_files_to_clipboard,
             lsp::start_lsp,
             lsp::stop_lsp,
             lsp::lsp_did_open,
