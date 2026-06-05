@@ -290,18 +290,28 @@ export function initTerminalPanel() {
   });
   termResizeObserver.observe(document.getElementById("terminal-container")!);
 
+  // 监听 claude 状态：只轮询当前项目可见的终端（其它项目的徽标根本不渲染），
+  // 并用 in-flight 守卫避免上一轮还没跑完就堆下一轮——IPC 是串行单通道，
+  // 重叠的轮询会把通道堵死（之前卡顿的根因）。
+  let pollingClaude = false;
   setInterval(async () => {
-    let changed = false;
-    for (const inst of termInstances) {
-      try {
-        const status = await getClaudeStatus(inst.id);
-        if (status !== inst.claudeStatus) {
-          inst.claudeStatus = status;
-          changed = true;
-        }
-      } catch { /* ignore */ }
+    if (pollingClaude) return;
+    pollingClaude = true;
+    try {
+      let changed = false;
+      for (const inst of currentProjectTerms()) {
+        try {
+          const status = await getClaudeStatus(inst.id);
+          if (status !== inst.claudeStatus) {
+            inst.claudeStatus = status;
+            changed = true;
+          }
+        } catch { /* ignore */ }
+      }
+      if (changed) renderTerminalTabs();
+    } finally {
+      pollingClaude = false;
     }
-    if (changed) renderTerminalTabs();
   }, 2000);
 }
 

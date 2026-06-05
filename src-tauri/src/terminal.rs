@@ -16,6 +16,9 @@ struct TerminalInstance {
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
     child_pid: Option<u32>,
+    // 缓存上次解析到的 claude 进程 pid。仅作为快路径提示——真正的状态来源是
+    // claude 的 session 文件；缓存失效时会重新走 ps 解析（见 get_claude_status）。
+    claude_pid: Option<u32>,
 }
 
 #[derive(Default)]
@@ -101,6 +104,7 @@ pub fn spawn_terminal(
         writer,
         master: pair.master,
         child_pid,
+        claude_pid: None,
     };
 
     let mut terminals = state.terminals.lock().map_err(|e| e.to_string())?;
@@ -199,40 +203,78 @@ fn find_claude_descendant(shell_pid: u32) -> Option<u32> {
     None
 }
 
+/// 廉价的存活探测：进程是否还在？（不 spawn 任何子进程。）
+/// EPERM 也算存活——进程存在，只是我们无权向它发信号。
+#[cfg(unix)]
+fn pid_alive(pid: u32) -> bool {
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if r == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(_pid: u32) -> bool {
+    true
+}
+
+/// 从 claude 的 session 文件读取状态。
+/// 返回 None 表示文件缺失/不可读（调用方据此判断缓存是否已失效）；
+/// 返回 Some 表示文件存在——解析失败时退化为 "wait"，与原有语义一致。
+fn read_claude_status(claude_pid: u32) -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let session_path = format!("{}/.claude/sessions/{}.json", home, claude_pid);
+    let session_json = std::fs::read_to_string(&session_path).ok()?;
+    let status = match serde_json::from_str::<serde_json::Value>(&session_json) {
+        Ok(v) => match v["status"].as_str() {
+            Some("busy") => "work",
+            _ => "wait",
+        },
+        Err(_) => "wait",
+    };
+    Some(status.into())
+}
+
 #[tauri::command]
 pub fn get_claude_status(id: u32, state: State<'_, TerminalState>) -> Result<Option<String>, String> {
-    let shell_pid = {
+    // 1) 在锁内取出 shell_pid 与缓存的 claude_pid，随即释放锁——
+    //    昂贵的 ps spawn 绝不在持锁时进行，避免阻塞 write/resize 等命令。
+    let (shell_pid, cached) = {
         let terminals = state.terminals.lock().map_err(|e| e.to_string())?;
         match terminals.get(&id) {
             Some(inst) => match inst.child_pid {
-                Some(pid) => pid,
+                Some(pid) => (pid, inst.claude_pid),
                 None => return Ok(None),
             },
             None => return Ok(None),
         }
     };
 
-    let claude_pid = match find_claude_descendant(shell_pid) {
+    // 2) 快路径：只有当缓存的 pid 仍存活、且其 session 文件可读时才信任缓存。
+    //    session 文件是状态的唯一真相来源，缓存的 pid 只是命中提示。
+    //    这样既避免了 pid 复用导致的误报，又在常态下完全省掉 ps spawn。
+    if let Some(cpid) = cached {
+        if pid_alive(cpid) {
+            if let Some(status) = read_claude_status(cpid) {
+                return Ok(Some(status));
+            }
+        }
+        // pid 已死，或 session 文件消失 → 缓存失效，落到慢路径重新解析。
+    }
+
+    // 3) 慢路径：spawn ps 重新解析 claude 子孙进程（唯一昂贵的调用），并回写缓存。
+    let new_pid = find_claude_descendant(shell_pid);
+    {
+        let mut terminals = state.terminals.lock().map_err(|e| e.to_string())?;
+        if let Some(inst) = terminals.get_mut(&id) {
+            inst.claude_pid = new_pid;
+        }
+    }
+    let cpid = match new_pid {
         Some(pid) => pid,
         None => return Ok(None),
     };
-
-    let home = std::env::var("HOME").unwrap_or_default();
-    let session_path = format!("{}/.claude/sessions/{}.json", home, claude_pid);
-    let session_json = match std::fs::read_to_string(&session_path) {
-        Ok(s) => s,
-        Err(_) => return Ok(Some("wait".into())),
-    };
-
-    let session: serde_json::Value = match serde_json::from_str(&session_json) {
-        Ok(v) => v,
-        Err(_) => return Ok(Some("wait".into())),
-    };
-
-    let status = match session["status"].as_str() {
-        Some("busy") => "work",
-        _ => "wait",
-    };
-
-    Ok(Some(status.into()))
+    // 新解析到的 claude：报告其状态（session 文件缺失退化为 "wait"，沿用原语义）。
+    Ok(Some(read_claude_status(cpid).unwrap_or_else(|| "wait".into())))
 }

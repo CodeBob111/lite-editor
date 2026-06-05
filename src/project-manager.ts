@@ -440,7 +440,30 @@ function applyExpandedPaths(node: { path: string; isDir: boolean; expanded?: boo
   if (node.children) for (const c of node.children) applyExpandedPaths(c, paths);
 }
 
+let refreshInFlight = false;
+let refreshPending = false;
+
+// 合并重叠的刷新：单飞执行，期间到来的请求只置 pending，结束后至多补跑一次。
+// 之前每次结构变更都各自发起一次 readDirTree——IPC 被堵时会堆叠十几个并发调用，
+// 全部在通道疏通时一起返回（perf 报告里 refresh-tree 单次 max 477s 的成因）。
 export async function refreshTree() {
+  if (refreshInFlight) {
+    refreshPending = true;
+    return;
+  }
+  refreshInFlight = true;
+  try {
+    await doRefreshTree();
+  } finally {
+    refreshInFlight = false;
+    if (refreshPending) {
+      refreshPending = false;
+      void refreshTree();
+    }
+  }
+}
+
+async function doRefreshTree() {
   if (!app.currentProjectPath) return;
   const t0 = performance.now();
   const project = currentProject();

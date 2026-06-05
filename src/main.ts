@@ -285,7 +285,9 @@ initAstorePanel(
 
 function exportPerfReport() {
   const report = formatReport();
-  const dest = (app.currentProjectPath || "/tmp") + "/perf-report.txt";
+  // 固定写到 /tmp，绝不写进被监听的项目目录——否则导出报告这一动作本身
+  // 会触发文件监听 → refreshTree → 更多 IPC（observer effect，正是排查时遇到的卡顿放大器）。
+  const dest = "/tmp/lite-editor-perf-report.txt";
   writeFile(dest, report).then(() => {
     showStatus(`Perf report → ${dest}`);
   }).catch((err) => {
