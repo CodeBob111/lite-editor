@@ -68,6 +68,9 @@ export function initSearch(ft: FileTree) {
 // ---- Search overlay ----
 
 export function showSearchOverlay() {
+  // 两个搜索浮层互斥:打开「文件内搜索」前先关掉「快速打开」,
+  // 二者同为全屏 .overlay(z-index 相同),共存会相互遮挡(见 hideQuickOpen)。
+  hideQuickOpen();
   const overlay = document.getElementById("search-overlay")!;
   const input = document.getElementById("search-dialog-input") as HTMLInputElement;
   overlay.classList.remove("hidden");
@@ -81,37 +84,65 @@ export function hideSearchOverlay() {
   searchPreviewCache.clear();
 }
 
+// 在结果区显示一行提示(搜索中 / 无结果 / 失败)。用 textContent + replaceChildren,
+// 不走 innerHTML。
+function showSearchMessage(text: string) {
+  const container = document.getElementById("search-dialog-results")!;
+  const row = document.createElement("div");
+  row.className = "search-result-info";
+  row.textContent = text;
+  container.replaceChildren(row);
+}
+
 async function executeSearchOverlay() {
   if (!app.currentProjectPath) return;
   const token = ++searchRequestToken;
   const input = document.getElementById("search-dialog-input") as HTMLInputElement;
   const query = input.value.trim();
   if (!query) {
-    document.getElementById("search-dialog-results")!.innerHTML = "";
+    document.getElementById("search-dialog-results")!.replaceChildren();
+    document.getElementById("search-preview")!.replaceChildren();
     searchResults = [];
+    searchTotalResults = 0;
     return;
   }
 
   const caseSensitive = (document.querySelector("#search-dialog-case input") as HTMLInputElement).checked;
 
+  // 立刻给出「搜索中」反馈:大仓搜索可能要几秒,没有它时空白结果区与「没搜到」
+  // 无法区分(用户此前正是因此误以为没搜到)。startedAt 用于回报真实耗时。
+  showSearchMessage("Searching…");
+  const startedAt = performance.now();
+
   try {
     const results = await searchInFiles(app.currentProjectPath, query, caseSensitive);
     if (token !== searchRequestToken) return;
+    const elapsed = Math.round(performance.now() - startedAt);
     searchResults = results.map((r) => ({ path: r.path, line: r.line, text: r.text }));
     searchTotalResults = results.length;
     searchSelectedIndex = 0;
     searchShowLimit = 100;
     renderSearchResults();
-    showStatus(`${results.length} result(s) found`);
+    showStatus(`${results.length} result(s) in ${elapsed} ms`);
   } catch (e) {
+    if (token === searchRequestToken) showSearchMessage(`Search failed: ${e}`);
     showStatus(`Search failed: ${e}`, true);
   }
 }
 
 function renderSearchResults() {
   const container = document.getElementById("search-dialog-results")!;
-  container.innerHTML = "";
+  container.replaceChildren();
   if (!app.currentProjectPath) return;
+  // 明确的「无结果」态:否则空结果区与「尚未搜索」长得一模一样(用户此前的核心困惑)。
+  if (searchTotalResults === 0) {
+    const row = document.createElement("div");
+    row.className = "search-result-info";
+    row.textContent = "No results";
+    container.appendChild(row);
+    document.getElementById("search-preview")!.replaceChildren();
+    return;
+  }
   const projectPrefix = app.currentProjectPath + "/";
 
   const shown = searchResults.slice(0, searchShowLimit);
@@ -227,6 +258,9 @@ function searchConfirm() {
 // ---- Quick open ----
 
 export function showQuickOpen() {
+  // 与 showSearchOverlay 对称:打开「快速打开」前先关掉「文件内搜索」,
+  // 避免双击 Shift 在 Cmd+Shift+F 浮层之上再叠一个把输入框挡住。
+  hideSearchOverlay();
   const overlay = document.getElementById("quick-open-overlay")!;
   const input = document.getElementById("quick-open-input") as HTMLInputElement;
   overlay.classList.remove("hidden");

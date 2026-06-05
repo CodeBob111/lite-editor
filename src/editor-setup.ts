@@ -1,7 +1,7 @@
 import { EditorState, Annotation, Transaction } from "@codemirror/state";
 import { EditorView, keymap, ViewUpdate } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
-import { searchKeymap, highlightSelectionMatches } from "@codemirror/search";
+import { search, searchKeymap, highlightSelectionMatches } from "@codemirror/search";
 import { autocompletion, completionKeymap } from "@codemirror/autocomplete";
 import {
   syntaxHighlighting,
@@ -13,6 +13,7 @@ import {
 import { linter, lintGutter, type Diagnostic } from "@codemirror/lint";
 
 import { warmEarthTheme } from "./editor-theme";
+import { createSearchPanel } from "./editor-search-panel";
 import { flashLineField } from "./flash-line";
 import { blameExtensions } from "./git-blame-gutter";
 import { languageCompartment } from "./editor-language";
@@ -78,6 +79,9 @@ export function createEditorState(content: string, filename: string): EditorStat
       foldGutter(),
       bracketMatching(),
       highlightSelectionMatches(),
+      // 把 Cmd+F 查找面板放到编辑器顶部(默认在底部),并用自定义面板做成 IDEA 同款
+      // 查找条(见 editor-search-panel.ts)。
+      search({ top: true, createPanel: createSearchPanel }),
       autocompletion(),
       syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
       linter(diagnosticSource),
