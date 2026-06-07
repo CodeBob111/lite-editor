@@ -18,6 +18,16 @@
 - **磁盘外部改动自动重载**：原生文件系统监听器会检测到打开的文件被其他工具在磁盘上修改（如 `git checkout`、格式化工具、另一个编辑器），并自动重新加载。未保存的本地编辑永远不会被覆盖——这种情况下只会给出一条不破坏内容的提示。
 - **会话恢复**：下次启动时重新打开你的项目、文件和当前激活的标签。
 
+### 界面与工作台
+- **深色单强调色设计系统**——以冷蓝为唯一强调色的深色主题,由一套集中的 token 色板(背景 / 文字 / 边框 / 语法高亮)统一驱动 UI 与 CodeMirror 主题。
+- **左侧活动栏**在 **Explorer**、**Commit**(工作区改动)、**Git**(分支 + 日志)、**Maven**(模块 + 构建输出)之间切换侧栏,底部固定一个**设置**齿轮。
+- **设置 / 偏好界面**(`Cmd/Ctrl` + `,`):编辑器字体族 / 字号、Tab 宽度、自动换行、括号匹配、代码折叠——绑定到真实的 `settings.json`(持久化到 app-data 目录,并带一个原始 JSON 编辑标签),改动即时应用到编辑器。
+- **欢迎 / 起始页**:无打开文件时显示,含快捷操作(打开文件夹、克隆、新建终端)与最近项目列表。
+- **状态栏**:显示当前分支、诊断计数、光标位置、缩进、编码、行尾、语言。
+- **面包屑**:标签栏下方显示当前文件的路径。
+- **IDEA 风格查找条**(`Cmd/Ctrl` + `F`):实时命中计数 + 区分大小写 / 全词 / 正则开关。
+- **任意可选中处皆可复制**——Markdown 预览、Git 面板、文件树、状态栏等只读区域,不止编辑器内。
+
 ### 语言智能
 - **LSP 集成**（Java）：跳转到定义（`F12` 或 `Cmd`+点击）、查找引用、在 lint 槽（gutter）中渲染内联诊断。
 - **Java 类索引**：在 Rust 侧对项目及其 Maven 依赖建立符号索引，用于快速的类查找与导航。
@@ -63,16 +73,20 @@ lite-editor/
 │   ├── editor-setup.ts     # CodeMirror 状态、自动保存、外部重载
 │   ├── tabs.ts             # 标签管理器
 │   ├── state.ts            # 全局应用状态 + LRU 编辑器缓存
-│   ├── git-panel.ts        # Git 界面
+│   ├── git-panel.ts        # Git 界面(左侧栏视图)
 │   ├── lsp-*.ts            # LSP 客户端与导航
-│   ├── maven-helper.ts     # Maven 面板
+│   ├── maven-helper.ts     # Maven 面板(左侧栏视图)
 │   ├── terminal-panel.ts   # 集成终端
 │   ├── md-preview.ts       # Markdown 预览
+│   ├── settings.ts         # 偏好设置状态、持久化、即时应用
+│   ├── settings-ui.ts      # 设置界面(Cmd+,)
+│   ├── status-bar.ts       # 状态栏(分支/诊断/光标/语言)+ 面包屑
+│   ├── welcome-screen.ts   # 欢迎 / 起始页
 │   └── ...
 ├── src-tauri/              # 后端（Rust）
 │   ├── src/
 │   │   ├── lib.rs          # Tauri 构建器、原生菜单、命令注册
-│   │   ├── commands.rs     # 文件操作、搜索、Maven、文件监听、会话
+│   │   ├── commands.rs     # 文件操作、搜索、Maven、文件监听、会话、设置
 │   │   ├── git.rs          # Git 命令面
 │   │   ├── lsp.rs          # Language Server Protocol 桥接
 │   │   ├── java_index.rs   # Java 类索引器
@@ -119,13 +133,15 @@ cd src-tauri && cargo test
 | 打开文件夹 | `Cmd/Ctrl` + `O` |
 | 保存 | `Cmd/Ctrl` + `S` |
 | 关闭标签 | `Cmd/Ctrl` + `W` |
+| 当前文件内查找 | `Cmd/Ctrl` + `F` |
 | 全局文件搜索 | `Cmd/Ctrl` + `Shift` + `F` |
 | 快速打开文件 | 双击 `左 Shift` |
+| 设置 / 偏好 | `Cmd/Ctrl` + `,` |
 | 跳转到定义 | `F12` 或 `Cmd` + 点击 |
 | 后退 / 前进导航 | `Cmd/Ctrl` + `[` / `]` |
 | 导出性能报告 | `Cmd/Ctrl` + `Shift` + `P` |
 
-终端、Git 面板从 **View（视图）** 菜单切换。
+Explorer、Commit、Git、Maven 从左侧**活动栏**切换;集成终端从 **View（视图）** 菜单切换。
 
 ---
 

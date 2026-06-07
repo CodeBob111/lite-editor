@@ -18,6 +18,16 @@ A lightweight, native desktop code editor built with [Tauri 2](https://tauri.app
 - **Reload-on-external-change**: a native filesystem watcher detects when an open file is modified on disk by another tool (e.g. `git checkout`, a formatter, another editor) and reloads it automatically. Unsaved local edits are never clobbered — you get a non-destructive warning instead.
 - **Session restore**: reopens your projects, files, and active tab on the next launch.
 
+### Workbench & UI
+- **Dark, single-accent design system** — a cobalt-accent dark theme driven by a centralized token palette (backgrounds, text, borders, syntax colors) shared by the UI and the CodeMirror theme.
+- **Activity bar** on the left switches the sidebar between **Explorer**, **Commit** (working-tree changes), **Git** (branches + log), and **Maven** (modules + build output), with a **Settings** gear pinned at the bottom.
+- **Settings / preferences UI** (`Cmd/Ctrl` + `,`): editor font family/size, tab size, word wrap, bracket matching, and code folding — bound to a real `settings.json` (persisted to the app-data dir, with a raw-JSON editing tab) and applied live to the editor.
+- **Welcome / start screen** with quick actions (open folder, clone, new terminal) and a recent-projects list, shown when no file is open.
+- **Status bar** with the current branch, diagnostic counts, cursor position, indentation, encoding, line ending, and language.
+- **Breadcrumb** of the active file's path under the tab bar.
+- **IDEA-style find toolbar** (`Cmd/Ctrl` + `F`) with a live match count and case / whole-word / regex toggles.
+- **Copy from anywhere selectable** — Markdown preview, Git panel, file tree, status bar, and other read-only surfaces, not just the editor.
+
 ### Language intelligence
 - **LSP integration** (Java): go-to-definition (`F12` or `Cmd`+click), find references, and inline diagnostics rendered in the lint gutter.
 - **Java class index**: a Rust-side symbol index over your project and its Maven dependencies for fast class lookup and navigation.
@@ -63,16 +73,20 @@ lite-editor/
 │   ├── editor-setup.ts     # CodeMirror state, autosave, external-reload
 │   ├── tabs.ts             # Tab manager
 │   ├── state.ts            # Global app state + LRU editor cache
-│   ├── git-panel.ts        # Git UI
+│   ├── git-panel.ts        # Git UI (left sidebar view)
 │   ├── lsp-*.ts            # LSP client & navigation
-│   ├── maven-helper.ts     # Maven panel
+│   ├── maven-helper.ts     # Maven panel (left sidebar view)
 │   ├── terminal-panel.ts   # Integrated terminal
 │   ├── md-preview.ts       # Markdown preview
+│   ├── settings.ts         # Preferences state, persistence, live-apply
+│   ├── settings-ui.ts      # Settings screen (Cmd+,)
+│   ├── status-bar.ts       # Status bar (branch/diagnostics/cursor/lang) + breadcrumb
+│   ├── welcome-screen.ts   # Welcome / start screen
 │   └── ...
 ├── src-tauri/              # Backend (Rust)
 │   ├── src/
 │   │   ├── lib.rs          # Tauri builder, native menu, command registry
-│   │   ├── commands.rs     # File ops, search, Maven, file watcher, session
+│   │   ├── commands.rs     # File ops, search, Maven, file watcher, session, settings
 │   │   ├── git.rs          # Git command surface
 │   │   ├── lsp.rs          # Language Server Protocol bridge
 │   │   ├── java_index.rs   # Java class indexer
@@ -119,13 +133,15 @@ cd src-tauri && cargo test
 | Open folder | `Cmd/Ctrl` + `O` |
 | Save | `Cmd/Ctrl` + `S` |
 | Close tab | `Cmd/Ctrl` + `W` |
+| Find in current file | `Cmd/Ctrl` + `F` |
 | Find in files | `Cmd/Ctrl` + `Shift` + `F` |
 | Quick open file | double-tap `Left Shift` |
+| Settings / preferences | `Cmd/Ctrl` + `,` |
 | Go to definition | `F12` or `Cmd` + click |
 | Navigate back / forward | `Cmd/Ctrl` + `[` / `]` |
 | Export performance report | `Cmd/Ctrl` + `Shift` + `P` |
 
-Terminal and Git panels are toggled from the **View** menu.
+Explorer, Commit, Git, and Maven are switched from the left **activity bar**; the integrated terminal is toggled from the **View** menu.
 
 ---
 
