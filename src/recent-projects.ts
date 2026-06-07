@@ -1,7 +1,7 @@
 import { app } from "./state";
 import { abbreviatePath } from "./utils";
 
-interface RecentProject {
+export interface RecentProject {
   path: string;
   name: string;
   openedAt: number;
@@ -20,7 +20,7 @@ function projectNameFromPath(path: string) {
   return path.split("/").filter(Boolean).pop() || path;
 }
 
-function loadRecentProjects(): RecentProject[] {
+export function loadRecentProjects(): RecentProject[] {
   try {
     const raw = localStorage.getItem(RECENT_PROJECTS_KEY);
     if (!raw) return [];

@@ -145,6 +145,8 @@ pub fn run() {
             commands::stop_file_watcher,
             commands::save_session,
             commands::load_session,
+            commands::save_settings,
+            commands::load_settings,
             clipboard::copy_files_to_clipboard,
             lsp::start_lsp,
             lsp::stop_lsp,

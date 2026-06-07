@@ -11,6 +11,7 @@ import {
   type GitBranch, type GitCommit, type GitRepo,
 } from "./tauri-api";
 import { showConflictsDialog } from "./merge-conflict";
+import { setStatusBranch } from "./status-bar";
 
 let gitRepos: GitRepo[] = [];
 let gitExpandedRepos = new Set<string>();
@@ -308,7 +309,10 @@ async function ensureRepoBranches(repoPath: string) {
     const branches = await gitListBranches(repoPath);
     gitRepoBranchCache.set(repoPath, { branches, error: null });
     const current = branches.find((b) => b.current && !b.remote);
-    if (current) gitRepoHeadCache.set(repoPath, current.name);
+    if (current) {
+      gitRepoHeadCache.set(repoPath, current.name);
+      if (repoPath === app.currentProjectPath) setStatusBranch(current.name);
+    }
   } catch (err) {
     gitRepoBranchCache.set(repoPath, { branches: [], error: String(err) });
   }
@@ -698,9 +702,6 @@ export function initGitPanel() {
     loadGitBranches();
   });
 
-  document.querySelector('[data-panel="git"]')!.addEventListener("click", () => {
-    if (gitRepos.length === 0) {
-      requestAnimationFrame(() => { loadGitBranches(); });
-    }
-  });
+  // (Git 已移到左侧活动栏:激活时由 activateSidebarView("git") 调 loadGitBranches,
+  //  不再需要监听底部 Git tab。)
 }

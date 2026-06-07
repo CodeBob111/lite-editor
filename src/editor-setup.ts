@@ -6,8 +6,6 @@ import { autocompletion, completionKeymap } from "@codemirror/autocomplete";
 import {
   syntaxHighlighting,
   defaultHighlightStyle,
-  bracketMatching,
-  foldGutter,
   foldKeymap,
 } from "@codemirror/language";
 import { linter, lintGutter, type Diagnostic } from "@codemirror/lint";
@@ -22,6 +20,8 @@ import { navigateBack, navigateForward } from "./file-ops";
 import { smartNavigateAtPos, debouncedLspDidChange } from "./lsp-navigation";
 import { app } from "./state";
 import { showStatus } from "./utils";
+import { updateStatusCursor, setStatusDiagnostics } from "./status-bar";
+import { editorSettingsExtensions } from "./settings";
 import { writeFile } from "./tauri-api";
 import { loadChanges } from "./changes-panel";
 import type { TabManager } from "./tabs";
@@ -39,10 +39,10 @@ export function initEditorSetup(tabManager: TabManager) {
 export const externalReload = Annotation.define<boolean>();
 
 function diagnosticSource(view: EditorView): Diagnostic[] {
-  if (!app.currentFilePath) return [];
+  if (!app.currentFilePath) { setStatusDiagnostics(0, 0); return []; }
   const uri = `file://${app.currentFilePath}`;
   const diags = app.diagnosticsMap.get(uri);
-  if (!diags || diags.length === 0) return [];
+  if (!diags || diags.length === 0) { setStatusDiagnostics(0, 0); return []; }
 
   const doc = view.state.doc;
   const result: Diagnostic[] = [];
@@ -68,6 +68,10 @@ function diagnosticSource(view: EditorView): Diagnostic[] {
     });
   }
 
+  setStatusDiagnostics(
+    result.filter((r) => r.severity === "error").length,
+    result.filter((r) => r.severity === "warning").length,
+  );
   return result;
 }
 
@@ -76,8 +80,7 @@ export function createEditorState(content: string, filename: string): EditorStat
     doc: content,
     extensions: [
       history(),
-      foldGutter(),
-      bracketMatching(),
+      ...editorSettingsExtensions(),
       highlightSelectionMatches(),
       // 把 Cmd+F 查找面板放到编辑器顶部(默认在底部),并用自定义面板做成 IDEA 同款
       // 查找条(见 editor-search-panel.ts)。
@@ -97,7 +100,6 @@ export function createEditorState(content: string, filename: string): EditorStat
       ]),
       ...warmEarthTheme,
       flashLineField,
-      EditorView.lineWrapping,
       languageCompartment.of([]),
       ...blameExtensions,
       EditorView.domEventHandlers({
@@ -121,6 +123,7 @@ export function createEditorState(content: string, filename: string): EditorStat
         },
       }),
       EditorView.updateListener.of((update: ViewUpdate) => {
+        if (update.selectionSet || update.docChanged) updateStatusCursor();
         if (update.transactions.some((tr) => tr.annotation(externalReload))) return;
         if (update.docChanged && app.currentFilePath) {
           _tabManager.markDirty(app.currentFilePath);

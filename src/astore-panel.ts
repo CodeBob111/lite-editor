@@ -46,10 +46,10 @@ export function hideAstorePanel() {
 }
 
 // Astore Message tab 会随 astore-visible 一起隐藏；若当前正停在该面板上，
-// 切回 Maven，避免留下「已激活但不可见」的空面板。
+// 切回 Terminal,避免留下「已激活但不可见」的空面板(Maven 已移到左侧栏)。
 function leaveAstoreMsgTabIfActive() {
   if (document.getElementById("astore-msg-panel")?.classList.contains("active")) {
-    document.querySelector<HTMLElement>('.panel-tab[data-panel="maven"]')?.click();
+    document.querySelector<HTMLElement>('.panel-tab[data-panel="terminal"]')?.click();
   }
 }
 

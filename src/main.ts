@@ -8,6 +8,10 @@ import {
   app, destroyCachedView,
 } from "./state";
 import { showStatus, getLanguageId } from "./utils";
+import { updateStatusBar } from "./status-bar";
+import { initSettings } from "./settings";
+import { openSettings, closeSettings, isSettingsOpen } from "./settings-ui";
+import { initWelcomeScreen, refreshWelcomeScreen } from "./welcome-screen";
 import { initFileOps, openFile, navigateBack, navigateForward } from "./file-ops";
 import { flashLine } from "./flash-line";
 import {
@@ -140,6 +144,8 @@ const tabManager = new TabManager(
     if (isMdPreviewActive()) hideMdPreview();
     showPreviewButtonForFile(filePath);
     showSubTabsForFile(filePath);
+    updateStatusBar();
+    refreshWelcomeScreen();
   },
   () => debouncedSaveSession(),
   (closedPath) => {
@@ -162,6 +168,8 @@ const tabManager = new TabManager(
     showPreviewButtonForFile(null);
     showSubTabsForFile(null);
     fileTree.highlightFile("");
+    updateStatusBar();
+    refreshWelcomeScreen();
   },
 );
 
@@ -224,41 +232,49 @@ function syncTerminalPanelProjectLazy() {
 
 // Wire the IDEA-style activity bar: clicking an icon switches the sidebar body
 // between the Explorer and Commit views.
-function initActivityBar() {
-  const buttons = Array.from(document.querySelectorAll<HTMLElement>(".activity-btn"));
-  const views = Array.from(document.querySelectorAll<HTMLElement>(".sidebar-view"));
-  for (const btn of buttons) {
-    btn.addEventListener("click", () => {
-      const view = btn.dataset.view;
-      buttons.forEach((b) => b.classList.toggle("active", b === btn));
-      views.forEach((v) => v.classList.toggle("active", v.id === `${view}-view`));
-      if (view === "commit") {
-        // The view was display:none until the toggle above; defer one frame so
-        // #changes-list has a real clientHeight before the virtualizer measures it.
-        requestAnimationFrame(() => loadChanges());
-      }
-    });
+// 切换左侧活动栏视图:Explorer / Commit / Git / Maven。按钮与视图都用 data-view 配对
+// (Git/Maven 已从底部面板移到左侧,故不再用 `${view}-view` 的 id 约定)。
+function activateSidebarView(view: string) {
+  document.querySelectorAll<HTMLElement>(".activity-btn[data-view]").forEach((b) =>
+    b.classList.toggle("active", b.dataset.view === view));
+  document.querySelectorAll<HTMLElement>(".sidebar-view").forEach((v) =>
+    v.classList.toggle("active", v.dataset.view === view));
+  if (view === "commit") {
+    // The view was display:none until the toggle above; defer one frame so
+    // #changes-list has a real clientHeight before the virtualizer measures it.
+    requestAnimationFrame(() => loadChanges());
+  } else if (view === "git") {
+    loadGitBranches();
+  } else if (view === "maven") {
+    if (app.currentProjectPath) loadMavenModules(app.currentProjectPath);
   }
 }
 
+function initActivityBar() {
+  // 只有带 data-view 的按钮参与切换;底部齿轮是独立动作(打开设置)。
+  document.querySelectorAll<HTMLElement>(".activity-btn[data-view]").forEach((btn) => {
+    btn.addEventListener("click", () => activateSidebarView(btn.dataset.view!));
+  });
+  document.getElementById("btn-settings")?.addEventListener("click", () => openSettings());
+  // Maven 构建开始时,自动聚焦左侧 Maven 视图(取代原来切到底部 Maven tab)。
+  panelManager.setMavenFocusHandler(() => activateSidebarView("maven"));
+}
+
 function refreshActivePanelForProject() {
-  // The Commit view lives in the left sidebar now, independent of the bottom
-  // panel, so refresh it whenever it's the active sidebar view.
-  if (document.getElementById("commit-view")?.classList.contains("active")) {
+  // Commit / Git / Maven 现在都是左侧栏视图:刷新当前激活的那个。
+  const activeView = document.querySelector<HTMLElement>(".sidebar-view.active")?.dataset.view;
+  if (activeView === "commit") {
     closeDiff();
     loadChanges(true);
+  } else if (activeView === "git") {
+    loadGitBranches();
+  } else if (activeView === "maven") {
+    if (app.currentProjectPath) loadMavenModules(app.currentProjectPath);
   }
-  switch (panelManager.getActivePanel()) {
-    case "git":
-      loadGitBranches();
-      break;
-    case "maven":
-      if (app.currentProjectPath) loadMavenModules(app.currentProjectPath);
-      break;
-    case "terminal":
-      syncTerminalPanelProjectLazy();
-      openTerminalPanelLazy();
-      break;
+  // 底部面板现在只剩 Terminal / Astore Message。
+  if (panelManager.getActivePanel() === "terminal") {
+    syncTerminalPanelProjectLazy();
+    openTerminalPanelLazy();
   }
 }
 
@@ -283,6 +299,12 @@ initChangesPanel(
   (repoPath, change, original, modified) => openDiffAsTab(repoPath, change, original, modified),
 );
 initActivityBar();
+initWelcomeScreen({
+  onOpenFolder: () => openFolderDialog().then((folder) => { if (folder) addProject(folder); }),
+  onClone: () => import("./vcs-clone").then((mod) => mod.showVcsClone((dir) => addProject(dir))),
+  onNewTerminal: () => openTerminalPanelLazy(),
+  onOpenRecent: (path) => addProject(path),
+});
 panelManager.onSwitch("terminal", () => openTerminalPanelLazy());
 initContextMenu(tabManager, refreshTree);
 setupResizeHandles();
@@ -366,6 +388,34 @@ document.addEventListener("mousedown", (e) => {
 let lastLeftShiftDownAt = 0;
 document.addEventListener("keydown", (e) => {
   if (e.defaultPrevented) return;
+
+  // Cmd/Ctrl+C 兜底复制:WKWebView 对普通 DOM 选区(Markdown 预览、Git 分支、文件树、
+  // 状态栏等)的原生复制不可靠 —— 这些区域只要鼠标能选中,就把选区文本写入剪贴板。
+  // CodeMirror 与 input/textarea 自带复制,这里不拦截,交给原生。
+  if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && (e.key === "c" || e.key === "C")) {
+    const active = document.activeElement as HTMLElement | null;
+    const selfHandled = !!active &&
+      (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || !!active.closest(".cm-editor"));
+    if (!selfHandled) {
+      const text = window.getSelection()?.toString() ?? "";
+      if (text) {
+        e.preventDefault();
+        navigator.clipboard.writeText(text).catch(() => {});
+      }
+    }
+    // selfHandled 或无选区:不拦截,落到原生复制。
+  }
+
+  // 设置屏:Cmd+, 开;开着时吞掉 Esc 关闭,并屏蔽其它应用快捷键(输入键照常进控件)。
+  if ((e.metaKey || e.ctrlKey) && e.key === ",") {
+    e.preventDefault();
+    openSettings();
+    return;
+  }
+  if (isSettingsOpen()) {
+    if (e.key === "Escape") { e.preventDefault(); closeSettings(); }
+    return;
+  }
 
   const recentProjectsVisible = !document
     .getElementById("recent-projects-overlay")!
@@ -462,8 +512,7 @@ onMenuAction((id) => {
       panelManager.switchTo("terminal");
       break;
     case "toggle-git":
-      panelManager.switchTo("git");
-      loadGitBranches();
+      activateSidebarView("git");
       break;
     case "toggle-astore":
       toggleAstorePanel();
@@ -669,13 +718,19 @@ if (import.meta.env.DEV) {
 
 const state = createEditorState(welcomeContent, "welcome.ts");
 app.editorView = new EditorView({ state, parent: editorContainer });
+refreshWelcomeScreen(); // 启动先显示欢迎屏;恢复会话打开文件后 onTabActivate 会隐藏它。
 
 showStatus("Restoring session...");
-loadSession().then(() => {
-  if (app.projects.length === 0) {
-    showStatus("Ready");
-  }
-  if (app.currentProjectPath) {
-    astoreProjectChanged(app.currentProjectPath);
-  }
+// 先载入偏好设置(应用字体 CSS 变量 + 让随后恢复的文件按当前 tabSize/wrap 等初始化),
+// 再恢复会话。
+initSettings().finally(() => {
+  loadSession().then(() => {
+    if (app.projects.length === 0) {
+      showStatus("Ready");
+    }
+    if (app.currentProjectPath) {
+      astoreProjectChanged(app.currentProjectPath);
+    }
+    refreshWelcomeScreen(); // 会话恢复后再校正一次(无文件则保持显示)。
+  });
 });

@@ -17,9 +17,12 @@
         <div id="activity-bar">
           <button class="activity-btn active" data-view="explorer" title="Explorer">&#9776;</button>
           <button class="activity-btn" data-view="commit" title="Commit">&#10003;</button>
+          <button class="activity-btn" data-view="git" title="Git">&#9095;</button>
+          <button class="activity-btn" data-view="maven" title="Maven">&#9706;</button>
+          <button id="btn-settings" class="activity-btn activity-bottom" title="Settings (Preferences)">&#9881;</button>
         </div>
         <div id="sidebar-body">
-          <div id="explorer-view" class="sidebar-view active">
+          <div id="explorer-view" class="sidebar-view active" data-view="explorer">
             <div id="sidebar-header">
               <span class="sidebar-title">Explorer</span>
               <div class="sidebar-actions">
@@ -28,7 +31,7 @@
             </div>
             <div id="file-tree"></div>
           </div>
-          <div id="commit-view" class="sidebar-view">
+          <div id="commit-view" class="sidebar-view" data-view="commit">
             <div id="changes-toolbar">
               <span class="sidebar-title">Commit</span>
               <button id="changes-refresh" class="maven-toolbar-btn" title="Refresh">&#x21bb;</button>
@@ -43,6 +46,24 @@
               </div>
             </div>
           </div>
+          <div id="git-panel" class="sidebar-view" data-view="git">
+            <div id="git-toolbar">
+              <button id="git-refresh" class="maven-toolbar-btn" title="Refresh">&#x21bb;</button>
+              <span id="git-log-title"></span>
+            </div>
+            <div id="git-content">
+              <div id="git-branches"></div>
+              <div id="git-log"></div>
+            </div>
+          </div>
+          <div id="maven-panel" class="sidebar-view" data-view="maven">
+            <div id="maven-toolbar">
+              <button id="maven-sync" class="maven-toolbar-btn" title="Reload All Maven Projects">&#x21bb;</button>
+              <button id="maven-generate" class="maven-toolbar-btn" title="Generate Sources and Update Folders">&#x2699;</button>
+            </div>
+            <div id="maven-tree"></div>
+            <pre id="maven-output" class="maven-output-area"></pre>
+          </div>
         </div>
       </div>
       <div id="resize-handle-sidebar" class="resize-handle-v"></div>
@@ -53,6 +74,7 @@
             <button id="btn-md-preview" class="tabs-action-btn hidden" title="Preview Markdown">&#9776;</button>
           </div>
         </div>
+        <div id="breadcrumb" class="hidden"></div>
         <div id="editor-area">
           <div id="editor-container"></div>
           <div id="md-split-handle"></div>
@@ -84,39 +106,19 @@
       <div id="resize-handle-panel" class="resize-handle-h"></div>
       <div id="panel">
         <div id="panel-tabs">
-          <button class="panel-tab" data-panel="terminal">Terminal</button>
-          <button class="panel-tab" data-panel="git">Git</button>
+          <button class="panel-tab active" data-panel="terminal">Terminal</button>
           <button class="panel-tab" data-panel="astore-msg">Astore Message</button>
-          <button class="panel-tab active" data-panel="maven">Maven</button>
         </div>
         <div id="panel-content">
-          <div id="terminal-panel" class="panel-view">
+          <div id="terminal-panel" class="panel-view active">
             <div id="terminal-tab-bar">
               <div id="terminal-tabs"></div>
               <button id="terminal-add" class="terminal-add-btn" title="New Terminal">+</button>
             </div>
             <div id="terminal-container"></div>
           </div>
-          <div id="git-panel" class="panel-view">
-            <div id="git-toolbar">
-              <button id="git-refresh" class="maven-toolbar-btn" title="Refresh">&#x21bb;</button>
-              <span id="git-log-title"></span>
-            </div>
-            <div id="git-content">
-              <div id="git-branches"></div>
-              <div id="git-log"></div>
-            </div>
-          </div>
           <div id="astore-msg-panel" class="panel-view">
             <div id="astore-msg-content" class="astore-msg-content"></div>
-          </div>
-          <div id="maven-panel" class="panel-view active">
-            <div id="maven-toolbar">
-              <button id="maven-sync" class="maven-toolbar-btn" title="Reload All Maven Projects">&#x21bb;</button>
-              <button id="maven-generate" class="maven-toolbar-btn" title="Generate Sources and Update Folders">&#x2699;</button>
-            </div>
-            <div id="maven-tree"></div>
-            <pre id="maven-output" class="maven-output-area"></pre>
           </div>
         </div>
       </div>
@@ -288,7 +290,24 @@
     </div>
 
     <div id="status-bar">
-      <span id="status-text">Ready</span>
+      <div id="status-left">
+        <span id="status-branch" class="status-seg hidden" title="Current branch">
+          <span class="status-ico">&#9095;</span><span id="status-branch-name"></span>
+        </span>
+        <span id="status-diags" class="status-seg hidden" title="Problems">
+          <span class="status-diag-err">&times;<span id="status-diags-err">0</span></span>
+          <span class="status-diag-warn">&#9888;<span id="status-diags-warn">0</span></span>
+        </span>
+        <span id="status-text">Ready</span>
+      </div>
+      <div id="status-right" class="hidden">
+        <span id="status-cursor" class="status-seg"></span>
+        <span id="status-indent" class="status-seg">Spaces: 4</span>
+        <span id="status-encoding" class="status-seg">UTF-8</span>
+        <span id="status-eol" class="status-seg">LF</span>
+        <span id="status-lang" class="status-seg"></span>
+        <span id="status-lsp" class="status-seg" title="Language server"><span class="status-dot"></span></span>
+      </div>
       <div id="lsp-progress" class="lsp-progress hidden">
         <span id="lsp-progress-text"></span>
         <div class="lsp-progress-bar"><div id="lsp-progress-fill" class="lsp-progress-fill"></div></div>

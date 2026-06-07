@@ -7,6 +7,8 @@ export class PanelManager {
   private onSwitchCallbacks: Map<string, () => void> = new Map();
   private onLeaveCallbacks: Map<string, () => void> = new Map();
   private activePanelId: string | null = null;
+  // Maven 面板已移到左侧栏(不再是底部 tab);构建开始时用它来聚焦左侧 Maven 视图。
+  private mavenFocusHandler: (() => void) | null = null;
 
   constructor(tabsContainer: HTMLElement, contentContainer: HTMLElement) {
     this.tabsContainer = tabsContainer;
@@ -65,8 +67,12 @@ export class PanelManager {
     outputEl.scrollTop = outputEl.scrollHeight;
   }
 
+  setMavenFocusHandler(fn: () => void) {
+    this.mavenFocusHandler = fn;
+  }
+
   clearMavenOutput(header: string) {
-    this.switchTo("maven");
+    this.mavenFocusHandler?.();
     this.mavenLines = [header];
     this.renderMavenOutput();
   }

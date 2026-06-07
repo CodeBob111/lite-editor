@@ -401,6 +401,42 @@ pub fn load_session(app: tauri::AppHandle) -> Result<Option<String>, String> {
     }
 }
 
+// ---- Settings (preferences) ----
+// 偏好设置持久化到 app_data_dir/settings.json,与 session.json 同目录、同套路。
+// 前端拿到原始 JSON 字符串自己解析/合并默认值,后端只负责存取。
+
+#[tauri::command]
+pub async fn save_settings(data: String, app: tauri::AppHandle) -> Result<(), String> {
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&app_dir)
+            .map_err(|e| format!("Failed to create app data dir: {}", e))?;
+        let settings_file = app_dir.join("settings.json");
+        std::fs::write(settings_file, data).map_err(|e| format!("Failed to save settings: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))?
+}
+
+#[tauri::command]
+pub fn load_settings(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let settings_file = app_dir.join("settings.json");
+    if settings_file.exists() {
+        let data = std::fs::read_to_string(settings_file)
+            .map_err(|e| format!("Failed to read settings: {}", e))?;
+        Ok(Some(data))
+    } else {
+        Ok(None)
+    }
+}
+
 // ---- Maven ----
 
 #[derive(Serialize)]

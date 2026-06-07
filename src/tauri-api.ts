@@ -244,6 +244,14 @@ export async function loadSessionData(): Promise<string | null> {
   return invoke<string | null>("load_session", {});
 }
 
+export async function saveSettingsData(data: string): Promise<void> {
+  return invoke<void>("save_settings", { data });
+}
+
+export async function loadSettingsData(): Promise<string | null> {
+  return invoke<string | null>("load_settings", {});
+}
+
 // ---- Terminal ----
 
 export async function spawnTerminal(cwd: string, cols: number, rows: number): Promise<number> {
