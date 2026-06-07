@@ -130,6 +130,25 @@ async function executeSearchOverlay() {
   }
 }
 
+// 等宽字体下单个字符的宽度(用于估算一行能放多少字符)。canvas 测一次后缓存。
+let _searchPathCharW = 0;
+function pathCharWidth(): number {
+  if (_searchPathCharW) return _searchPathCharW;
+  const ctx = document.createElement("canvas").getContext("2d");
+  if (!ctx) return 7.2;
+  ctx.font = "12px 'SF Mono', 'Fira Code', 'Cascadia Code', monospace";
+  _searchPathCharW = ctx.measureText("0".repeat(100)).width / 100 || 7.2;
+  return _searchPathCharW;
+}
+
+// 路径太长放不下时省略「前面」、保留尾部(文件名最有用):头部加「…」。
+function truncatePathFront(path: string, availPx: number): string {
+  if (availPx <= 0) return path;
+  const maxChars = Math.floor(availPx / pathCharWidth()) - 1; // 留 1 字余量,确保尾部不被裁
+  if (maxChars <= 1 || path.length <= maxChars) return path;
+  return "…" + path.slice(path.length - (maxChars - 1));
+}
+
 function renderSearchResults() {
   const container = document.getElementById("search-dialog-results")!;
   container.replaceChildren();
@@ -148,12 +167,20 @@ function renderSearchResults() {
   const shown = searchResults.slice(0, searchShowLimit);
   searchSelectedIndex = Math.min(searchSelectedIndex, Math.max(0, shown.length - 1));
 
+  // 行宽固定(对话框 720px):减去行内左右 padding(18×2)与滚动条余量,得到路径可用像素宽。
+  const avail = container.clientWidth - 36 - 12;
+
   for (let i = 0; i < shown.length; i++) {
     const r = shown[i];
     const relPath = r.path.replace(projectPrefix, "");
     const item = document.createElement("div");
     item.className = `search-result-item${i === searchSelectedIndex ? " selected" : ""}`;
-    item.innerHTML = `<span class="search-result-file">${escapeHtml(relPath)}</span><span class="search-result-line">${r.line + 1}</span><span class="search-result-text">${escapeHtml(r.text)}</span>`;
+    // 只展示路径;过长时省略「前面」、保留尾部文件名。完整路径放进 title 供 hover。
+    const fileSpan = document.createElement("span");
+    fileSpan.className = "search-result-file";
+    fileSpan.textContent = truncatePathFront(relPath, avail);
+    fileSpan.title = relPath;
+    item.appendChild(fileSpan);
     item.addEventListener("click", () => {
       searchSelectedIndex = i;
       container.querySelectorAll(".search-result-item").forEach((el, j) => el.classList.toggle("selected", j === i));

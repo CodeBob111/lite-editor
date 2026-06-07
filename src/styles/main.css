@@ -2046,21 +2046,10 @@ html, body {
 
 .search-result-file {
   color: var(--accent);
-  min-width: 120px;
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.search-result-line {
-  color: var(--text-muted);
-  min-width: 35px;
-}
-
-.search-result-text {
-  color: var(--text-secondary);
-  overflow: hidden;
-  text-overflow: ellipsis;
+  text-overflow: clip; /* 自己在头部加「…」,不用浏览器在末尾省略 */
   white-space: nowrap;
 }
 
