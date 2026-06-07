@@ -77,7 +77,7 @@ function build() {
   const logo = el("div", "welcome-logo", "</>");
   const heroText = el("div", "welcome-hero-text");
   const titleLine = el("div", "welcome-title-line");
-  titleLine.append(el("span", "welcome-title", "Lite Editor"));
+  titleLine.append(el("span", "welcome-title", "Nib"));
   titleLine.append(el("span", "welcome-version", "v0.1.0"));
   heroText.append(titleLine);
   heroText.append(el("div", "welcome-tagline",

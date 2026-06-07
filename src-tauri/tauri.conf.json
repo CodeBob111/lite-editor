@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicepage/nicepage-dist/master/tauri.conf.schema.json",
-  "productName": "Lite Editor",
+  "productName": "Nib",
   "version": "0.1.0",
   "identifier": "com.lite-editor.app",
   "build": {
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Lite Editor",
+        "title": "Nib",
         "width": 1200,
         "height": 800,
         "minWidth": 800,

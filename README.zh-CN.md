@@ -1,4 +1,4 @@
-# Lite Editor
+# Nib
 
 [English](./README.md) | **简体中文**
 

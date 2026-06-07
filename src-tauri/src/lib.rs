@@ -10,10 +10,10 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuild
 use tauri::Emitter;
 
 fn build_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
-    let app_menu = SubmenuBuilder::new(app, "Lite Editor")
+    let app_menu = SubmenuBuilder::new(app, "Nib")
         .item(&PredefinedMenuItem::about(
             app,
-            Some("About Lite Editor"),
+            Some("About Nib"),
             None,
         )?)
         .separator()

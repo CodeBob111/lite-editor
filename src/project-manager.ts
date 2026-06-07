@@ -26,7 +26,7 @@ let _panelManager: PanelManager;
 let _editorContainer: HTMLElement;
 let _onRefreshActivePanel: () => void = () => {};
 
-export const welcomeContent = `// Welcome to Lite Editor
+export const welcomeContent = `// Welcome to Nib
 //
 // A lightweight code editor built with Tauri + CodeMirror 6
 //
@@ -132,7 +132,7 @@ export async function addProject(folderPath: string) {
     newProject.treeRoot = tree;
     _fileTree.setRoot(tree);
     astoreProjectChanged(folderPath);
-    document.title = `${name} — Lite Editor`;
+    document.title = `${name} — Nib`;
 
     autoStartLsp(folderPath);
     loadMavenModules(folderPath);
@@ -185,7 +185,7 @@ export function switchProject(index: number) {
     app.editorView = new EditorView({ state, parent: _editorContainer });
   }
 
-  document.title = `${project.name} — Lite Editor`;
+  document.title = `${project.name} — Nib`;
   renderProjectBar();
   debouncedSaveSession();
   initJavaIndex(project.path);
@@ -223,7 +223,7 @@ export function closeProject(index: number) {
     _fileTree.setRoot(null);
     const state = createEditorState(welcomeContent, "welcome.ts");
     app.editorView = new EditorView({ state, parent: _editorContainer });
-    document.title = "Lite Editor";
+    document.title = "Nib";
   } else {
     if (index === app.activeProjectIndex) {
       app.activeProjectIndex = Math.min(index, app.projects.length - 1);
@@ -242,7 +242,7 @@ export function closeProject(index: number) {
         app.editorView = new EditorView({ state, parent: _editorContainer });
       }
 
-      document.title = `${project.name} — Lite Editor`;
+      document.title = `${project.name} — Nib`;
     } else if (index < app.activeProjectIndex) {
       app.activeProjectIndex--;
     }
@@ -406,7 +406,7 @@ export async function loadSession() {
         app.currentFilePath = project.activeFilePath ?? _tabManager.getActiveFile();
       }
 
-      document.title = `${project.name} — Lite Editor`;
+      document.title = `${project.name} — Nib`;
       loadMavenModules(project.path);
       renderProjectBar();
       showStatus(`Restored ${app.projects.length} project(s)`);
