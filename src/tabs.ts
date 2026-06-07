@@ -10,6 +10,7 @@ export class TabManager {
   private onTabActivate: (path: string, content: string) => void;
   private onTabClose: ((path: string) => void) | null;
   private onStateChange: (() => void) | null;
+  private onAllClosed: (() => void) | null;
   private tabs: OpenTab[] = [];
   private activeIndex: number = -1;
   private activeElement: HTMLElement | null = null;
@@ -19,11 +20,13 @@ export class TabManager {
     onTabActivate: (path: string, content: string) => void,
     onStateChange?: () => void,
     onTabClose?: (path: string) => void,
+    onAllClosed?: () => void,
   ) {
     this.container = container;
     this.onTabActivate = onTabActivate;
     this.onStateChange = onStateChange ?? null;
     this.onTabClose = onTabClose ?? null;
+    this.onAllClosed = onAllClosed ?? null;
   }
 
   openFile(path: string, content?: string, displayName?: string) {
@@ -88,6 +91,7 @@ export class TabManager {
     if (this.tabs.length === 0) {
       this.activeIndex = -1;
       this.render();
+      this.onAllClosed?.();
     } else if (wasActive) {
       this.activeIndex = Math.min(index, this.tabs.length - 1);
       this.render();
@@ -116,6 +120,7 @@ export class TabManager {
       this.onTabActivate(tab.path, tab.content);
     } else {
       this.render();
+      this.onAllClosed?.();
     }
     this.onStateChange?.();
   }

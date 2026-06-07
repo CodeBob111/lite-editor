@@ -150,6 +150,19 @@ const tabManager = new TabManager(
       destroyCachedView(closedPath);
     }
   },
+  () => {
+    // 最后一个标签关闭 → 回到空状态:销毁残留的编辑器视图、清空当前文件,
+    // 并收起 Markdown 预览与子标签(否则关掉所有 md 标签后,右侧预览框还挂着)。
+    if (app.editorView) {
+      app.editorView.dom.remove();
+      app.editorView.destroy();
+      app.editorView = null;
+    }
+    app.currentFilePath = null;
+    showPreviewButtonForFile(null);
+    showSubTabsForFile(null);
+    fileTree.highlightFile("");
+  },
 );
 
 const fileTree = new FileTree(
