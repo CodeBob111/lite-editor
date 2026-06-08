@@ -15,7 +15,6 @@ import {
   startFileWatcher, stopFileWatcher,
   saveSessionData, loadSessionData,
 } from "./tauri-api";
-import { record } from "./perf-monitor";
 import type { TabManager } from "./tabs";
 import type { FileTree } from "./file-tree";
 import type { PanelManager } from "./panel";
@@ -321,7 +320,6 @@ export function saveSession() {
 }
 
 export async function loadSession() {
-  const t0 = performance.now();
   try {
     const data = await loadSessionData();
     if (!data) {
@@ -423,7 +421,6 @@ export async function loadSession() {
     // invalid session data
   }
 
-  record({ ts: Date.now(), kind: "ui", label: "load-session", ms: performance.now() - t0 });
   app.isRestoring = false;
 }
 
@@ -465,7 +462,6 @@ export async function refreshTree() {
 
 async function doRefreshTree() {
   if (!app.currentProjectPath) return;
-  const t0 = performance.now();
   const project = currentProject();
   try {
     const expandedPaths = new Set<string>();
@@ -479,7 +475,6 @@ async function doRefreshTree() {
         project.allFilePathsCache = null;
       }
       _fileTree.setRoot(tree);
-      record({ ts: Date.now(), kind: "ui", label: "refresh-tree", ms: performance.now() - t0, args: app.currentProjectPath! });
     });
   } catch {
     // ignore refresh failures

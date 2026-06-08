@@ -26,12 +26,11 @@ import { initContextMenu, showContextMenu } from "./context-menu";
 import { setupResizeHandles } from "./resize";
 import { initMdPreview, toggleMdPreview, showPreviewButtonForFile, hideMdPreview, isMdPreviewActive, refreshMdPreview } from "./md-preview";
 import { showSubTabsForFile, showDepAnalyzer, hideDepAnalyzer, isDepAnalyzerActive } from "./maven-helper";
-import { initLongTaskObserver, formatReport, record } from "./perf-monitor";
 import { initAstorePanel, onProjectChanged as astoreProjectChanged, toggleAstorePanel } from "./astore-panel";
 import {
   openFolderDialog, lspDidOpen,
   onLspDiagnostics, onFileChanged, onMenuAction,
-  writeFile, runMavenCommand, readFile,
+  runMavenCommand, readFile,
   type FileChangeEvent,
 } from "./tauri-api";
 
@@ -54,8 +53,6 @@ const editorContainer = document.getElementById("editor-container")!;
 const tabManager = new TabManager(
   document.getElementById("tabs-bar")!,
   (filePath, content) => {
-    const t0 = performance.now();
-
     if (isDiffTab(filePath)) {
       if (isDepAnalyzerActive()) hideDepAnalyzer();
       if (app.editorView) {
@@ -101,7 +98,6 @@ const tabManager = new TabManager(
       editorContainer.appendChild(cached.dom);
       cached.requestMeasure();
       hydrateEditorLanguage(cached, filePath);
-      record({ ts: Date.now(), kind: "ui", label: "tab-switch-cached", ms: performance.now() - t0, args: filePath });
       if (getLanguageId(filePath) === "java") {
         ensureJavaLspForFile(filePath).catch(() => {});
       }
@@ -110,7 +106,6 @@ const tabManager = new TabManager(
       app.editorView = new EditorView({ state, parent: editorContainer });
       app.editorViewCache.set(filePath, app.editorView);
       hydrateEditorLanguage(app.editorView, filePath);
-      record({ ts: Date.now(), kind: "ui", label: "tab-switch-new", ms: performance.now() - t0, args: filePath });
       const langId = getLanguageId(filePath);
       if (langId === "java") {
         ensureJavaLspForFile(filePath)
@@ -310,25 +305,12 @@ initContextMenu(tabManager, refreshTree);
 setupResizeHandles();
 initMdPreview();
 initMergeConflict();
-initLongTaskObserver();
 initAstorePanel(
   document.getElementById("astore-panel-content")!,
   document.getElementById("astore-msg-content")!,
 );
 
 // ---- Helper functions ----
-
-function exportPerfReport() {
-  const report = formatReport();
-  // 固定写到 /tmp，绝不写进被监听的项目目录——否则导出报告这一动作本身
-  // 会触发文件监听 → refreshTree → 更多 IPC（observer effect，正是排查时遇到的卡顿放大器）。
-  const dest = "/tmp/lite-editor-perf-report.txt";
-  writeFile(dest, report).then(() => {
-    showStatus(`Perf report → ${dest}`);
-  }).catch((err) => {
-    showStatus(`Perf save failed: ${err}`, true);
-  });
-}
 
 function openVcsCloneLazy() {
   import("./vcs-clone").then((mod) => {
@@ -443,12 +425,6 @@ document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); hideUsagesPopup(); return; }
   }
 
-  if ((e.metaKey || e.ctrlKey) && e.shiftKey && (e.key === "p" || e.key === "P")) {
-    e.preventDefault();
-    exportPerfReport();
-    return;
-  }
-
   if (e.key === "Meta" && app.editorView) {
     app.editorView.dom.classList.add("cmd-held");
   }
@@ -516,9 +492,6 @@ onMenuAction((id) => {
       break;
     case "toggle-astore":
       toggleAstorePanel();
-      break;
-    case "export-perf":
-      exportPerfReport();
       break;
   }
 });
@@ -663,56 +636,6 @@ onFileChanged((evt: FileChangeEvent) => {
 window.addEventListener("beforeunload", () => {
   saveSession();
 });
-
-// ---- Performance monitor (dev only) ----
-
-if (import.meta.env.DEV) {
-  const hud = document.createElement("div");
-  hud.id = "perf-hud";
-  hud.style.cssText = "position:fixed;top:4px;right:4px;z-index:99999;background:rgba(0,0,0,0.75);color:#0f0;font:11px/1.3 monospace;padding:4px 8px;border-radius:4px;pointer-events:none;white-space:pre";
-  document.body.appendChild(hud);
-
-  let frameTimes: number[] = [];
-  let lastFrame = performance.now();
-  let totalRealDrops = 0;
-  let totalFrames = 0;
-  const measureFrame = () => {
-    const now = performance.now();
-    const dt = now - lastFrame;
-    frameTimes.push(dt);
-    lastFrame = now;
-    totalFrames++;
-    if (dt > 33) totalRealDrops++;
-    if (frameTimes.length >= 120) {
-      frameTimes.sort((a, b) => a - b);
-      const p50 = frameTimes[Math.floor(frameTimes.length * 0.5)];
-      const p95 = frameTimes[Math.floor(frameTimes.length * 0.95)];
-      const p99 = frameTimes[Math.floor(frameTimes.length * 0.99)];
-      const jank = frameTimes.filter(t => t > 33).length;
-      const color = jank > 3 ? "#f44" : jank > 0 ? "#fa0" : "#0f0";
-      hud.style.color = color;
-      hud.textContent = `p50=${p50.toFixed(1)} p95=${p95.toFixed(1)} p99=${p99.toFixed(1)}\njank=${jank}/120 total=${totalRealDrops}/${totalFrames}\ncache=${app.editorViewCache.size}`;
-      const entry = `${new Date().toISOString()} p50=${p50.toFixed(1)} p95=${p95.toFixed(1)} p99=${p99.toFixed(1)} jank=${jank}/120 total=${totalRealDrops}/${totalFrames} cache=${app.editorViewCache.size}`;
-      console.log(`[perf] ${entry}`);
-      try {
-        const log = JSON.parse(localStorage.getItem("perf-log") || "[]") as string[];
-        log.push(entry);
-        if (log.length > 500) log.splice(0, log.length - 500);
-        localStorage.setItem("perf-log", JSON.stringify(log));
-      } catch { /* quota exceeded */ }
-      frameTimes = [];
-    }
-    requestAnimationFrame(measureFrame);
-  };
-  requestAnimationFrame(measureFrame);
-}
-
-// ---- Dev globals ----
-
-if (import.meta.env.DEV) {
-  (window as any).__app = app;
-  (window as any).__createEditorState = createEditorState;
-}
 
 // ---- Startup ----
 
