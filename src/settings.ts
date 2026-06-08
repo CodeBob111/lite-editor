@@ -37,7 +37,9 @@ export const SETTINGS_DEFAULTS: Record<string, unknown> = {
   "editor.fontFamily": DEFAULT_FONT,
   "editor.fontSize": 13,
   "editor.tabSize": 4,
-  "editor.wordWrap": true,
+  // 代码默认不软换行(对齐 IntelliJ):软换行时 CodeMirror 会把长行的前导缩进折到
+  // 单独一行、代码顶到行首,看着像没缩进。需要时可在设置里开 Word Wrap。
+  "editor.wordWrap": false,
   "editor.matchBrackets": true,
   "editor.folding": true,
 };

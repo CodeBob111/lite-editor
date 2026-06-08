@@ -88,6 +88,9 @@ fn should_skip(name: &str) -> bool {
     matches!(
         name,
         ".git" | ".idea" | ".vscode" | "node_modules" | "target" | ".DS_Store" | "__pycache__"
+            // 构建/产物目录:否则会搜到已删代码在编译/打包输出里的陈旧副本。
+            | "build" | "dist" | "out" | "bin" | ".gradle" | ".next" | ".nuxt" | ".turbo"
+            | "coverage" | ".settings" | ".metadata"
     )
 }
 
