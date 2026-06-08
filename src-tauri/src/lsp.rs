@@ -304,6 +304,10 @@ fn start_lsp_blocking(
             "textDocument": {
                 "references": { "dynamicRegistration": false },
                 "definition": { "dynamicRegistration": false },
+                "documentSymbol": {
+                    "dynamicRegistration": false,
+                    "hierarchicalDocumentSymbolSupport": true
+                },
                 "publishDiagnostics": { "relatedInformation": false },
                 "synchronization": {
                     "didSave": true,
@@ -479,7 +483,7 @@ pub async fn lsp_find_references(
         id,
         "textDocument/references",
         params,
-        Duration::from_secs(8),
+        Duration::from_secs(5),
     )
     .await?;
     parse_locations(response)
@@ -509,11 +513,40 @@ pub async fn lsp_goto_definition(
         id,
         "textDocument/definition",
         params,
-        Duration::from_secs(5),
+        Duration::from_secs(4),
     )
     .await?;
     let locations = parse_locations(response)?;
     Ok(locations.into_iter().next())
+}
+
+/// 返回整份文档的符号树(textDocument/documentSymbol)的原始 LSP result,
+/// 前端据此按 range 命中找到光标所在的方法(像 IDEA 用 PSI 那样结构化解析,
+/// 不靠正则猜方法名)。jdtls 返回层级化的 DocumentSymbol[]。
+#[tauri::command]
+pub async fn lsp_document_symbols(
+    file_path: String,
+    state: State<'_, LspState>,
+) -> Result<serde_json::Value, String> {
+    let lang = detect_language(&file_path);
+    let server = {
+        let servers = state.servers.lock().map_err(|e| e.to_string())?;
+        find_server_for_file(&servers, &file_path, &lang)?
+    };
+
+    let id = server.next_id.fetch_add(1, Ordering::Relaxed);
+    let params = serde_json::json!({
+        "textDocument": { "uri": format!("file://{}", file_path) }
+    });
+
+    request_and_wait_on_worker(
+        server,
+        id,
+        "textDocument/documentSymbol",
+        params,
+        Duration::from_secs(3),
+    )
+    .await
 }
 
 // ---- Internals ----

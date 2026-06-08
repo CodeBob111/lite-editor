@@ -22,7 +22,7 @@ import { app } from "./state";
 import { showStatus } from "./utils";
 import { updateStatusCursor, setStatusDiagnostics } from "./status-bar";
 import { editorSettingsExtensions } from "./settings";
-import { writeFile } from "./tauri-api";
+import { writeFile, updateUsageIndexFile } from "./tauri-api";
 import { loadChanges } from "./changes-panel";
 import type { TabManager } from "./tabs";
 
@@ -154,6 +154,11 @@ export async function saveCurrentFile() {
     app.savedContentCache.set(app.currentFilePath, content);
     _tabManager.markSaved(app.currentFilePath);
     showStatus(`Saved ${app.currentFilePath.split("/").pop()}`);
+    // 保存后增量更新「符号出现」倒排索引(只重扫这一个文件、改内存,很轻),
+    // 让 find-usages 立刻反映刚改的内容。
+    if (app.currentProjectPath && app.currentFilePath.endsWith(".java")) {
+      updateUsageIndexFile(app.currentProjectPath, app.currentFilePath).catch(() => {});
+    }
     const changesActive = document.getElementById("commit-view")?.classList.contains("active");
     if (changesActive) loadChanges();
   } catch (e) {

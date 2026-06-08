@@ -1,18 +1,6 @@
-import { invoke as rawInvoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { record, type PerfEntry } from "./perf-monitor";
-
-function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
-  const t0 = performance.now();
-  return rawInvoke<T>(cmd, args).finally(() => {
-    const ms = performance.now() - t0;
-    const entry: PerfEntry = { ts: Date.now(), kind: "ipc", label: cmd, ms };
-    const first = args ? Object.values(args)[0] : undefined;
-    if (typeof first === "string" && first.length < 120) entry.args = first;
-    record(entry);
-  });
-}
 
 // ---- Types matching Rust structs ----
 
@@ -81,6 +69,12 @@ export async function copyPath(src: string, dest: string): Promise<void> {
 // 把文件以「文件引用」写入系统剪贴板，可在 Finder / 其他 app 中粘贴出真正的文件。
 export async function copyFilesToClipboard(paths: string[]): Promise<void> {
   return invoke<void>("copy_files_to_clipboard", { paths });
+}
+
+// 纯文本写系统剪贴板:走原生 NSPasteboard,异步 await 之后也能可靠写入
+// (不受 navigator.clipboard 的「用户手势」限制)。
+export async function copyTextToClipboard(text: string): Promise<void> {
+  return invoke<void>("copy_text_to_clipboard", { text });
 }
 
 export async function renamePath(oldPath: string, newPath: string): Promise<void> {
@@ -172,6 +166,25 @@ export async function lspFindReferences(filePath: string, line: number, characte
 
 export async function lspGotoDefinition(filePath: string, line: number, character: number): Promise<LspUsage | null> {
   return invoke<LspUsage | null>("lsp_goto_definition", { filePath, line, character });
+}
+
+// LSP DocumentSymbol(层级化符号树)。jdtls 返回此结构,据此按 range 命中找方法/类。
+export interface LspPosition { line: number; character: number; }
+export interface LspRange { start: LspPosition; end: LspPosition; }
+export interface LspDocumentSymbol {
+  name: string;
+  detail?: string;
+  kind: number; // SymbolKind: 5=Class 6=Method 9=Constructor 10=Enum 11=Interface 12=Function ...
+  // 层级化 DocumentSymbol:有 range/children;扁平 SymbolInformation:range 在 location.range,无 children。
+  range?: LspRange;
+  selectionRange?: LspRange;
+  children?: LspDocumentSymbol[];
+  location?: { uri: string; range: LspRange };
+}
+
+export async function lspDocumentSymbols(filePath: string): Promise<LspDocumentSymbol[]> {
+  const res = await invoke<unknown>("lsp_document_symbols", { filePath });
+  return Array.isArray(res) ? (res as LspDocumentSymbol[]) : [];
 }
 
 export interface DecompiledClass {
@@ -485,6 +498,25 @@ export async function updateJavaIndexFile(projectPath: string, filePath: string)
 
 export async function removeJavaIndexFile(projectPath: string, filePath: string): Promise<void> {
   return invoke<void>("remove_java_index_file", { projectPath, filePath });
+}
+
+// ---- 符号出现倒排索引(find-usages 用,不依赖 jdtls)----
+export interface UsageHit { file: string; line: number; text: string; }
+
+export async function buildUsageIndex(projectPath: string): Promise<number> {
+  return invoke<number>("build_usage_index", { projectPath });
+}
+
+export async function queryUsages(projectPath: string, symbol: string, limit = 500): Promise<UsageHit[]> {
+  return invoke<UsageHit[]>("query_usages", { projectPath, symbol, limit });
+}
+
+export async function updateUsageIndexFile(projectPath: string, filePath: string): Promise<void> {
+  return invoke<void>("update_usage_index_file", { projectPath, filePath });
+}
+
+export async function removeUsageIndexFile(projectPath: string, filePath: string): Promise<void> {
+  return invoke<void>("remove_usage_index_file", { projectPath, filePath });
 }
 
 // ---- Git Blame ----

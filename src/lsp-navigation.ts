@@ -5,7 +5,7 @@ import { openFileAtLine } from "./file-ops";
 import {
   lspIsReady, lspGotoDefinition, lspFindReferences,
   findClassInMaven, searchJavaClass, lspDidChange,
-  searchInFiles, listAllFiles, readFile,
+  searchInFiles, listAllFiles, readFile, queryUsages,
 } from "./tauri-api";
 
 let usagesPopupIndex = 0;
@@ -15,6 +15,16 @@ let lspNavigationInFlight = false;
 function isLspBusyError(error: unknown): boolean {
   const text = String(error).toLowerCase();
   return text.includes("timed out") || text.includes("timeout") || text.includes("cancelled");
+}
+
+// 给 LSP 请求加 JS 侧超时:jdtls 繁忙/索引时,单次请求在 Rust 侧最长会等若干秒并独占
+// 响应通道(request_and_wait 持锁直到超时),整个导航像冻住。超时即放弃、走快速文本搜索
+// 兜底,保证「跳转定义 / 查引用」不卡死。
+function withTimeout<T>(p: Promise<T>, ms: number, label = "lsp"): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timeout`)), ms)),
+  ]);
 }
 
 function showLspBusyStatus() {
@@ -357,9 +367,10 @@ export async function smartNavigateAtPos(view: EditorView, pos: number) {
 
     if (lspReady) {
       try {
-        def = await lspGotoDefinition(filePath, lineNumber, character);
+        def = await withTimeout(lspGotoDefinition(filePath, lineNumber, character), 3500, "definition");
       } catch (e) {
-        if (isLspBusyError(e)) { showLspBusyStatus(); return; }
+        // 超时不再直接 return,落到下面的类索引 / 文本兜底,避免「卡一下又啥都没有」。
+        if (isLspBusyError(e) && !String(e).includes("definition timeout")) { showLspBusyStatus(); return; }
         lspFailed = true;
       }
     }
@@ -527,28 +538,57 @@ export async function smartNavigateAtPos(view: EditorView, pos: number) {
     }
 
     showStatus("Finding usages...");
+    const usageWord = getWordAtPos(view, pos);
 
-    try {
-      const usages = await lspFindReferences(filePath, lineNumber, character);
-      const word = getWordAtPos(view, pos);
-      usagesPopupItems = usages
+    // 1) 本地「符号出现」倒排索引:瞬时、不依赖 jdtls(项目打开时已后台构建+落盘缓存)。
+    //    索引就绪且有命中就直接用,彻底避开 jdtls 索引中的卡顿。
+    if (usageWord && app.currentProjectPath) {
+      try {
+        const hits = await queryUsages(app.currentProjectPath, usageWord, 500);
+        if (hits.length > 0) {
+          usagesPopupItems = hits
+            .filter((h) => !(h.file === filePath && h.line === lineNumber + 1))
+            .map((h) => ({ file: h.file, line: h.line, text: h.text }));
+          showUsagesPopup(view, pos, usageWord, usagesPopupItems);
+          showStatus(`${usagesPopupItems.length} usage(s)`);
+          return;
+        }
+      } catch { /* 索引尚未构建/失败 → 落到 jdtls/文本 */ }
+    }
+
+    // 2) jdtls 精确引用,加 4s 超时:jdtls 还在索引时别死等(原来 Rust 侧要等到 8s
+    //    且独占响应通道,整个导航卡住)。超时/无 server/空结果一律落到快速文本搜索兜底。
+    let lspUsages: Awaited<ReturnType<typeof lspFindReferences>> | null = null;
+    if (lspReady) {
+      try {
+        lspUsages = await withTimeout(lspFindReferences(filePath, lineNumber, character), 4000, "references");
+      } catch { /* 超时/繁忙/无 server → 文本兜底 */ }
+    }
+
+    if (lspUsages) {
+      usagesPopupItems = lspUsages
         .filter((u) => !(u.uri.replace("file://", "") === filePath && u.line === lineNumber))
-        .map((u) => ({
-          file: u.uri.replace("file://", ""),
-          line: u.line + 1,
-          text: u.text,
-        }));
-      showUsagesPopup(view, pos, word, usagesPopupItems);
-      showStatus(`${usagesPopupItems.length} usage(s) found`);
-    } catch (e) {
-      const errStr = String(e);
-      if (errStr.includes("No LSP server running")) {
-        showStatus("LSP not available for this file type");
-      } else if (isLspBusyError(e)) {
-        showLspBusyStatus();
-      } else {
-        showStatus(`Find Usages: ${errStr}`, true);
+        .map((u) => ({ file: u.uri.replace("file://", ""), line: u.line + 1, text: u.text }));
+      if (usagesPopupItems.length > 0) {
+        showUsagesPopup(view, pos, usageWord, usagesPopupItems);
+        showStatus(`${usagesPopupItems.length} usage(s) found`);
+        return;
       }
+    }
+
+    // 兜底:全项目文本搜索(快,不卡)。
+    if (usageWord && app.currentProjectPath) {
+      showStatus("Finding usages (text search)...");
+      try {
+        const results = await searchInFiles(app.currentProjectPath, usageWord, true, 200);
+        usagesPopupItems = results.map((r) => ({ file: r.path, line: r.line, text: r.text }));
+        showUsagesPopup(view, pos, usageWord, usagesPopupItems);
+        showStatus(`${results.length} occurrence(s) of "${usageWord}"`);
+      } catch {
+        showStatus("Find usages failed");
+      }
+    } else {
+      showStatus("No usages found");
     }
   } finally {
     lspNavigationInFlight = false;

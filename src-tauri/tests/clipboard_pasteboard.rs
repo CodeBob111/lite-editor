@@ -9,7 +9,7 @@
 
 #![cfg(target_os = "macos")]
 
-use lite_editor_lib::clipboard::copy_files_to_clipboard;
+use lite_editor_lib::clipboard::{copy_files_to_clipboard, copy_text_to_clipboard};
 use std::process::Command;
 
 fn make_temp_file(name: &str) -> String {
@@ -58,6 +58,22 @@ fn multiple_files_each_land_as_a_distinct_file_url() {
     // the count via AppKit (osascript collapses multi-file to a useless `list`).
     let count = pasteboard_file_url_item_count();
     assert_eq!(count, 2, "expected 2 file-url pasteboard items, got {count}");
+}
+
+// Bug-2 fix: the Arthas command must land on the pasteboard via native NSPasteboard
+// (gesture-free), so a single click copies it — unlike navigator.clipboard which is
+// rejected after an await. Write text, read it back with pbpaste, expect exact match.
+#[test]
+fn text_lands_on_pasteboard_verbatim() {
+    let s = format!(
+        "trace com.alibaba.business.app.taobao.tradereview.utils.UserTagUtil buildUserTagVOListNew -n 5 --skipJDKMethod false [{}]",
+        std::process::id()
+    );
+    copy_text_to_clipboard(s.clone()).expect("write text to pasteboard");
+
+    let out = Command::new("pbpaste").output().expect("run pbpaste");
+    let got = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(got, s, "pbpaste did not return exactly what we copied");
 }
 
 // Count pasteboard items that advertise the public.file-url type.

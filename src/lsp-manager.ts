@@ -9,6 +9,7 @@ import {
   onMavenDone,
   buildJavaIndex,
   loadJavaIndex,
+  buildUsageIndex,
   gitDiscoverRepos,
   type MavenModule,
 } from "./tauri-api";
@@ -191,6 +192,9 @@ export async function initJavaIndex(projectPath: string, force = false) {
       app.javaIndexReady = true;
       javaIndexLastBuilt.set(projectPath, performance.now());
       if (cached === 0) showStatus(`Java index built (${fresh} classes)`);
+      // 顺带构建「符号出现」倒排索引(供 find-usages 瞬时查询,不依赖 jdtls)。
+      // 增量 + 落盘缓存,后台跑,不阻塞 Java 类索引。
+      buildUsageIndex(projectPath).catch(() => {});
     } catch { /* ignore */ }
   })();
   javaIndexBuildInFlight.set(projectPath, p);

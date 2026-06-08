@@ -3,6 +3,7 @@ pub mod clipboard;
 mod commands;
 pub mod git;
 mod java_index;
+mod usage_index;
 mod lsp;
 mod terminal;
 
@@ -85,8 +86,6 @@ fn build_menu(app: &tauri::App) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> 
         .item(&MenuItemBuilder::with_id("toggle-terminal", "Terminal").build(app)?)
         .item(&MenuItemBuilder::with_id("toggle-git", "Git").build(app)?)
         .item(&MenuItemBuilder::with_id("toggle-astore", "Astore").build(app)?)
-        .separator()
-        .item(&MenuItemBuilder::with_id("export-perf", "Export Perf Report").build(app)?)
         .build()?;
 
     let window_menu = SubmenuBuilder::new(app, "Window")
@@ -126,6 +125,7 @@ pub fn run() {
         .manage(commands::WatcherState::default())
         .manage(terminal::TerminalState::default())
         .manage(java_index::JavaIndexState::default())
+        .manage(usage_index::UsageIndexState::default())
         .manage(astore::AstoreState::default())
         .invoke_handler(tauri::generate_handler![
             commands::read_dir_tree,
@@ -148,12 +148,14 @@ pub fn run() {
             commands::save_settings,
             commands::load_settings,
             clipboard::copy_files_to_clipboard,
+            clipboard::copy_text_to_clipboard,
             lsp::start_lsp,
             lsp::stop_lsp,
             lsp::lsp_did_open,
             lsp::lsp_did_change,
             lsp::lsp_find_references,
             lsp::lsp_goto_definition,
+            lsp::lsp_document_symbols,
             lsp::find_class_in_maven,
             lsp::lsp_is_ready,
             terminal::spawn_terminal,
@@ -200,6 +202,10 @@ pub fn run() {
             java_index::search_java_class,
             java_index::update_java_index_file,
             java_index::remove_java_index_file,
+            usage_index::build_usage_index,
+            usage_index::query_usages,
+            usage_index::update_usage_index_file,
+            usage_index::remove_usage_index_file,
             astore::astore_login,
             astore::astore_logout,
             astore::astore_get_session,

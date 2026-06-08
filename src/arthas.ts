@@ -1,4 +1,17 @@
 import type { EditorView } from "@codemirror/view";
+import { lspDocumentSymbols, lspGotoDefinition, readFile } from "./tauri-api";
+import {
+  findMethodAtPosition, methodNameFromDeclLine,
+  parseJdtFqn, parsePackage, classNameFromFilePath, identifierAt, followedByParen,
+  resolveCallFqnByText,
+} from "./arthas-symbols";
+
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error("lsp timeout")), ms)),
+  ]);
+}
 
 interface JavaContext {
   packageName: string;
@@ -62,10 +75,78 @@ export function getJavaContext(view: EditorView, pos: number): JavaContext | nul
   }
   if (!className) return null;
 
-  const methodName = findEnclosingMethod(view, pos);
+  // 文本兜底:光标停在方法声明行上(右键方法名最常见)优先取该行方法名,否则按花括号回溯。
+  const methodName = methodFromCurrentLine(view, pos) ?? findEnclosingMethod(view, pos);
 
   const fqn = packageName ? `${packageName}.${className}` : className;
   return { packageName: fqn, className, methodName };
+}
+
+// 结构化解析(像 IDEA 的 PSI):用 jdtls 的 documentSymbol 找「包含光标的最内层方法/构造器」。
+// 稳妥处理「光标在方法体内」和「光标停在方法声明名上」两种情况;LSP 未就绪/出错时返回 null,
+// 交给文本兜底。line/character 为 0-based(LSP 约定)。解析逻辑在 arthas-symbols.ts(可单测)。
+export async function resolveMethodViaLsp(
+  filePath: string, line: number, character: number,
+): Promise<string | null> {
+  try {
+    // 加 JS 侧超时:jdtls 还在索引/繁忙时,documentSymbol 可能迟迟不返回(串行 IPC 会卡)。
+    // 超时即放弃 LSP、回退文本解析,确保 Arthas 操作绝不卡死。
+    const symbols = await withTimeout(lspDocumentSymbols(filePath), 2500);
+    return symbols.length ? findMethodAtPosition(symbols, line, character) : null;
+  } catch {
+    return null;
+  }
+}
+
+// 解析「光标所在的方法调用/声明」→ 被调方法的声明类 FQCN + 方法名(像 IDEA resolve 方法调用)。
+// - 光标在跨类方法调用上(如 richReadClient.batchQuery(...))→ 返回 RichReadClient + batchQuery;
+// - 光标在同类方法调用上 → 当前类 + 被调方法名;
+// - 光标在方法声明名上(gotoDefinition 指回自身)→ 返回 null,交回「最内层方法 + 当前类」逻辑;
+// - 光标不在 `name(` 这种方法 token 上 → 返回 null。
+export async function resolveCallTarget(
+  view: EditorView, pos: number, filePath: string,
+): Promise<{ fqn: string; method: string } | null> {
+  const lineObj = view.state.doc.lineAt(pos);
+  const id = identifierAt(lineObj.text, pos - lineObj.from);
+  if (!id || !followedByParen(lineObj.text, id.end)) return null;
+
+  // 1) gotoDefinition:项目方法 / 有源码的库方法走得通(更精确,能处理继承)。
+  let def: { uri: string; line: number } | null = null;
+  try {
+    def = await withTimeout(lspGotoDefinition(filePath, lineObj.number - 1, id.start), 3500);
+  } catch { /* jdtls 未就绪/出错 → 落文本兜底 */ }
+
+  if (def) {
+    const defPath = def.uri.startsWith("file://") ? def.uri.slice(7) : def.uri;
+    const selfDecl = defPath === filePath && def.line === lineObj.number - 1; // 光标在声明自身上
+    if (!selfDecl) {
+      let fqn: string | null = null;
+      if (def.uri.startsWith("jdt://")) {
+        fqn = parseJdtFqn(def.uri);
+      } else if (defPath.endsWith(".java")) {
+        try {
+          const content = await readFile(defPath);
+          const pkg = parsePackage(content);
+          fqn = pkg ? `${pkg}.${classNameFromFilePath(defPath)}` : classNameFromFilePath(defPath);
+        } catch { /* ignore */ }
+      }
+      if (fqn) return { fqn, method: id.word };
+    }
+  }
+
+  // 2) gotoDefinition 没给出 FQN(库类无源码 → 返回空,或 jdtls 未起来)→ 纯文本兜底:
+  //    有接收者 → 接收者类型 + import 推 FQCN;无接收者 → 同类方法调用 = 当前类。
+  //    方法声明行无接收者 → 返回 null,交回「最内层方法」逻辑。
+  const fileText = view.state.doc.toString();
+  const pkg = parsePackage(fileText);
+  const currentClassFqn = pkg ? `${pkg}.${classNameFromFilePath(filePath)}` : classNameFromFilePath(filePath);
+  return resolveCallFqnByText(fileText, lineObj.text, id.start, id.word, pkg, currentClassFqn);
+}
+
+// 当前行的文本兜底:光标停在方法声明行上(右键方法名最常见)时取该行方法名。
+// 判定逻辑在 arthas-symbols.ts 的 methodNameFromDeclLine(纯函数,可单测)。
+function methodFromCurrentLine(view: EditorView, pos: number): string | null {
+  return methodNameFromDeclLine(view.state.doc.lineAt(pos).text);
 }
 
 function findEnclosingMethod(view: EditorView, pos: number): string | null {
