@@ -88,8 +88,8 @@ const blameGutter = gutter({
 
 const blameTheme = EditorView.theme({
   ".cm-blame-gutter": {
-    backgroundColor: "#101314",
-    borderRight: "1px solid #2b3336",
+    backgroundColor: "var(--bg-primary)",
+    borderRight: "1px solid var(--border)",
   },
   ".cm-blame-gutter .cm-gutterElement": {
     minWidth: "160px",

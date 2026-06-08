@@ -1,5 +1,5 @@
 import { EditorState, Annotation, Transaction } from "@codemirror/state";
-import { EditorView, keymap, ViewUpdate } from "@codemirror/view";
+import { EditorView, keymap, ViewUpdate, lineNumbers } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { search, searchKeymap, highlightSelectionMatches } from "@codemirror/search";
 import { autocompletion, completionKeymap } from "@codemirror/autocomplete";
@@ -79,6 +79,7 @@ export function createEditorState(content: string, filename: string): EditorStat
   return EditorState.create({
     doc: content,
     extensions: [
+      lineNumbers(),
       history(),
       ...editorSettingsExtensions(),
       highlightSelectionMatches(),

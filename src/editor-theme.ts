@@ -2,17 +2,20 @@ import { EditorView } from "@codemirror/view";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
 
+// 引用 :root 单一真源(main.css)。CM 主题对象的值会被原样写进样式表,
+// var() 在渲染时对 document 根解析,所以改色板这里自动跟随。
+// (xterm 终端配色无法用 var(),仍在 terminal-panel.ts 里硬编码。)
 const ui = {
-  bg: "#0d1017",
-  panel: "#11161f",
-  card: "#161c27",
-  border: "#1b2230",
-  text: "#c9d3e0",
-  textSubtle: "#7a8699",
-  muted: "#4d5870",
-  accent: "#3b82f6",
-  selection: "rgba(59, 130, 246, 0.22)",
-  search: "rgba(214, 164, 87, 0.28)",
+  bg: "var(--bg-primary)",
+  panel: "var(--bg-card)",
+  card: "var(--bg-elevated)",
+  border: "var(--border)",
+  text: "var(--text-primary)",
+  textSubtle: "var(--text-secondary)",
+  muted: "var(--text-muted)",
+  accent: "var(--accent)",
+  selection: "var(--selection)",
+  search: "var(--search-match)",
 };
 
 const baseTheme = EditorView.theme(
@@ -103,7 +106,7 @@ const baseTheme = EditorView.theme(
       whiteSpace: "nowrap",
     },
     ".cm-idea-search-count.empty, .cm-idea-search-count.error": {
-      color: "#f25555",
+      color: "var(--danger)",
     },
     ".cm-idea-search-nav": {
       width: "24px",
@@ -206,7 +209,7 @@ const highlightStyle = HighlightStyle.define([
   { tag: tags.tagName, color: "#7ee787" },
   { tag: tags.attributeName, color: "#79c0ff" },
   { tag: tags.attributeValue, color: "#9fd2ff" },
-  { tag: tags.invalid, color: "#f25555" },
+  { tag: tags.invalid, color: "var(--danger)" },
 ]);
 
 export const warmEarthTheme = [baseTheme, syntaxHighlighting(highlightStyle)];

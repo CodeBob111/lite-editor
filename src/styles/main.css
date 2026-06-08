@@ -2,16 +2,18 @@
   /* Dark engineering-tool system — single cobalt accent.
      GitHub/Datadog density × Linear/Vercel restraint.
      Surface depth order (darkest → lightest):
-       bg-tertiary (titlebar/activity bar) < bg-secondary (sidebar)
-       < bg-primary (editor canvas) < bg-card (panels/tabs/terminal)
-       < bg-elevated (inputs/palette/modals) < bg-hover < active. */
-  --bg-primary: #0d1017;
-  --bg-secondary: #0f131b;
-  --bg-tertiary: #0b0e14;
-  --bg-card: #11161f;
-  --bg-elevated: #161c27;
+       bg-primary (editor canvas — darkest "well", where the eye rests)
+       < bg-tertiary (titlebar/activity rail) < bg-secondary (sidebar)
+       < bg-card (panels/tabs/terminal) < bg-elevated (inputs/palette/modals)
+       < bg-hover < active. The chrome steps up from the recessed code well
+       and every adjacent pair is separated by a visible --border hairline. */
+  --bg-primary: #080b11;
+  --bg-secondary: #0f151f;
+  --bg-tertiary: #0c1119;
+  --bg-card: #131a26;
+  --bg-elevated: #1a2230;
   --bg-main: var(--bg-primary);
-  --bg-hover: #1a2130;
+  --bg-hover: #1c2433;
   /* 文字三层 + 最亮层(对齐设计稿 --fg / --muted / --faint / --fg-bright) */
   --text-primary: #c9d3e0;   /* 正文 --fg */
   --text-secondary: #7a8699; /* 次要/弱化 --muted */
@@ -20,10 +22,10 @@
   --accent: #3b82f6;
   --accent-strong: #60a5fa;
   --accent-dim: rgba(59, 130, 246, 0.16); /* 设计稿 --accent-soft */
-  --border: #1b2230;
-  --border-2: #26303f;       /* 较亮边框(浮层/控件描边) */
+  --border: #283341;         /* 可见的区域分隔线(原 #1b2230 太贴背景,看不见) */
+  --border-2: #39465a;       /* 较亮边框(浮层/控件描边) */
   --hover: var(--bg-hover);
-  --active: #1c2433;         /* 设计稿 --surface-2 */
+  --active: #232d3d;         /* 设计稿 --surface-2 */
   --danger: #f25555;
   --warning: #d29922;
   --success: #3fb950;
@@ -73,6 +75,7 @@ html, body {
   right: 0;
   height: var(--project-bar-height);
   background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border); /* 与底部状态栏的 border-top 对称:给顶栏一条可见下边界,避免和下方 6px 同色缝溶成一片 */
   display: flex;
   align-items: center;
   z-index: 100;
@@ -703,6 +706,24 @@ html, body {
   height: 100%;
   font-family: var(--editor-font-family, var(--mono));
   font-size: var(--editor-font-size, 13px);
+}
+
+/* 代码行距 + 留白:对齐设计稿的 13px/20px(≈1.54)节奏,让相邻代码行有呼吸感。
+   垂直留白放在 .cm-content、行距用 line-height —— 都不用 per-line padding,
+   以免破坏 CodeMirror 对光标/选区位置的测算。 */
+#editor-container .cm-content {
+  line-height: 1.54;
+  padding: 8px 0;
+}
+
+/* 代码正文左侧留一点缝,不要紧贴行号槽。 */
+#editor-container .cm-line {
+  padding-left: 8px;
+}
+
+/* 行号与代码之间拉开间距(CM 默认仅 ~5px,过于拥挤)。 */
+#editor-container .cm-lineNumbers .cm-gutterElement {
+  padding: 0 12px 0 16px;
 }
 
 #editor-container .cm-scroller {
@@ -2330,7 +2351,7 @@ html, body {
 }
 
 .cm-editor .cm-activeLine {
-  background: rgba(102, 183, 189, 0.055) !important;
+  background: rgba(59, 130, 246, 0.055) !important;
 }
 
 .cm-editor .cm-selectionBackground {
@@ -2338,7 +2359,7 @@ html, body {
 }
 
 .cm-editor.cm-focused .cm-selectionBackground {
-  background: rgba(102, 183, 189, 0.28) !important;
+  background: rgba(59, 130, 246, 0.28) !important;
 }
 
 .cm-editor .cm-cursor {
@@ -2346,7 +2367,7 @@ html, body {
 }
 
 .cm-editor .cm-matchingBracket {
-  background: rgba(102, 183, 189, 0.22) !important;
+  background: rgba(59, 130, 246, 0.22) !important;
   color: var(--text-primary) !important;
 }
 
