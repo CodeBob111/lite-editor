@@ -731,6 +731,10 @@ initSettings().finally(() => {
     if (app.currentProjectPath) {
       astoreProjectChanged(app.currentProjectPath);
     }
+    // Terminal 现在是底部面板的默认激活项,但「点已激活的 tab」会被 panelManager.switchTo
+    // 的 early-return 吞掉、onSwitch 不触发,且 loadSession 只硬编码加载了 Maven。
+    // 所以启动时在这里主动初始化并打开终端:接线 + 按钮,并按当前项目开一个终端。
+    if (panelManager.getActivePanel() === "terminal") openTerminalPanelLazy();
     refreshWelcomeScreen(); // 会话恢复后再校正一次(无文件则保持显示)。
   });
 });
