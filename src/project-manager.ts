@@ -466,6 +466,8 @@ async function doRefreshTree() {
   try {
     const expandedPaths = new Set<string>();
     if (project?.treeRoot) collectExpandedPaths(project.treeRoot, expandedPaths);
+    // setRoot→rebuild 会把滚动位置重置到顶部,删除/新建后记下并还原,避免展开的子树滚出视野。
+    const scrollTop = _fileTree.getScrollTop();
 
     const tree = await readDirTree(app.currentProjectPath, 4);
     requestAnimationFrame(() => {
@@ -475,6 +477,7 @@ async function doRefreshTree() {
         project.allFilePathsCache = null;
       }
       _fileTree.setRoot(tree);
+      _fileTree.setScrollTop(scrollTop);
     });
   } catch {
     // ignore refresh failures

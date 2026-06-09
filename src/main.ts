@@ -12,7 +12,7 @@ import { updateStatusBar } from "./status-bar";
 import { initSettings } from "./settings";
 import { openSettings, closeSettings, isSettingsOpen } from "./settings-ui";
 import { initWelcomeScreen, refreshWelcomeScreen } from "./welcome-screen";
-import { initFileOps, openFile, navigateBack, navigateForward } from "./file-ops";
+import { initFileOps, openFile, navigateBack, navigateForward, navRecordTabSwitch } from "./file-ops";
 import { flashLine } from "./flash-line";
 import {
   gotoDefinitionAtCursor, debouncedLspDidChange,
@@ -22,7 +22,7 @@ import {
 import { initGitPanel, loadGitBranches } from "./git-panel";
 import { initChangesPanel, loadChanges, closeDiff } from "./changes-panel";
 import { initMergeConflict } from "./merge-conflict";
-import { initContextMenu, showContextMenu } from "./context-menu";
+import { initContextMenu, showContextMenu, showMultiContextMenu } from "./context-menu";
 import { setupResizeHandles } from "./resize";
 import { initMdPreview, toggleMdPreview, showPreviewButtonForFile, hideMdPreview, isMdPreviewActive, refreshMdPreview } from "./md-preview";
 import { showSubTabsForFile, showDepAnalyzer, hideDepAnalyzer, isDepAnalyzerActive } from "./maven-helper";
@@ -52,7 +52,7 @@ const editorContainer = document.getElementById("editor-container")!;
 
 const tabManager = new TabManager(
   document.getElementById("tabs-bar")!,
-  (filePath, content) => {
+  (filePath, content, reason) => {
     if (isDiffTab(filePath)) {
       if (isDepAnalyzerActive()) hideDepAnalyzer();
       if (app.editorView) {
@@ -72,6 +72,12 @@ const tabManager = new TabManager(
     }
 
     destroyActiveDiff();
+
+    // 记录导航历史(cmd+[ / cmd+]):离开当前文件前先抓住它的最新光标行。
+    const navPrevFile = app.currentFilePath;
+    const navPrevLine = (navPrevFile && app.editorView)
+      ? app.editorView.state.doc.lineAt(app.editorView.state.selection.main.head).number
+      : 1;
 
     if (app.currentFilePath === filePath && app.editorView) {
       fileTree.highlightFile(filePath);
@@ -141,6 +147,17 @@ const tabManager = new TabManager(
     showSubTabsForFile(filePath);
     updateStatusBar();
     refreshWelcomeScreen();
+
+    // 仅用户主动的打开/切换记入历史(关闭后激活相邻页、会话恢复不记)。
+    // openFileAtLine 驱动的激活由 suppressTabNavRecord 抑制,避免重复记录。
+    if (reason === "open" || reason === "switch") {
+      const navNewLine = app.editorView
+        ? app.editorView.state.doc.lineAt(app.editorView.state.selection.main.head).number
+        : 1;
+      // diff 标签页不是真实文件,不能作为「后退」目标(否则 readFile("diff:...") 会失败)。
+      const prevFile = navPrevFile && !isDiffTab(navPrevFile) ? navPrevFile : null;
+      navRecordTabSwitch(prevFile, navPrevLine, filePath, navNewLine);
+    }
   },
   () => debouncedSaveSession(),
   (closedPath) => {
@@ -174,6 +191,7 @@ const fileTree = new FileTree(
 );
 
 fileTree.setContextMenuHandler((node, x, y) => showContextMenu(node, x, y));
+fileTree.setMultiContextMenuHandler((nodes, x, y) => showMultiContextMenu(nodes, x, y));
 setRevealDirectoryHandler((path) => fileTree.revealFile(path));
 
 const panelManager = new PanelManager(

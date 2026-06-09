@@ -286,10 +286,32 @@ export class FileTree {
 
   private async refreshRoot() {
     if (!this.root) return;
+    // readDirTree 返回的节点没有 expanded(后端 FileNode 无此字段),直接 rebuild 会全部折叠。
+    // 重建前记下当前展开的目录与滚动位置,重建后还原,避免删除/粘贴后目录折叠、视图跳到顶部。
+    const expanded = new Set<string>();
+    this.collectExpandedPaths(this.root, expanded);
+    const scrollTop = this.container.scrollTop;
     const fresh = await readDirTree(this.root.path, 4);
     this.root.children = fresh.children;
+    if (this.root.children) this.applyExpandedPaths(this.root.children, expanded);
     this.rebuild();
+    this.container.scrollTop = scrollTop;
   }
+
+  private collectExpandedPaths(node: FileNode, out: Set<string>) {
+    if (node.isDir && node.expanded) out.add(node.path);
+    if (node.children) for (const c of node.children) this.collectExpandedPaths(c, out);
+  }
+
+  private applyExpandedPaths(nodes: FileNode[], expanded: Set<string>) {
+    for (const n of nodes) {
+      if (n.isDir && expanded.has(n.path)) n.expanded = true;
+      if (n.children) this.applyExpandedPaths(n.children, expanded);
+    }
+  }
+
+  getScrollTop(): number { return this.container.scrollTop; }
+  setScrollTop(v: number) { this.container.scrollTop = v; }
 
   setContextMenuHandler(handler: (node: FileNode, x: number, y: number) => void) {
     this.onContextMenu = handler;

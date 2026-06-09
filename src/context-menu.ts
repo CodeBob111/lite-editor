@@ -23,12 +23,76 @@ export function initContextMenu(tm: TabManager, refreshTree: () => Promise<void>
 }
 
 export function showContextMenu(node: FileNode, x: number, y: number) {
+  document.getElementById("multi-context-menu")?.classList.add("hidden");
   contextMenuTarget = node;
   positionContextMenu(document.getElementById("context-menu")!, x, y);
 }
 
+// 多选右键菜单:对全部选中项操作(目前只有删除)。单选走上面的静态 #context-menu;
+// 多选项数不固定,故动态构建一个独立菜单。
+export function showMultiContextMenu(nodes: FileNode[], x: number, y: number) {
+  hideContextMenu();
+  let menu = document.getElementById("multi-context-menu");
+  if (!menu) {
+    menu = document.createElement("div");
+    menu.id = "multi-context-menu";
+    menu.className = "context-menu";
+    document.body.appendChild(menu);
+  }
+  menu.replaceChildren();
+
+  const item = document.createElement("div");
+  item.className = "context-menu-item";
+  item.textContent = `Delete ${nodes.length} items`;
+  item.addEventListener("click", (e) => {
+    e.stopPropagation();
+    menu!.classList.add("hidden");
+    void deleteMultiple(nodes);
+  });
+  menu.appendChild(item);
+
+  menu.classList.remove("hidden");
+  positionContextMenu(menu, x, y);
+
+  const dismiss = (e: MouseEvent) => {
+    if (!menu!.contains(e.target as Node)) {
+      menu!.classList.add("hidden");
+      document.removeEventListener("mousedown", dismiss, true);
+    }
+  };
+  setTimeout(() => document.addEventListener("mousedown", dismiss, true), 0);
+}
+
+// 批量删除:沿用单文件删除的清理(关标签页、销毁缓存的编辑器视图、清诊断),逐个删除后刷新一次。
+async function deleteMultiple(nodes: FileNode[]) {
+  if (nodes.length === 0) return;
+  if (!(await appConfirm(`Delete ${nodes.length} items?`))) return;
+  let deleted = 0;
+  for (const node of nodes) {
+    try {
+      await deletePath(node.path);
+      destroyCachedViewsByPrefix(node.path);
+      tabManager.closeByPathPrefix(node.path);
+      for (const key of app.diagnosticsMap.keys()) {
+        const fp = key.replace("file://", "");
+        if (fp.startsWith(node.path)) app.diagnosticsMap.delete(key);
+      }
+      deleted++;
+    } catch (e) {
+      showStatus(`Failed to delete ${node.name}: ${e}`, true);
+    }
+  }
+  if (!tabManager.getActiveFile()) {
+    app.currentFilePath = null;
+    app.editorView = null;
+  }
+  await refreshTreeFn();
+  showStatus(`Deleted ${deleted} item${deleted === 1 ? "" : "s"}`);
+}
+
 export function hideContextMenu() {
   document.getElementById("context-menu")!.classList.add("hidden");
+  document.getElementById("multi-context-menu")?.classList.add("hidden");
   contextMenuTarget = null;
 }
 

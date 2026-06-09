@@ -5,9 +5,13 @@ export interface OpenTab {
   dirty: boolean;
 }
 
+// 触发 onTabActivate 的原因:open=新开文件, switch=切换标签页(用户导航,记入历史);
+// close=关闭后激活相邻页, restore=会话恢复(非用户主动导航,不记入历史)。
+export type TabActivateReason = "open" | "switch" | "close" | "restore";
+
 export class TabManager {
   private container: HTMLElement;
-  private onTabActivate: (path: string, content: string) => void;
+  private onTabActivate: (path: string, content: string, reason: TabActivateReason) => void;
   private onTabClose: ((path: string) => void) | null;
   private onStateChange: (() => void) | null;
   private onAllClosed: (() => void) | null;
@@ -17,7 +21,7 @@ export class TabManager {
 
   constructor(
     container: HTMLElement,
-    onTabActivate: (path: string, content: string) => void,
+    onTabActivate: (path: string, content: string, reason: TabActivateReason) => void,
     onStateChange?: () => void,
     onTabClose?: (path: string) => void,
     onAllClosed?: () => void,
@@ -45,7 +49,7 @@ export class TabManager {
     this.tabs.push({ path, name, content: fileContent, dirty: false });
     this.activeIndex = this.tabs.length - 1;
     this.render();
-    this.onTabActivate(path, fileContent);
+    this.onTabActivate(path, fileContent, "open");
     this.onStateChange?.();
   }
 
@@ -96,7 +100,7 @@ export class TabManager {
       this.activeIndex = Math.min(index, this.tabs.length - 1);
       this.render();
       const tab = this.tabs[this.activeIndex];
-      this.onTabActivate(tab.path, tab.content);
+      this.onTabActivate(tab.path, tab.content, "close");
     } else {
       if (index < this.activeIndex) this.activeIndex--;
       this.render();
@@ -117,7 +121,7 @@ export class TabManager {
     if (this.activeIndex >= 0) {
       this.render();
       const tab = this.tabs[this.activeIndex];
-      this.onTabActivate(tab.path, tab.content);
+      this.onTabActivate(tab.path, tab.content, "close");
     } else {
       this.render();
       this.onAllClosed?.();
@@ -148,7 +152,7 @@ export class TabManager {
     this.render();
     if (this.activeIndex >= 0 && this.activeIndex < this.tabs.length) {
       const tab = this.tabs[this.activeIndex];
-      this.onTabActivate(tab.path, tab.content);
+      this.onTabActivate(tab.path, tab.content, "restore");
     }
   }
 
@@ -161,7 +165,7 @@ export class TabManager {
     this.tabs = [kept];
     this.activeIndex = 0;
     this.render();
-    this.onTabActivate(kept.path, kept.content);
+    this.onTabActivate(kept.path, kept.content, "close");
     this.onStateChange?.();
   }
 
@@ -184,7 +188,7 @@ export class TabManager {
     this.updateActiveTabElements();
     const tab = this.tabs[index];
     if (tab && !wasActive) {
-      this.onTabActivate(tab.path, tab.content);
+      this.onTabActivate(tab.path, tab.content, "switch");
       this.onStateChange?.();
     }
   }

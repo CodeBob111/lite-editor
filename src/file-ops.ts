@@ -1,3 +1,4 @@
+import { EditorView } from "@codemirror/view";
 import { app } from "./state";
 import { readFile } from "./tauri-api";
 import { showStatus } from "./utils";
@@ -15,6 +16,18 @@ export function initFileOps(tm: TabManager) {
 interface NavLocation { file: string; line: number; }
 const navHistory: NavLocation[] = [];
 let navIndex = -1;
+
+// openFileAtLine 自己会精确记录(含目标行号、同文件跳转),它驱动的标签激活期间要抑制
+// onTabActivate 里的兜底记录,避免同一次跳转被记两遍。
+let suppressTabNavRecord = false;
+
+// 切换/打开标签页时记录导航历史(IntelliJ 式 cmd+[ / cmd+])。先记离开位置(带最新光标行),
+// 再记落点 —— 这样「后退」能回到刚才所在的行。openFileAtLine 驱动的激活已被抑制。
+export function navRecordTabSwitch(prevFile: string | null, prevLine: number, newFile: string, newLine: number) {
+  if (suppressTabNavRecord) return;
+  if (prevFile && prevFile !== newFile) navPush({ file: prevFile, line: prevLine });
+  navPush({ file: newFile, line: newLine });
+}
 
 export function navPush(loc: NavLocation) {
   if (navIndex >= 0) {
@@ -52,7 +65,9 @@ export async function openFileAtLine(filePath: string, line: number, isNavRestor
     const targetLine = app.editorView.state.doc.line(clampedLine);
     app.editorView.dispatch({
       selection: { anchor: targetLine.from },
-      scrollIntoView: true,
+      // 跳转到同文件内其它行时,把目标行居中(默认 scrollIntoView:true 只滚到最近边缘,
+      // 落在最上或最下)。与新开/切标签页路径(pendingScrollLine)的居中行为保持一致。
+      effects: EditorView.scrollIntoView(targetLine.from, { y: "center" }),
     });
     flashLine(app.editorView, clampedLine);
     if (!isNavRestore) {
@@ -63,7 +78,8 @@ export async function openFileAtLine(filePath: string, line: number, isNavRestor
 
   if (tabManager.hasTab(filePath)) {
     app.pendingScrollLine = line;
-    tabManager.activatePath(filePath);
+    suppressTabNavRecord = true;
+    try { tabManager.activatePath(filePath); } finally { suppressTabNavRecord = false; }
     if (!isNavRestore) {
       navPush({ file: filePath, line });
     }
@@ -73,7 +89,8 @@ export async function openFileAtLine(filePath: string, line: number, isNavRestor
   try {
     const content = await readFile(filePath);
     app.pendingScrollLine = line;
-    tabManager.openFile(filePath, content);
+    suppressTabNavRecord = true;
+    try { tabManager.openFile(filePath, content); } finally { suppressTabNavRecord = false; }
     if (!isNavRestore) {
       navPush({ file: filePath, line });
     }
