@@ -1,5 +1,5 @@
 import { EditorState, Annotation, Transaction } from "@codemirror/state";
-import { EditorView, keymap, ViewUpdate, lineNumbers } from "@codemirror/view";
+import { EditorView, keymap, ViewUpdate, lineNumbers, tooltips } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { search, searchKeymap, highlightSelectionMatches } from "@codemirror/search";
 import { autocompletion, completionKeymap } from "@codemirror/autocomplete";
@@ -90,6 +90,9 @@ export function createEditorState(content: string, filename: string): EditorStat
       syntaxHighlighting(defaultHighlightStyle, { fallback: true }),
       linter(diagnosticSource),
       lintGutter(),
+      // 用 absolute 定位 tooltip:祖先 #main 有 contain:strict(含 layout),会让默认的
+      // fixed 定位先落错位置、再被测量修正,表现为弹框出现后「先跳一下」。改 absolute 即可消除。
+      tooltips({ position: "absolute" }),
       keymap.of([
         { key: "Mod-[", run: () => { navigateBack(); return true; } },
         { key: "Mod-]", run: () => { navigateForward(); return true; } },
