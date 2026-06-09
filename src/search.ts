@@ -74,6 +74,17 @@ export function showSearchOverlay() {
   const overlay = document.getElementById("search-overlay")!;
   const input = document.getElementById("search-dialog-input") as HTMLInputElement;
   overlay.classList.remove("hidden");
+
+  // 编辑器里有选中文本时,带进搜索框并立即搜一次(对齐 IDEA 的 Find in Files)。
+  const sel = app.editorView?.state.selection.main;
+  if (sel && !sel.empty) {
+    const text = app.editorView!.state.sliceDoc(sel.from, sel.to);
+    if (text && !text.includes("\n") && text.length <= 200) {
+      input.value = text;
+      executeSearchOverlay();
+    }
+  }
+
   input.focus();
   input.select();
 }

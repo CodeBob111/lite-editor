@@ -136,6 +136,13 @@ export function createSearchPanel(view: EditorView): Panel {
       e.preventDefault();
       if (e.shiftKey) findPrevious(view);
       else findNext(view);
+    } else if (e.key === "ArrowDown") {
+      // 上下键在匹配项之间跳转(否则单行输入框里上下键只是移动光标,没用)。
+      e.preventDefault();
+      findNext(view);
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      findPrevious(view);
     } else if (e.key === "Escape") {
       e.preventDefault();
       closeSearchPanel(view);
