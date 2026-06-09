@@ -629,9 +629,10 @@ export async function gotoDefinitionAtCursor(view: EditorView) {
       const file = def.uri.replace("file://", "");
       openFileAtLine(file, def.line + 1);
       showStatus(`Jumped to ${file.split("/").pop()}:${def.line + 1}`);
-    } else if (isJava && app.javaIndexReady && app.currentProjectPath) {
+    } else if (isJava && app.currentProjectPath) {
       const word = getWordAtPos(view, pos);
-      if (word && word[0] === word[0].toUpperCase() && word.length > 1) {
+      // 类查找需 java 索引就绪;没就绪就跳过,走下面的文本兜底
+      if (word && app.javaIndexReady && word[0] === word[0].toUpperCase() && word.length > 1) {
         const locations = await searchJavaClass(app.currentProjectPath, word);
         if (locations.length === 1) {
           openFileAtLine(locations[0].path, 1);
@@ -655,6 +656,16 @@ export async function gotoDefinitionAtCursor(view: EditorView) {
             }
           }
           showStatus(`${locations.length} matches — use Cmd+Click for picker`);
+          return;
+        }
+      }
+      // 文本兜底:jdtls/索引没就绪或类查找没命中 → 工程内搜该符号,跳到第一个匹配(与 Cmd+点击一致),
+      // 让刚打开、还没建好索引的工程上 F12 也不至于「啥都没有」。
+      if (word) {
+        const results = await searchInFiles(app.currentProjectPath, word, true, 50);
+        if (results.length > 0) {
+          openFileAtLine(results[0].path, results[0].line + 1);
+          showStatus(`No exact definition — first match of "${word}"`);
           return;
         }
       }
