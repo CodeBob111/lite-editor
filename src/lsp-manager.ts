@@ -100,6 +100,36 @@ const javaLspStartPromises = new Map<string, Promise<void>>();
 const javaLspRootsByProject = new Map<string, Set<string>>();
 const repoRootCache = new Map<string, Promise<string[]>>();
 
+// 常驻 jdtls 实例的 LRU 上限:每个 git 仓库各起一个 jdtls(各占约 1.5G 堆),
+// 像 rate-native 这种装了十来个仓库的工作区,挨个开文件会攒出十来个常驻 jdtls 把内存吃光。
+// 这里限制最多常驻 MAX_WARM_JAVA_LSP 个,超了就关掉最久没用的(被关的仓库再打开会重启,
+// 但工作区已落盘,比首次导入快)。
+const MAX_WARM_JAVA_LSP = 3;
+const javaLspLru: string[] = []; // 最近使用在前
+
+function touchJavaLspRoot(rootPath: string) {
+  const i = javaLspLru.indexOf(rootPath);
+  if (i >= 0) javaLspLru.splice(i, 1);
+  javaLspLru.unshift(rootPath);
+}
+
+function forgetJavaLspRoot(rootPath: string) {
+  const i = javaLspLru.indexOf(rootPath);
+  if (i >= 0) javaLspLru.splice(i, 1);
+  javaLspStartPromises.delete(rootPath);
+  for (const roots of javaLspRootsByProject.values()) roots.delete(rootPath);
+}
+
+// 超过上限时,关掉最久未用的 jdtls(keepRoot 刚用过、在最前,不会被选中)。
+function evictExcessJavaLsp() {
+  while (javaLspLru.length > MAX_WARM_JAVA_LSP) {
+    const victim = javaLspLru.pop()!;
+    javaLspStartPromises.delete(victim);
+    for (const roots of javaLspRootsByProject.values()) roots.delete(victim);
+    stopLsp("java", victim).catch(() => {});
+  }
+}
+
 function deepestMatchingRoot(filePath: string, roots: string[]) {
   return roots
     .filter((root) => filePath === root || filePath.startsWith(root + "/"))
@@ -134,13 +164,16 @@ export async function ensureJavaLspForFile(filePath: string) {
   const rootPath = await javaLspRootForFile(filePath);
   if (!rootPath) return false;
 
+  touchJavaLspRoot(rootPath); // 标记最近使用,避免刚用的被 LRU 淘汰
+
   let promise = javaLspStartPromises.get(rootPath);
   if (!promise) {
     promise = startLsp("java", rootPath).catch((err) => {
-      javaLspStartPromises.delete(rootPath);
+      forgetJavaLspRoot(rootPath);
       throw err;
     });
     javaLspStartPromises.set(rootPath, promise);
+    evictExcessJavaLsp(); // 新增了一个常驻实例 → 超限就关掉最久没用的
   }
   await promise;
 
@@ -165,6 +198,8 @@ export function stopLspForProject(projectPath: string) {
   if (roots) {
     for (const root of roots) {
       javaLspStartPromises.delete(root);
+      const i = javaLspLru.indexOf(root);
+      if (i >= 0) javaLspLru.splice(i, 1);
       stopLsp("java", root).catch(() => {});
     }
     javaLspRootsByProject.delete(projectPath);

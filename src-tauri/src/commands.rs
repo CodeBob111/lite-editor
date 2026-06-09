@@ -328,6 +328,19 @@ pub fn start_file_watcher(
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
+            // 忽略构建产物/依赖/VCS 目录(target、.git、node_modules、.metadata 等)的事件:
+            // 新项目打开时 jdtls 会触发 Maven 构建,往 target/ 写大量 .class。否则这些事件每
+            // 500ms 就触发一次整树刷新(readDirTree + 展开态全树遍历),索引期间界面持续卡顿。
+            // 按项目根的相对路径判断,避免祖先目录恰好叫 out/bin 之类时全部误伤。
+            if event.paths.iter().all(|p| {
+                p.strip_prefix(&path_clone)
+                    .map(|rel| rel.components().any(|c| {
+                        c.as_os_str().to_str().map(should_skip).unwrap_or(false)
+                    }))
+                    .unwrap_or(false)
+            }) {
+                return;
+            }
             match event.kind {
                 EventKind::Create(_) | EventKind::Remove(_) => {
                     structural_clone.store(true, Ordering::Relaxed);
