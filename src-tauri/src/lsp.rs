@@ -12,15 +12,25 @@ pub struct LspState {
     servers: Mutex<HashMap<(String, String), Arc<LspServer>>>,
 }
 
-impl Drop for LspState {
-    fn drop(&mut self) {
+impl LspState {
+    // 应用退出时必须显式调用(见 lib.rs 的 RunEvent::Exit):Tauri 在事件循环结束后
+    // 直接 process::exit,托管状态的 Drop 不会执行;jdtls 不随父进程退出(实证:父进程
+    // 被杀后 ppid=1 仍存活),不杀干净的话每次退出都孤儿化一批 ~1.5G 堆的 JVM。
+    pub fn kill_all(&self) {
         if let Ok(mut servers) = self.servers.lock() {
             for (_, server) in servers.drain() {
                 if let Ok(mut process) = server.process.lock() {
                     let _ = process.kill();
+                    let _ = process.wait();
                 }
             }
         }
+    }
+}
+
+impl Drop for LspState {
+    fn drop(&mut self) {
+        self.kill_all();
     }
 }
 
@@ -1049,5 +1059,46 @@ fn decompile_class(jar_path: &str, fqn: &str) -> Result<String, String> {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 验证 kill_all 真正杀死并回收子进程(应用退出路径 RunEvent::Exit 依赖它,
+    // 否则 jdtls 孤儿跨重启累积——曾在真机上发现存活 23 小时的孤儿实例)。
+    #[test]
+    fn kill_all_reaps_server_processes() {
+        let mut child = Command::new("cat") // 读 stdin 永不退出,模拟常驻 LSP
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn cat");
+        let pid = child.id();
+        let stdin = child.stdin.take().unwrap();
+
+        let (_tx, rx) = mpsc::channel::<serde_json::Value>();
+        let server = LspServer {
+            stdin: Arc::new(Mutex::new(std::io::BufWriter::new(stdin))),
+            response_rx: Mutex::new(rx),
+            next_id: AtomicI64::new(1),
+            root_uri: "file:///tmp".into(),
+            process: Mutex::new(child),
+            ready: Arc::new(AtomicBool::new(true)),
+        };
+        let state = LspState::default();
+        state
+            .servers
+            .lock()
+            .unwrap()
+            .insert(("test".into(), "/tmp".into()), Arc::new(server));
+
+        state.kill_all();
+
+        // kill(pid, 0) 失败(ESRCH)= 进程已不存在且已被回收(wait 过,非僵尸)
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+        assert!(!alive, "kill_all 后子进程 {} 仍存活", pid);
+        assert!(state.servers.lock().unwrap().is_empty(), "服务表应已清空");
     }
 }

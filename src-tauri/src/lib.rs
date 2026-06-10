@@ -216,6 +216,17 @@ pub fn run() {
             astore::astore_get_editor_url,
             astore::astore_get_record_url,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Tauri 在事件循环结束后直接 process::exit,托管状态的 Drop 不执行——
+            // 必须在 Exit 事件里显式杀掉 LSP 子进程,否则 jdtls(每个 ~1.5G 堆)
+            // 在每次退出后变孤儿、跨重启累积吃光内存。
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                if let Some(state) = app_handle.try_state::<lsp::LspState>() {
+                    state.kill_all();
+                }
+            }
+        });
 }
