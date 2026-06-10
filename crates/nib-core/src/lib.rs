@@ -18,6 +18,7 @@ pub mod maven;
 pub mod paths;
 pub mod rt;
 pub mod search;
+pub mod terminal;
 pub mod session;
 pub mod usage_index;
 pub mod watch;

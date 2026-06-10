@@ -7,6 +7,7 @@ mod diff_view;
 mod git_panel;
 mod maven_panel;
 mod merge_view;
+mod terminal_panel;
 mod usages_view;
 mod quick_open;
 mod search_panel;
@@ -36,6 +37,7 @@ use maven_panel::MavenPanel;
 use merge_view::{MergeView, MergeViewEvent};
 use quick_open::{QuickOpen, QuickOpenEvent};
 use search_panel::{SearchEvent, SearchPanel};
+use terminal_panel::TerminalPanel;
 use usages_view::{UsagesEvent, UsagesView};
 
 actions!(
@@ -52,6 +54,7 @@ actions!(
         GotoDefinition,
         FindUsages,
         ToggleMdPreview,
+        ToggleTerminal,
         ArthasWatch,
         ArthasTrace,
         ArthasStack,
@@ -155,6 +158,8 @@ struct Workbench {
     events_sink: Arc<ChannelSink>,
     settings: session::EditorSettings,
     md_preview: bool,
+    terminal: Option<Entity<TerminalPanel>>,
+    terminal_visible: bool,
     status: SharedString,
     /// 主线程停顿哨兵计数(>32ms 漂移即记,可举证不凭感觉)
     stall_count: usize,
@@ -246,6 +251,8 @@ impl Workbench {
             events_sink: Arc::new(ChannelSink(tx)),
             settings: session::EditorSettings::default(),
             md_preview: false,
+            terminal: None,
+            terminal_visible: false,
             status: "".into(),
             stall_count: 0,
             first_frame_logged: false,
@@ -326,6 +333,9 @@ impl Workbench {
             .unwrap_or_else(|| root.display().to_string())
             .into();
         self.status = root.display().to_string().into();
+        if let Some(panel) = &self.terminal {
+            panel.update(cx, |panel, _| panel.set_project(root.clone()));
+        }
 
         self.reload_tree(cx);
         let git_root = self.project_root.clone();
@@ -951,6 +961,35 @@ impl Workbench {
         cx.notify();
     }
 
+    /// 底部终端开/关。首次打开才起 shell;关闭只藏不杀(再开即回)。
+    fn on_toggle_terminal(
+        &mut self,
+        _: &ToggleTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_visible = !self.terminal_visible;
+        if self.terminal_visible {
+            let panel = match &self.terminal {
+                Some(panel) => panel.clone(),
+                None => {
+                    let panel = cx.new(|cx| TerminalPanel::new(self.project_root.clone(), cx));
+                    self.terminal = Some(panel.clone());
+                    panel
+                }
+            };
+            let handle = panel.read(cx).focus_handle();
+            window.focus(&handle, cx);
+        } else {
+            let handle = match self.active() {
+                Some(tab) => tab.editor.read(cx).focus_handle(cx),
+                None => self.focus_handle.clone(),
+            };
+            window.focus(&handle, cx);
+        }
+        cx.notify();
+    }
+
     fn on_open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -1210,6 +1249,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_goto_definition))
             .on_action(cx.listener(Self::on_find_usages))
             .on_action(cx.listener(Self::on_toggle_md_preview))
+            .on_action(cx.listener(Self::on_toggle_terminal))
             .on_action(cx.listener(|this: &mut Self, _: &ArthasWatch, _, cx| {
                 this.arthas_command(nib_core::arthas::ArthasCommand::Watch, cx)
             }))
@@ -1354,7 +1394,18 @@ impl Render for Workbench {
                                             ),
                                     ),
                                 }
-                            })),
+                            }))
+                            .when(self.terminal_visible, |this| {
+                                this.when_some(self.terminal.clone(), |this, panel| {
+                                    this.child(
+                                        div()
+                                            .h(px(240.))
+                                            .border_t_1()
+                                            .border_color(cx.theme().border)
+                                            .child(panel),
+                                    )
+                                })
+                            }),
                     ),
             )
             .child(
@@ -1454,6 +1505,8 @@ fn main() {
                 MenuItem::action("查找引用", FindUsages),
                 MenuItem::action("Markdown 预览", ToggleMdPreview),
             ]),
+            // 对齐旧版 View 菜单(Terminal 项;Git/Astore 在侧栏页签,不重复列)
+            Menu::new("View").items([MenuItem::action("Terminal", ToggleTerminal)]),
         ]);
 
         cx.bind_keys([
@@ -1462,6 +1515,7 @@ fn main() {
             KeyBinding::new("f12", GotoDefinition, Some("Workbench")),
             KeyBinding::new("shift-f12", FindUsages, Some("Workbench")),
             KeyBinding::new("cmd-shift-v", ToggleMdPreview, Some("Workbench")),
+            KeyBinding::new("ctrl-`", ToggleTerminal, Some("Workbench")),
             KeyBinding::new("enter", PaletteConfirm, Some("QuickOpen")),
             KeyBinding::new("cmd-s", SaveFile, Some("Workbench")),
             KeyBinding::new("cmd-w", CloseTab, Some("Workbench")),

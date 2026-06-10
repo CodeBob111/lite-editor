@@ -21,6 +21,7 @@ dirs = "5"
 comrak = { version = "0.52.0", default-features = false }
 similar = "2"
 regex = "1"
+alacritty_terminal = "0.26.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"
