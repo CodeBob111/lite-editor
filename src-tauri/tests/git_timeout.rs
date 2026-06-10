@@ -1,4 +1,4 @@
-use lite_editor_lib::git::{git_pull, git_status, run_git_with_timeout};
+use lite_editor_lib::git::{git_pull_sync, parse_git_status, run_git_with_timeout};
 use std::time::{Duration, Instant};
 
 fn run(cwd: &std::path::Path, args: &[&str]) {
@@ -145,8 +145,8 @@ fn test_git_pull_missing_upstream_is_friendly() {
         ],
     );
 
-    let result = git_pull(
-        tmp.to_string_lossy().to_string(),
+    let result = git_pull_sync(
+        &tmp.to_string_lossy(),
         Some("feature/stale".to_string()),
         Some("origin/feature/stale".to_string()),
     );
@@ -178,7 +178,7 @@ fn test_git_status_keeps_staged_nested_path_intact() {
         ],
     );
 
-    let changes = git_status(tmp.to_string_lossy().to_string()).unwrap();
+    let changes = parse_git_status(&tmp.to_string_lossy()).unwrap();
 
     assert_eq!(changes.len(), 1);
     assert_eq!(
@@ -207,7 +207,7 @@ fn test_git_status_keeps_unstaged_nested_path_intact() {
     run(&tmp, &["commit", "-m", "initial"]);
     std::fs::write(&file, "class SurveyServiceImpl { int changed; }\n").unwrap();
 
-    let changes = git_status(tmp.to_string_lossy().to_string()).unwrap();
+    let changes = parse_git_status(&tmp.to_string_lossy()).unwrap();
 
     assert_eq!(changes.len(), 1);
     assert_eq!(
@@ -228,7 +228,7 @@ fn test_git_status_records_rename_old_path() {
     run(&tmp, &["commit", "-m", "initial"]);
     run(&tmp, &["mv", "src/Old Name.java", "src/New Name.java"]);
 
-    let changes = git_status(tmp.to_string_lossy().to_string()).unwrap();
+    let changes = parse_git_status(&tmp.to_string_lossy()).unwrap();
 
     assert_eq!(changes.len(), 1);
     let value = serde_json::to_value(&changes[0]).unwrap();

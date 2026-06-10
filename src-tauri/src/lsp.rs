@@ -370,7 +370,7 @@ fn start_lsp_blocking(
 }
 
 #[tauri::command]
-pub fn stop_lsp(
+pub async fn stop_lsp(
     language: String,
     root_path: String,
     state: State<'_, LspState>,
@@ -380,18 +380,23 @@ pub fn stop_lsp(
         servers.remove(&(language, root_path))
     };
     if let Some(server) = server {
-        let id = server.next_id.fetch_add(1, Ordering::Relaxed);
-        let _ = request_and_wait(
-            &server,
-            id,
-            "shutdown",
-            serde_json::Value::Null,
-            Duration::from_secs(3),
-        );
-        let _ = send_notification(&server, "exit", serde_json::Value::Null);
-        if let Ok(mut proc) = server.process.lock() {
-            let _ = proc.kill();
-        }
+        // shutdown 握手最长等 3s:放到阻塞线程池,不能让调用方(主线程)跟着等。
+        let _ = tokio::task::spawn_blocking(move || {
+            let id = server.next_id.fetch_add(1, Ordering::Relaxed);
+            let _ = request_and_wait(
+                &server,
+                id,
+                "shutdown",
+                serde_json::Value::Null,
+                Duration::from_secs(3),
+            );
+            let _ = send_notification(&server, "exit", serde_json::Value::Null);
+            if let Ok(mut proc) = server.process.lock() {
+                let _ = proc.kill();
+                let _ = proc.wait(); // kill 后必须 wait 回收,否则留僵尸进程
+            }
+        })
+        .await;
     }
     Ok(())
 }
@@ -409,8 +414,10 @@ pub fn lsp_is_ready(file_path: String, state: State<'_, LspState>) -> Result<boo
     Ok(server.ready.load(Ordering::Relaxed))
 }
 
+// didOpen/didChange 往 LSP stdin 写整份文件内容:jdtls 忙(索引中)不读管道时,
+// 64K 管道缓冲一满 write 就阻塞——必须离开主线程。
 #[tauri::command]
-pub fn lsp_did_open(
+pub async fn lsp_did_open(
     file_path: String,
     language_id: String,
     content: String,
@@ -421,20 +428,23 @@ pub fn lsp_did_open(
         find_server_for_file(&servers, &file_path, &language_id)?
     };
 
-    let params = serde_json::json!({
-        "textDocument": {
-            "uri": format!("file://{}", file_path),
-            "languageId": language_id,
-            "version": 1,
-            "text": content
-        }
-    });
-
-    send_notification(&server, "textDocument/didOpen", params)
+    tokio::task::spawn_blocking(move || {
+        let params = serde_json::json!({
+            "textDocument": {
+                "uri": format!("file://{}", file_path),
+                "languageId": language_id,
+                "version": 1,
+                "text": content
+            }
+        });
+        send_notification(&server, "textDocument/didOpen", params)
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))?
 }
 
 #[tauri::command]
-pub fn lsp_did_change(
+pub async fn lsp_did_change(
     file_path: String,
     content: String,
     state: State<'_, LspState>,
@@ -448,14 +458,18 @@ pub fn lsp_did_change(
         }
     };
 
-    let params = serde_json::json!({
-        "textDocument": {
-            "uri": format!("file://{}", file_path),
-            "version": 2
-        },
-        "contentChanges": [{ "text": content }]
-    });
-    send_notification(&server, "textDocument/didChange", params)
+    tokio::task::spawn_blocking(move || {
+        let params = serde_json::json!({
+            "textDocument": {
+                "uri": format!("file://{}", file_path),
+                "version": 2
+            },
+            "contentChanges": [{ "text": content }]
+        });
+        send_notification(&server, "textDocument/didChange", params)
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))?
 }
 
 #[tauri::command]

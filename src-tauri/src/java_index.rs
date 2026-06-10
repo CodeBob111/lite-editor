@@ -247,26 +247,45 @@ pub fn search_java_class(
         .collect())
 }
 
+// 序列化后的整份索引落盘:JSON 可达数 MB,同步命令里写盘会卡主线程,统一丢到阻塞线程池。
+fn persist_index_async(project_path: &str, index: &JavaIndex) {
+    let cache_path = index_cache_path(project_path);
+    if let Ok(json) = serde_json::to_string(index) {
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = cache_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&cache_path, json);
+        });
+    }
+}
+
 #[tauri::command]
-pub fn update_java_index_file(
+pub async fn update_java_index_file(
     project_path: String,
     file_path: String,
     state: State<'_, JavaIndexState>,
 ) -> Result<(), String> {
-    let path = Path::new(&file_path);
-    if !path.exists() || path.extension().map_or(true, |e| e != "java") {
+    let fp = file_path.clone();
+    let parsed = tokio::task::spawn_blocking(move || {
+        let path = Path::new(&fp);
+        if !path.exists() || path.extension().map_or(true, |e| e != "java") {
+            return Ok(None);
+        }
+        let class_name = path
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .ok_or("Invalid file name")?
+            .to_string();
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        Ok::<_, String>(Some((class_name, parse_package(&content), file_modified_secs(path))))
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
+
+    let Some((class_name, package, modified)) = parsed else {
         return Ok(());
-    }
-
-    let class_name = path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .ok_or("Invalid file name")?
-        .to_string();
-
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let package = parse_package(&content);
-    let modified = file_modified_secs(path);
+    };
 
     let mut indices = state.indices.lock().map_err(|e| e.to_string())?;
     let index = indices.entry(project_path.clone()).or_default();
@@ -283,19 +302,12 @@ pub fn update_java_index_file(
         });
     }
 
-    let cache_path = index_cache_path(&project_path);
-    if let Some(parent) = cache_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string(&index) {
-        let _ = std::fs::write(&cache_path, json);
-    }
-
+    persist_index_async(&project_path, index);
     Ok(())
 }
 
 #[tauri::command]
-pub fn remove_java_index_file(
+pub async fn remove_java_index_file(
     project_path: String,
     file_path: String,
     state: State<'_, JavaIndexState>,
@@ -319,10 +331,6 @@ pub fn remove_java_index_file(
         }
     }
 
-    let cache_path = index_cache_path(&project_path);
-    if let Ok(json) = serde_json::to_string(&index) {
-        let _ = std::fs::write(&cache_path, json);
-    }
-
+    persist_index_async(&project_path, index);
     Ok(())
 }

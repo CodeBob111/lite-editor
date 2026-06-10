@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 use tauri::State;
 use walkdir::WalkDir;
 
@@ -186,7 +186,7 @@ pub async fn build_usage_index(
 }
 
 #[tauri::command]
-pub fn query_usages(
+pub async fn query_usages(
     project_path: String,
     symbol: String,
     limit: usize,
@@ -211,57 +211,71 @@ pub fn query_usages(
     if hits.is_empty() {
         return Ok(Vec::new());
     }
-    hits.sort();
-    let cap = if limit == 0 { usize::MAX } else { limit };
 
-    // 按文件分组,各读一次,取需要的行文本。
-    let mut by_file: HashMap<String, Vec<u32>> = HashMap::new();
-    for (path, ln) in hits.into_iter().take(cap) {
-        by_file.entry(path).or_default().push(ln);
-    }
-    let mut out: Vec<Usage> = Vec::new();
-    for (path, mut lines) in by_file {
-        lines.sort();
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            let src: Vec<&str> = content.lines().collect();
-            for ln in lines {
-                let text = src
-                    .get((ln as usize).saturating_sub(1))
-                    .map(|s| s.trim().to_string())
-                    .unwrap_or_default();
-                out.push(Usage {
-                    file: path.clone(),
-                    line: ln,
-                    text,
-                });
+    // 命中行的文本要读一批文件:同步命令跑在主线程会卡 UI,搬到阻塞线程池。
+    tokio::task::spawn_blocking(move || {
+        hits.sort();
+        let cap = if limit == 0 { usize::MAX } else { limit };
+
+        // 按文件分组,各读一次,取需要的行文本。
+        let mut by_file: HashMap<String, Vec<u32>> = HashMap::new();
+        for (path, ln) in hits.into_iter().take(cap) {
+            by_file.entry(path).or_default().push(ln);
+        }
+        let mut out: Vec<Usage> = Vec::new();
+        for (path, mut lines) in by_file {
+            lines.sort();
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let src: Vec<&str> = content.lines().collect();
+                for ln in lines {
+                    let text = src
+                        .get((ln as usize).saturating_sub(1))
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    out.push(Usage {
+                        file: path.clone(),
+                        line: ln,
+                        text,
+                    });
+                }
             }
         }
-    }
-    out.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
-    Ok(out)
+        out.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+        Ok(out)
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))?
 }
 
 // 文件保存时:只重扫该文件、更新内存(不写盘——大索引逐次写盘太慢;
 // 下次构建/启动的 mtime 增量会把磁盘补齐)。
 #[tauri::command]
-pub fn update_usage_index_file(
+pub async fn update_usage_index_file(
     project_path: String,
     file_path: String,
     state: State<'_, UsageIndexState>,
 ) -> Result<(), String> {
-    let path = Path::new(&file_path);
-    if !path.exists() || path.extension().map_or(true, |e| e != "java") {
-        return Ok(());
-    }
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let ft = FileTokens {
-        modified: file_modified_secs(path),
-        tokens: tokenize(&content),
-    };
-    let mut indices = state.indices.lock().map_err(|e| e.to_string())?;
-    // 只在该项目索引已加载时更新;没加载就算了(下次构建会带上)。
-    if let Some(index) = indices.get_mut(&project_path) {
-        index.files.insert(file_path, ft);
+    let fp = file_path.clone();
+    let ft = tokio::task::spawn_blocking(move || {
+        let path = Path::new(&fp);
+        if !path.exists() || path.extension().map_or(true, |e| e != "java") {
+            return Ok(None);
+        }
+        let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+        Ok::<_, String>(Some(FileTokens {
+            modified: file_modified_secs(path),
+            tokens: tokenize(&content),
+        }))
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))??;
+
+    if let Some(ft) = ft {
+        let mut indices = state.indices.lock().map_err(|e| e.to_string())?;
+        // 只在该项目索引已加载时更新;没加载就算了(下次构建会带上)。
+        if let Some(index) = indices.get_mut(&project_path) {
+            index.files.insert(file_path, ft);
+        }
     }
     Ok(())
 }

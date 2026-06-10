@@ -15,6 +15,8 @@ fn utf8_valid_prefix_len(bytes: &[u8]) -> usize {
 struct TerminalInstance {
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
+    // 持有 shell 子进程句柄:关闭终端时 kill + wait 回收,否则每关一个终端留一个僵尸进程。
+    child: Box<dyn portable_pty::Child + Send + Sync>,
     child_pid: Option<u32>,
     // 缓存上次解析到的 claude 进程 pid。仅作为快路径提示——真正的状态来源是
     // claude 的 session 文件；缓存失效时会重新走 ps 解析（见 get_claude_status）。
@@ -103,6 +105,7 @@ pub fn spawn_terminal(
     let instance = TerminalInstance {
         writer,
         master: pair.master,
+        child,
         child_pid,
         claude_pid: None,
     };
@@ -158,8 +161,17 @@ pub fn resize_terminal(
 
 #[tauri::command]
 pub fn close_terminal(id: u32, state: State<'_, TerminalState>) -> Result<(), String> {
-    let mut terminals = state.terminals.lock().map_err(|e| e.to_string())?;
-    terminals.remove(&id);
+    let inst = {
+        let mut terminals = state.terminals.lock().map_err(|e| e.to_string())?;
+        terminals.remove(&id)
+    };
+    if let Some(mut inst) = inst {
+        // kill 后必须 wait 回收子进程;wait 会等 shell 真正退出,放后台线程,不卡调用方。
+        std::thread::spawn(move || {
+            let _ = inst.child.kill();
+            let _ = inst.child.wait();
+        });
+    }
     Ok(())
 }
 
@@ -237,7 +249,7 @@ fn read_claude_status(claude_pid: u32) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn get_claude_status(id: u32, state: State<'_, TerminalState>) -> Result<Option<String>, String> {
+pub async fn get_claude_status(id: u32, state: State<'_, TerminalState>) -> Result<Option<String>, String> {
     // 1) 在锁内取出 shell_pid 与缓存的 claude_pid，随即释放锁——
     //    昂贵的 ps spawn 绝不在持锁时进行，避免阻塞 write/resize 等命令。
     let (shell_pid, cached) = {
@@ -263,8 +275,10 @@ pub fn get_claude_status(id: u32, state: State<'_, TerminalState>) -> Result<Opt
         // pid 已死，或 session 文件消失 → 缓存失效，落到慢路径重新解析。
     }
 
-    // 3) 慢路径：spawn ps 重新解析 claude 子孙进程（唯一昂贵的调用），并回写缓存。
-    let new_pid = find_claude_descendant(shell_pid);
+    // 3) 慢路径：spawn ps 重新解析 claude 子孙进程（唯一昂贵的调用,放阻塞线程池），并回写缓存。
+    let new_pid = tokio::task::spawn_blocking(move || find_claude_descendant(shell_pid))
+        .await
+        .map_err(|e| format!("Task failed: {}", e))?;
     {
         let mut terminals = state.terminals.lock().map_err(|e| e.to_string())?;
         if let Some(inst) = terminals.get_mut(&id) {

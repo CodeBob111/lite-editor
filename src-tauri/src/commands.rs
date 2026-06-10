@@ -25,6 +25,18 @@ pub struct WatcherState {
     watchers: Mutex<HashMap<String, RecommendedWatcher>>,
 }
 
+// ---- Worker helper ----
+
+// 同步 Tauri 命令在主线程执行,任何磁盘/子进程等待都会冻住整个 UI。
+// 所有做阻塞 IO 的命令统一经这里搬到阻塞线程池。
+pub(crate) async fn on_worker<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("Task failed: {}", e))?
+}
+
 // ---- File tree ----
 
 #[derive(Serialize, Clone)]
@@ -37,12 +49,16 @@ pub struct FileNode {
 }
 
 #[tauri::command]
-pub fn read_dir_tree(path: String, max_depth: Option<usize>) -> Result<FileNode, String> {
-    let root = Path::new(&path);
-    if !root.exists() {
-        return Err(format!("Path does not exist: {}", path));
-    }
-    build_tree(root, max_depth.unwrap_or(4), 0).ok_or_else(|| "Failed to read directory".into())
+pub async fn read_dir_tree(path: String, max_depth: Option<usize>) -> Result<FileNode, String> {
+    on_worker(move || {
+        let root = Path::new(&path);
+        if !root.exists() {
+            return Err(format!("Path does not exist: {}", path));
+        }
+        build_tree(root, max_depth.unwrap_or(4), 0)
+            .ok_or_else(|| "Failed to read directory".into())
+    })
+    .await
 }
 
 fn build_tree(path: &Path, max_depth: usize, current_depth: usize) -> Option<FileNode> {
@@ -110,68 +126,86 @@ fn is_binary_ext(name: &str) -> bool {
 // ---- File system commands ----
 
 #[tauri::command]
-pub fn read_file(path: String) -> Result<String, String> {
-    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {}", path, e))
+pub async fn read_file(path: String) -> Result<String, String> {
+    on_worker(move || {
+        std::fs::read_to_string(&path).map_err(|e| format!("Failed to read {}: {}", path, e))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn write_file(path: String, content: String) -> Result<(), String> {
-    std::fs::write(&path, &content).map_err(|e| format!("Failed to write {}: {}", path, e))
+pub async fn write_file(path: String, content: String) -> Result<(), String> {
+    on_worker(move || {
+        std::fs::write(&path, &content).map_err(|e| format!("Failed to write {}: {}", path, e))
+    })
+    .await
 }
 
 #[tauri::command]
-pub fn create_file(path: String) -> Result<(), String> {
-    let p = Path::new(&path);
-    if p.exists() {
-        return Err(format!("Already exists: {}", path));
-    }
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create parent dirs: {}", e))?;
-    }
-    std::fs::File::create(&path).map_err(|e| format!("Failed to create {}: {}", path, e))?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn create_dir(path: String) -> Result<(), String> {
-    std::fs::create_dir_all(&path)
-        .map_err(|e| format!("Failed to create directory {}: {}", path, e))
-}
-
-#[tauri::command]
-pub fn delete_path(path: String) -> Result<(), String> {
-    let p = Path::new(&path);
-    if !p.exists() {
-        return Err(format!("Path does not exist: {}", path));
-    }
-    if p.is_dir() {
-        std::fs::remove_dir_all(&path).map_err(|e| format!("Failed to delete {}: {}", path, e))
-    } else {
-        std::fs::remove_file(&path).map_err(|e| format!("Failed to delete {}: {}", path, e))
-    }
-}
-
-#[tauri::command]
-pub fn copy_path(src: String, dest: String) -> Result<(), String> {
-    let s = Path::new(&src);
-    if !s.exists() {
-        return Err(format!("Source does not exist: {}", src));
-    }
-    if Path::new(&dest).exists() {
-        return Err(format!("Destination already exists: {}", dest));
-    }
-    if s.is_dir() {
-        copy_dir_recursive(&src, &dest)
-    } else {
-        if let Some(parent) = Path::new(&dest).parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create dir {}: {}", parent.display(), e))?;
+pub async fn create_file(path: String) -> Result<(), String> {
+    on_worker(move || {
+        let p = Path::new(&path);
+        if p.exists() {
+            return Err(format!("Already exists: {}", path));
         }
-        std::fs::copy(&src, &dest)
-            .map(|_| ())
-            .map_err(|e| format!("Failed to copy {}: {}", src, e))
-    }
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create parent dirs: {}", e))?;
+        }
+        std::fs::File::create(&path).map_err(|e| format!("Failed to create {}: {}", path, e))?;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn create_dir(path: String) -> Result<(), String> {
+    on_worker(move || {
+        std::fs::create_dir_all(&path)
+            .map_err(|e| format!("Failed to create directory {}: {}", path, e))
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_path(path: String) -> Result<(), String> {
+    on_worker(move || {
+        let p = Path::new(&path);
+        if !p.exists() {
+            return Err(format!("Path does not exist: {}", path));
+        }
+        if p.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|e| format!("Failed to delete {}: {}", path, e))
+        } else {
+            std::fs::remove_file(&path).map_err(|e| format!("Failed to delete {}: {}", path, e))
+        }
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn copy_path(src: String, dest: String) -> Result<(), String> {
+    on_worker(move || {
+        let s = Path::new(&src);
+        if !s.exists() {
+            return Err(format!("Source does not exist: {}", src));
+        }
+        if Path::new(&dest).exists() {
+            return Err(format!("Destination already exists: {}", dest));
+        }
+        if s.is_dir() {
+            copy_dir_recursive(&src, &dest)
+        } else {
+            if let Some(parent) = Path::new(&dest).parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create dir {}: {}", parent.display(), e))?;
+            }
+            std::fs::copy(&src, &dest)
+                .map(|_| ())
+                .map_err(|e| format!("Failed to copy {}: {}", src, e))
+        }
+    })
+    .await
 }
 
 fn copy_dir_recursive(src: &str, dest: &str) -> Result<(), String> {
@@ -194,14 +228,17 @@ fn copy_dir_recursive(src: &str, dest: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
-    if !Path::new(&old_path).exists() {
-        return Err(format!("Path does not exist: {}", old_path));
-    }
-    if Path::new(&new_path).exists() {
-        return Err(format!("Target already exists: {}", new_path));
-    }
-    std::fs::rename(&old_path, &new_path).map_err(|e| format!("Failed to rename: {}", e))
+pub async fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
+    on_worker(move || {
+        if !Path::new(&old_path).exists() {
+            return Err(format!("Path does not exist: {}", old_path));
+        }
+        if Path::new(&new_path).exists() {
+            return Err(format!("Target already exists: {}", new_path));
+        }
+        std::fs::rename(&old_path, &new_path).map_err(|e| format!("Failed to rename: {}", e))
+    })
+    .await
 }
 
 // ---- Search (parallelized with rayon) ----
@@ -467,26 +504,29 @@ pub struct MavenModule {
 }
 
 #[tauri::command]
-pub fn parse_maven_modules(project_path: String) -> Result<Vec<MavenModule>, String> {
-    let mut modules = Vec::new();
+pub async fn parse_maven_modules(project_path: String) -> Result<Vec<MavenModule>, String> {
+    on_worker(move || {
+        let mut modules = Vec::new();
 
-    for entry in WalkDir::new(&project_path)
-        .max_depth(3)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if entry.file_name() == "pom.xml" {
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                if let Some(module) =
-                    parse_pom(&content, entry.path().to_string_lossy().to_string())
-                {
-                    modules.push(module);
+        for entry in WalkDir::new(&project_path)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_name() == "pom.xml" {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    if let Some(module) =
+                        parse_pom(&content, entry.path().to_string_lossy().to_string())
+                    {
+                        modules.push(module);
+                    }
                 }
             }
         }
-    }
 
-    Ok(modules)
+        Ok(modules)
+    })
+    .await
 }
 
 fn local_tag_name(raw: &[u8]) -> String {
