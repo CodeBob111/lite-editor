@@ -35,9 +35,14 @@ actions!(
         ToggleSearch,
         PaletteUp,
         PaletteDown,
-        PaletteDismiss
+        PaletteDismiss,
+        OpenFolder,
+        Quit
     ]
 );
+
+/// 首帧计时锚点(RFC v2 §5 预算:冷启动首帧 ≤300ms)
+static APP_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// 双击 Shift 的判定窗口(对齐旧版 quick-open 习惯)
 const DOUBLE_SHIFT_WINDOW: Duration = Duration::from_millis(400);
@@ -113,6 +118,7 @@ struct Workbench {
     status: SharedString,
     /// 主线程停顿哨兵计数(>32ms 漂移即记,可举证不凭感觉)
     stall_count: usize,
+    first_frame_logged: bool,
     last_shift: Option<Instant>,
     prev_modifiers: Modifiers,
 }
@@ -179,6 +185,7 @@ impl Workbench {
             events_sink: Arc::new(ChannelSink(tx)),
             status: "".into(),
             stall_count: 0,
+            first_frame_logged: false,
             last_shift: None,
             prev_modifiers: Modifiers::default(),
         };
@@ -457,6 +464,10 @@ impl Workbench {
         self.status = tab.path.display().to_string().into();
         let handle = tab.editor.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
+        // 树高亮跟随当前标签(按 id 匹配,自动展开祖先;观察者对已激活文件是 no-op)
+        let tree_item = TreeItem::new(tab.path.to_string_lossy().to_string(), tab.title.clone());
+        self.tree_state
+            .update(cx, |state, cx| state.set_selected_item(Some(&tree_item), cx));
         self.persist_session(cx);
         cx.notify();
     }
@@ -596,6 +607,29 @@ impl Workbench {
                     cx.notify();
                 });
             });
+        })
+        .detach();
+    }
+
+    fn on_open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("打开项目".into()),
+        });
+        cx.spawn(async move |weak, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(root) = paths.into_iter().next() {
+                    let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                        this.tabs.clear();
+                        this.active_tab = None;
+                        this.load_project(root, cx);
+                        this.persist_session(cx);
+                        cx.notify();
+                    });
+                }
+            }
         })
         .detach();
     }
@@ -749,6 +783,12 @@ impl Workbench {
 
 impl Render for Workbench {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.first_frame_logged {
+            self.first_frame_logged = true;
+            if let Some(t0) = APP_START.get() {
+                eprintln!("[nib-perf] 首帧 {}ms", t0.elapsed().as_millis());
+            }
+        }
         let active_lang = self.active().map(|t| t.lang).unwrap_or("");
         let title: SharedString = match self.active() {
             Some(tab) => format!("{} — {}", self.project_name, tab.title).into(),
@@ -765,6 +805,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_toggle_quick_open))
             .on_action(cx.listener(Self::on_toggle_search))
+            .on_action(cx.listener(Self::on_open_folder))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
             .child(
@@ -878,6 +919,7 @@ impl Render for Workbench {
 }
 
 fn main() {
+    APP_START.set(Instant::now()).ok();
     gpui_platform::application().run(move |cx| {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
@@ -896,7 +938,25 @@ fn main() {
             Theme::global_mut(cx).apply_config(&config);
         }
 
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        // 原生菜单栏(条目对齐旧版 lib.rs build_menu)
+        cx.set_menus([
+            Menu::new("Nib").items([MenuItem::action("退出 Nib", Quit)]),
+            Menu::new("File").items([
+                MenuItem::action("打开文件夹…", OpenFolder),
+                MenuItem::separator(),
+                MenuItem::action("保存", SaveFile),
+                MenuItem::action("关闭标签", CloseTab),
+            ]),
+            Menu::new("Go").items([
+                MenuItem::action("快速打开文件…", ToggleQuickOpen),
+                MenuItem::action("在项目中搜索…", ToggleSearch),
+            ]),
+        ]);
+
         cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-o", OpenFolder, Some("Workbench")),
             KeyBinding::new("cmd-s", SaveFile, Some("Workbench")),
             KeyBinding::new("cmd-w", CloseTab, Some("Workbench")),
             KeyBinding::new("cmd-p", ToggleQuickOpen, Some("Workbench")),
