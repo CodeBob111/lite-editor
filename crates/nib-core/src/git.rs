@@ -16,24 +16,24 @@ pub struct GitRepo {
 
 #[derive(Serialize)]
 pub struct GitBranch {
-    name: String,
-    current: bool,
-    remote: bool,
-    ahead: i32,
-    behind: i32,
-    tracking: Option<String>,
-    upstream_gone: bool,
+    pub name: String,
+    pub current: bool,
+    pub remote: bool,
+    pub ahead: i32,
+    pub behind: i32,
+    pub tracking: Option<String>,
+    pub upstream_gone: bool,
 }
 
 #[derive(Serialize)]
 pub struct GitCommit {
-    hash: String,
-    short_hash: String,
-    parents: Vec<String>,
-    author: String,
-    date: String,
-    refs: String,
-    subject: String,
+    pub hash: String,
+    pub short_hash: String,
+    pub parents: Vec<String>,
+    pub author: String,
+    pub date: String,
+    pub refs: String,
+    pub subject: String,
 }
 
 fn run_git(cwd: &str, args: &[&str]) -> Result<String, String> {

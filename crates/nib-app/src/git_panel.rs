@@ -10,19 +10,30 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
+    tab::{Tab, TabBar},
     v_flex, ActiveTheme, Disableable as _, Sizable as _,
 };
-use nib_core::git::GitChange;
+use nib_core::git::{GitBranch, GitChange, GitCommit};
 
 pub enum GitPanelEvent {
     OpenFile(PathBuf),
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum GitView {
+    Changes,
+    Branches,
+    Log,
+}
+
 pub struct GitPanel {
     window_handle: AnyWindowHandle,
     project_root: PathBuf,
+    view: GitView,
     branch: SharedString,
     changes: Vec<GitChange>,
+    branches: Vec<GitBranch>,
+    log: Vec<GitCommit>,
     message_input: Entity<InputState>,
     busy: bool,
     status: SharedString,
@@ -41,8 +52,11 @@ impl GitPanel {
         let mut this = Self {
             window_handle: window.window_handle(),
             project_root,
+            view: GitView::Changes,
             branch: "".into(),
             changes: Vec::new(),
+            branches: Vec::new(),
+            log: Vec::new(),
             message_input,
             busy: false,
             status: "".into(),
@@ -55,6 +69,8 @@ impl GitPanel {
     pub fn set_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.project_root = root;
         self.changes.clear();
+        self.branches.clear();
+        self.log.clear();
         self.branch = "".into();
         self.refresh(cx);
     }
@@ -65,14 +81,24 @@ impl GitPanel {
         let seq = self.refresh_seq;
         let cwd = self.project_root.to_string_lossy().to_string();
         cx.spawn(async move |weak, cx| {
-            let branch = nib_core::git::git_current_branch(cwd.clone()).await;
-            let changes = nib_core::git::git_status(cwd).await;
+            let branch = nib_core::git::git_current_branch(cwd.clone())
+                .await
+                .unwrap_or_default();
+            let changes = nib_core::git::git_status(cwd.clone()).await;
+            let branches = nib_core::git::git_list_branches(cwd.clone()).await;
+            let log = if branch.is_empty() {
+                Ok(Vec::new())
+            } else {
+                nib_core::git::git_log(cwd, branch.clone(), Some(50)).await
+            };
             let _ = weak.update(cx, |this, cx| {
                 if this.refresh_seq != seq {
                     return;
                 }
-                this.branch = branch.unwrap_or_default().into();
+                this.branch = branch.into();
                 this.changes = changes.unwrap_or_default();
+                this.branches = branches.unwrap_or_default();
+                this.log = log.unwrap_or_default();
                 cx.notify();
             });
         })
@@ -124,6 +150,106 @@ impl GitPanel {
             });
         })
         .detach();
+    }
+
+    fn checkout(&mut self, branch: String, cx: &mut Context<Self>) {
+        if self.busy || branch == self.branch.as_ref() {
+            return;
+        }
+        self.busy = true;
+        self.status = format!("切换到 {} …", branch).into();
+        cx.notify();
+        let cwd = self.project_root.to_string_lossy().to_string();
+        cx.spawn(async move |weak, cx| {
+            let result = nib_core::git::git_checkout(cwd, branch.clone(), None).await;
+            let _ = weak.update(cx, |this: &mut GitPanel, cx| {
+                this.busy = false;
+                this.status = match &result {
+                    Ok(_) => format!("已切换到 {} ✓", branch).into(),
+                    Err(err) => format!("切换失败: {}", err).into(),
+                };
+                this.refresh(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_branches(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        self.branches
+            .iter()
+            .filter(|b| !b.remote)
+            .map(|b| {
+                let name = b.name.clone();
+                let current = b.current;
+                let mut row = h_flex()
+                    .px_2()
+                    .py_0p5()
+                    .gap_2()
+                    .items_center()
+                    .rounded(cx.theme().radius)
+                    .text_size(px(12.))
+                    .hover(|s| s.bg(cx.theme().accent));
+                if current {
+                    row = row
+                        .bg(cx.theme().list_active)
+                        .font_weight(FontWeight::BOLD);
+                }
+                let to_switch = name.clone();
+                row.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this: &mut GitPanel, _, _, cx| {
+                        this.checkout(to_switch.clone(), cx)
+                    }),
+                )
+                .child(div().flex_1().min_w_0().overflow_hidden().child(name))
+                .when(b.ahead > 0 || b.behind > 0, |s| {
+                    s.child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("↑{} ↓{}", b.ahead, b.behind)),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn render_log(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        self.log
+            .iter()
+            .map(|c| {
+                h_flex()
+                    .px_2()
+                    .py_0p5()
+                    .gap_2()
+                    .items_start()
+                    .rounded(cx.theme().radius)
+                    .text_size(px(12.))
+                    .hover(|s| s.bg(cx.theme().accent))
+                    .child(
+                        div()
+                            .text_color(cx.theme().info)
+                            .font_family("monospace")
+                            .child(c.short_hash.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(c.subject.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(cx.theme().muted_foreground)
+                            .whitespace_nowrap()
+                            .child(c.date.clone()),
+                    )
+            })
+            .collect()
     }
 
     fn status_color(status: &str, cx: &App) -> Hsla {
@@ -222,24 +348,50 @@ impl Render for GitPanel {
                     ),
             )
             .child(
+                TabBar::new("git-views")
+                    .w_full()
+                    .underline()
+                    .selected_index(match self.view {
+                        GitView::Changes => 0,
+                        GitView::Branches => 1,
+                        GitView::Log => 2,
+                    })
+                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                        this.view = match ix {
+                            1 => GitView::Branches,
+                            2 => GitView::Log,
+                            _ => GitView::Changes,
+                        };
+                        cx.notify();
+                    }))
+                    .child(Tab::new().label("变更"))
+                    .child(Tab::new().label("分支"))
+                    .child(Tab::new().label("历史")),
+            )
+            .child(
                 v_flex()
-                    .id("git-changes")
+                    .id("git-body")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .p_1()
-                    .when(self.changes.is_empty(), |s| {
-                        s.child(
-                            div()
-                                .p_2()
-                                .text_size(px(12.))
-                                .text_color(cx.theme().muted_foreground)
-                                .child("工作区干净"),
-                        )
-                    })
-                    .children(rows),
+                    .map(|body| match self.view {
+                        GitView::Changes => body
+                            .when(self.changes.is_empty(), |s| {
+                                s.child(
+                                    div()
+                                        .p_2()
+                                        .text_size(px(12.))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("工作区干净"),
+                                )
+                            })
+                            .children(rows),
+                        GitView::Branches => body.children(self.render_branches(cx)),
+                        GitView::Log => body.children(self.render_log(cx)),
+                    }),
             )
-            .child(
+            .when(self.view == GitView::Changes, |panel| panel.child(
                 v_flex()
                     .p_2()
                     .gap_2()
@@ -277,6 +429,6 @@ impl Render for GitPanel {
                                 .child(self.status.clone()),
                         )
                     }),
-            )
+            ))
     }
 }
