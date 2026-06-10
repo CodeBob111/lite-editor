@@ -4,6 +4,7 @@
 // 约定:阻塞工作经 rt::on_worker/spawn_blocking 跑在 core 自持 runtime;
 // 低频事件走 EventSink;高频源(终端)不经 EventSink(dirty-pull,M4)。
 
+pub mod arthas;
 pub mod astore;
 pub mod clipboard;
 pub mod diff;
