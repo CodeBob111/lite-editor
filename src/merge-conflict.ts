@@ -327,8 +327,18 @@ async function openMergeEditor(relPath: string) {
 
     const resultDoc = mergeResultView.state.doc;
     const initialChunks: ChunkPos[] = parsed.chunks.map((c, i) => {
-      // 末尾空 ours 块(EOF 处删除 vs 新增、无尾随换行)行号会越过文档末行,夹一下防 RangeError
-      const startLine = Math.min(c.ours_start + 1, resultDoc.lines);
+      // EOF 处的空 ours 块(删除 vs 新增、无尾随换行)在 ours 文本里没有对应行,
+      // 直接取行号会越界 RangeError;表达为文档末尾的零宽插入点,accept theirs
+      // 时补上分隔换行——绝不能夹到末行整行区间,否则 accept 会吃掉最后一行
+      if (c.ours_start + 1 > resultDoc.lines) {
+        return {
+          from: resultDoc.length, to: resultDoc.length, idx: i,
+          oursText: "",
+          theirsText: c.theirs_text ? `\n${c.theirs_text}` : "",
+          resolved: false,
+        };
+      }
+      const startLine = c.ours_start + 1;
       const endLine = Math.min(c.ours_end, resultDoc.lines);
       const from = resultDoc.line(startLine).from;
       const to = endLine >= startLine ? resultDoc.line(endLine).to : from;

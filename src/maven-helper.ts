@@ -363,7 +363,10 @@ export async function showDepAnalyzer(pomPath: string) {
     setPlaceholder(getContainer(), "Loading dependency tree...");
     await preloadPromise;
     if (currentTree) renderContent();
-    else setPlaceholder(getContainer(), "mvn dependency:tree failed", true);
+    // 等待期间 pom 已切走 → 新 fetch 在跑,别把加载中的面板标成 failed
+    else if (currentPomPath === pomPath) {
+      setPlaceholder(getContainer(), "mvn dependency:tree failed", true);
+    }
   } else {
     refreshDependencyTree();
   }
@@ -436,15 +439,17 @@ async function doFetchTree(pomPath: string) {
 
 export async function refreshDependencyTree() {
   if (!currentPomPath || !app.currentProjectPath) return;
+  const pomPath = currentPomPath;
   isLoading = true;
   const container = getContainer();
   setPlaceholder(container, "Loading...");
   currentTree = null;
   currentConflicts = [];
   currentFlat = [];
-  preloadPromise = doFetchTree(currentPomPath);
+  preloadPromise = doFetchTree(pomPath);
   await preloadPromise;
-  if (!currentTree) {
+  // pom 已切走时不写 failed——那是新 fetch 正在用的容器
+  if (!currentTree && currentPomPath === pomPath) {
     setPlaceholder(container, "mvn dependency:tree failed", true);
   }
 }

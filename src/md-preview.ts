@@ -67,6 +67,7 @@ export async function showMdPreview(filePath: string, content?: string) {
 
 export function hideMdPreview() {
   renderSeq++; // 立刻作废在飞的渲染,防止关闭后异步结果回写把预览重新打开
+  previewEl.replaceChildren(); // 清掉残留内容,下次打开不闪现上一个文件
   editorArea.classList.remove("md-split-active");
   editorContainer.style.width = "";
   previewEl.style.width = "";
