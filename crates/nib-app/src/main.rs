@@ -2,6 +2,7 @@
 // 性能纪律(RFC v2 §5):主线程零阻塞 IO——目录遍历/读写文件全部经 nib-core
 // 自持 runtime,结果回主线程更新实体;异步回灌一律带陈旧守卫。
 
+mod git_panel;
 mod quick_open;
 mod search_panel;
 mod session;
@@ -23,6 +24,7 @@ use gpui_component::{
 };
 
 use futures::StreamExt as _;
+use git_panel::{GitPanel, GitPanelEvent};
 use quick_open::{QuickOpen, QuickOpenEvent};
 use search_panel::{SearchEvent, SearchPanel};
 
@@ -101,8 +103,17 @@ struct OpenTab {
     _change_sub: Subscription,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum SidebarView {
+    Files,
+    Git,
+}
+
 struct Workbench {
     focus_handle: FocusHandle,
+    sidebar_view: SidebarView,
+    git_panel: Entity<GitPanel>,
+    _git_sub: Subscription,
     window_handle: AnyWindowHandle,
     project_root: PathBuf,
     project_name: SharedString,
@@ -151,6 +162,14 @@ impl Workbench {
         })
         .detach();
 
+        let git_panel = cx.new(|cx| GitPanel::new(root.clone(), window, cx));
+        let git_sub = cx.subscribe(
+            &git_panel,
+            |this: &mut Workbench, _, event: &GitPanelEvent, cx| match event {
+                GitPanelEvent::OpenFile(path) => this.open_file(path.clone(), cx),
+            },
+        );
+
         Self::start_stall_sentinel(cx);
 
         // 空窗口也要有焦点锚点,否则 Cmd+P/双击Shift 的按键分发没有落点
@@ -173,6 +192,9 @@ impl Workbench {
 
         let mut this = Self {
             focus_handle,
+            sidebar_view: SidebarView::Files,
+            git_panel,
+            _git_sub: git_sub,
             window_handle: window.window_handle(),
             project_root: root.clone(),
             project_name: "".into(),
@@ -258,6 +280,9 @@ impl Workbench {
         self.status = root.display().to_string().into();
 
         self.reload_tree(cx);
+        let git_root = self.project_root.clone();
+        self.git_panel
+            .update(cx, |panel, cx| panel.set_project(git_root, cx));
 
         // quick-open 文件清单预载
         let files_root = root.to_string_lossy().to_string();
@@ -322,6 +347,7 @@ impl Workbench {
         if has_structural {
             self.reload_tree(cx);
         }
+        self.git_panel.update(cx, |panel, cx| panel.refresh(cx));
         let _ = window;
         for tab in &self.tabs {
             if tab.dirty {
@@ -842,7 +868,33 @@ impl Render for Workbench {
                             .border_r_1()
                             .border_color(cx.theme().border)
                             .bg(cx.theme().sidebar)
-                            .child(tree(&self.tree_state, Self::render_tree_item)),
+                            .child(
+                                TabBar::new("sidebar-tabs")
+                                    .w_full()
+                                    .underline()
+                                    .selected_index(match self.sidebar_view {
+                                        SidebarView::Files => 0,
+                                        SidebarView::Git => 1,
+                                    })
+                                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                                        this.sidebar_view = if *ix == 1 {
+                                            this.git_panel.update(cx, |p, cx| p.refresh(cx));
+                                            SidebarView::Git
+                                        } else {
+                                            SidebarView::Files
+                                        };
+                                        cx.notify();
+                                    }))
+                                    .child(Tab::new().label("文件"))
+                                    .child(Tab::new().label("Git")),
+                            )
+                            .child(div().flex_1().min_h_0().map(|this| {
+                                match self.sidebar_view {
+                                    SidebarView::Files => this
+                                        .child(tree(&self.tree_state, Self::render_tree_item)),
+                                    SidebarView::Git => this.child(self.git_panel.clone()),
+                                }
+                            })),
                     )
                     .child(
                         v_flex()

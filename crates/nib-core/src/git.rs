@@ -619,10 +619,10 @@ pub async fn git_new_branch_at_commit(
 
 #[derive(Serialize)]
 pub struct GitChange {
-    path: String,
-    old_path: Option<String>,
-    status: String,
-    staged: bool,
+    pub path: String,
+    pub old_path: Option<String>,
+    pub status: String,
+    pub staged: bool,
 }
 
 pub async fn git_commit(cwd: String, files: Vec<String>, message: String) -> Result<String, String> {
