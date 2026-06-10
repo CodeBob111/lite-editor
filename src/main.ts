@@ -50,6 +50,10 @@ import {
 
 const editorContainer = document.getElementById("editor-container")!;
 
+// 记住每个文件的滚动位置:CodeMirror 视图从 DOM 摘下再挂回会丢 scrollTop、requestMeasure 也不还原,
+// 导致切走再切回跳回顶部。摘下时存、挂回后还原。
+const editorScrollByPath = new Map<string, number>();
+
 const tabManager = new TabManager(
   document.getElementById("tabs-bar")!,
   (filePath, content, reason) => {
@@ -89,6 +93,7 @@ const tabManager = new TabManager(
       const previousPath = app.currentFilePath;
       const previousView = app.editorView;
       if (previousPath && app.editorViewCache.get(previousPath) === previousView) {
+        editorScrollByPath.set(previousPath, previousView.scrollDOM.scrollTop);
         previousView.dom.remove();
       } else {
         syncActiveEditorToTab();
@@ -104,6 +109,14 @@ const tabManager = new TabManager(
       editorContainer.appendChild(cached.dom);
       cached.requestMeasure();
       hydrateEditorLanguage(cached, filePath);
+      // 还原切走前记住的滚动位置(摘挂 DOM 会清零 scrollTop)。延后一帧、等测量完再设;
+      // 若是「跳转到指定行」(pendingScrollLine)则让位给跳转,不还原。
+      const savedScroll = editorScrollByPath.get(filePath);
+      if (savedScroll != null && app.pendingScrollLine === null) {
+        requestAnimationFrame(() => {
+          if (app.editorView === cached) cached.scrollDOM.scrollTop = savedScroll;
+        });
+      }
       if (getLanguageId(filePath) === "java") {
         ensureJavaLspForFile(filePath).catch(() => {});
       }
@@ -166,6 +179,7 @@ const tabManager = new TabManager(
       destroyActiveDiff();
     } else {
       destroyCachedView(closedPath);
+      editorScrollByPath.delete(closedPath);
     }
   },
   () => {

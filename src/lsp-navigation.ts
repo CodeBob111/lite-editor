@@ -123,6 +123,12 @@ function resolveReceiverAndMethod(view: EditorView, pos: number): { typeName: st
   const receiver = text.slice(recStart, recEnd);
   if (!receiver || !methodName) return null;
 
+  // 接收者大写开头 = 静态调用(如 MtopResultUtil.foo()),它本身就是类型名,直接用。
+  // 否则是实例调用(someVar.foo()),下面去找 `类型 someVar` 声明推断变量类型。
+  if (/^[A-Z]/.test(receiver)) {
+    return { typeName: receiver, methodName };
+  }
+
   const doc = view.state.doc;
   const escaped = receiver.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const pattern = new RegExp(`\\b([A-Z]\\w*)(?:<[^>]*>)?\\s+${escaped}\\b`);
@@ -149,6 +155,19 @@ async function findMethodLineInFile(filePath: string, methodName: string): Promi
     }
   } catch { /* fall through */ }
   return 1;
+}
+
+// 不依赖任何索引:按 import 推出的 FQN,在工程源码里按相对路径直接找到 .java 文件。
+// jdtls / java 索引都没建好时也能跳到源码(刚打开新工程的核心场景)。
+async function findProjectClassFileByFqn(fqn: string): Promise<string | null> {
+  if (!app.currentProjectPath) return null;
+  try {
+    const rel = "/" + fqn.replace(/\./g, "/") + ".java";
+    const all = await listAllFiles(app.currentProjectPath);
+    return all.find((p) => p.endsWith(rel)) ?? null;
+  } catch {
+    return null;
+  }
 }
 
 async function tryNavigateToReceiverType(view: EditorView, pos: number, filePath: string): Promise<boolean> {
@@ -181,6 +200,14 @@ async function tryNavigateToReceiverType(view: EditorView, pos: number, filePath
 
   const fqn = resolveImportForClass(view, typeName);
   if (fqn) {
+    // 先在工程源码里按 FQN 路径直接找(不依赖索引);找不到再去 Maven 反编译。
+    const projFile = await findProjectClassFileByFqn(fqn);
+    if (projFile) {
+      const line = await findMethodLineInFile(projFile, methodName);
+      openFileAtLine(projFile, line);
+      showStatus(`Jumped to ${projFile.split("/").pop()}:${line}`);
+      return true;
+    }
     showStatus(`Looking up ${fqn}...`);
     try {
       const result = await findClassInMaven(fqn);
@@ -478,6 +505,13 @@ export async function smartNavigateAtPos(view: EditorView, pos: number) {
 
       const fqn = resolveImportForSymbol(view, pos);
       if (fqn) {
+        // 先在工程源码里按 FQN 路径直接找(不依赖索引);找不到再去 Maven 反编译。
+        const projFile = await findProjectClassFileByFqn(fqn);
+        if (projFile) {
+          openFileAtLine(projFile, 1);
+          showStatus(`Jumped to ${projFile.split("/").pop()}`);
+          return;
+        }
         showStatus(`Looking up ${fqn} in Maven repository...`);
         try {
           const result = await findClassInMaven(fqn);
@@ -488,23 +522,12 @@ export async function smartNavigateAtPos(view: EditorView, pos: number) {
           }
         } catch { /* fall through */ }
       }
-      const word = getWordAtPos(view, pos);
-      if (word && app.currentProjectPath) {
-        showStatus("Finding usages (text search)...");
-        try {
-          const results = await searchInFiles(app.currentProjectPath, word, true, 200);
-          usagesPopupItems = results.map((r) => ({
-            file: r.path,
-            line: r.line,
-            text: r.text,
-          }));
-          showUsagesPopup(view, pos, word, usagesPopupItems);
-          showStatus(`${results.length} occurrence(s) of "${word}"`);
-        } catch {
-          showStatus("Text search failed");
-        }
+      // Cmd+点击是「跳转到定义」,不是「查引用」。解析不出定义时如实提示,
+      // 不再退回 find-usages(此前会塞一个文本搜索的引用列表,体验上像功能错了)。
+      if (isJava && !lspReady && !app.javaIndexReady) {
+        showStatus("Java 索引/语言服务尚未就绪,稍后再点");
       } else {
-        showStatus("No definition found");
+        showStatus("未找到定义");
       }
       return;
     }
@@ -678,10 +701,15 @@ export async function gotoDefinitionAtCursor(view: EditorView) {
   }
 }
 
+// 按文件各自防抖:若全局共用一个 timer,700ms 内编辑/切换到另一个文件会把
+// 上一个文件待发的 didChange 取消掉,LSP 里留下过期内容(诊断/跳转随之错乱)。
+const lspChangeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 export function debouncedLspDidChange(path: string, getContent: () => string) {
-  if (app.lspChangeTimeout) clearTimeout(app.lspChangeTimeout);
-  app.lspChangeTimeout = setTimeout(() => {
-    const content = getContent();
-    lspDidChange(path, content).catch(() => {});
-  }, 700);
+  const existing = lspChangeTimers.get(path);
+  if (existing) clearTimeout(existing);
+  lspChangeTimers.set(path, setTimeout(() => {
+    lspChangeTimers.delete(path);
+    lspDidChange(path, getContent()).catch(() => {});
+  }, 700));
 }

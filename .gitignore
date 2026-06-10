@@ -5,3 +5,4 @@ src-tauri/target/
 *.log
 CLAUDE.md
 .claude/
+.claude/sessions/

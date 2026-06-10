@@ -108,7 +108,6 @@ export const app = {
   isRestoring: true,
   javaIndexReady: false,
   pendingScrollLine: null as number | null,
-  lspChangeTimeout: null as ReturnType<typeof setTimeout> | null,
   saveSessionTimeout: null as ReturnType<typeof setTimeout> | null,
 };
 

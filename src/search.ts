@@ -11,6 +11,9 @@ let searchSelectedIndex = 0;
 let searchTimeout: ReturnType<typeof setTimeout> | null = null;
 let searchTotalResults = 0;
 let searchShowLimit = 100;
+// 预览缓存按文件存全文,加上限防止在大结果集里上下翻预览时无界增长
+// (Map 迭代序 = 插入序,删最旧的即 FIFO,对这种场景足够)。
+const SEARCH_PREVIEW_CACHE_MAX = 20;
 const searchPreviewCache = new Map<string, string>();
 let searchPreviewToken = 0;
 let searchRequestToken = 0;
@@ -253,6 +256,10 @@ async function updateSearchPreview() {
       content = await readFile(r.path);
       if (token !== searchPreviewToken) return;
       searchPreviewCache.set(r.path, content);
+      if (searchPreviewCache.size > SEARCH_PREVIEW_CACHE_MAX) {
+        const oldest = searchPreviewCache.keys().next().value;
+        if (oldest !== undefined) searchPreviewCache.delete(oldest);
+      }
     } catch {
       if (token !== searchPreviewToken) return;
       preview.innerHTML = '<div class="search-preview-empty">Cannot read file</div>';

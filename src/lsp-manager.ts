@@ -120,10 +120,23 @@ function forgetJavaLspRoot(rootPath: string) {
   for (const roots of javaLspRootsByProject.values()) roots.delete(rootPath);
 }
 
-// 超过上限时,关掉最久未用的 jdtls(keepRoot 刚用过、在最前,不会被选中)。
+// 该根下当前还有缓存的 Java 编辑器视图 = 正在使用,淘汰它会让打开中的文件
+// 诊断/跳转悄悄失效——这种根不淘汰,宁可暂时超限。
+function javaLspRootInUse(rootPath: string): boolean {
+  for (const path of app.editorViewCache.keys()) {
+    if (path.endsWith(".java") && (path === rootPath || path.startsWith(rootPath + "/"))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 超过上限时,从最久未用端关掉「当前没在用」的 jdtls(刚 touch 过的在最前,不会被选中)。
 function evictExcessJavaLsp() {
-  while (javaLspLru.length > MAX_WARM_JAVA_LSP) {
-    const victim = javaLspLru.pop()!;
+  for (let i = javaLspLru.length - 1; i >= 1 && javaLspLru.length > MAX_WARM_JAVA_LSP; i--) {
+    const victim = javaLspLru[i];
+    if (javaLspRootInUse(victim)) continue;
+    javaLspLru.splice(i, 1);
     javaLspStartPromises.delete(victim);
     for (const roots of javaLspRootsByProject.values()) roots.delete(victim);
     stopLsp("java", victim).catch(() => {});

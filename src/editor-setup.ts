@@ -134,39 +134,52 @@ export function createEditorState(content: string, filename: string): EditorStat
           const filePath = app.currentFilePath;
           const state = update.state;
           debouncedLspDidChange(filePath, () => state.doc.toString());
-          debouncedAutoSave();
+          debouncedAutoSave(filePath, update.view);
         }
       }),
     ],
   });
 }
 
-let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
-function debouncedAutoSave() {
-  if (autoSaveTimer) clearTimeout(autoSaveTimer);
-  autoSaveTimer = setTimeout(() => saveCurrentFile(), 1000);
+// 自动保存也按文件各自防抖,并在调度时锁定 path+view:全局单 timer + 保存「当前文件」
+// 的旧写法下,编辑 A 后 1s 内切到 B 再编辑,A 的待存改动会被取消——A 一直 dirty,
+// 一旦它的视图被 LRU 淘汰销毁,这些改动就悄悄丢了。
+const autoSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function debouncedAutoSave(path: string, view: EditorView) {
+  const existing = autoSaveTimers.get(path);
+  if (existing) clearTimeout(existing);
+  autoSaveTimers.set(path, setTimeout(() => {
+    autoSaveTimers.delete(path);
+    // 标签已关闭 = 用户已选择丢弃未保存改动,不再落盘
+    if (_tabManager.hasTab(path)) saveFile(path, view);
+  }, 1000));
 }
 
-export async function saveCurrentFile() {
-  if (!app.currentFilePath || !app.editorView) return;
-  const content = app.editorView.state.doc.toString();
+async function saveFile(path: string, view: EditorView) {
+  const content = view.state.doc.toString();
   try {
-    await writeFile(app.currentFilePath, content);
+    await writeFile(path, content);
     // Remember what we just wrote so the file watcher's echo of our own save
     // isn't mistaken for an external change while the user keeps typing.
-    app.savedContentCache.set(app.currentFilePath, content);
-    _tabManager.markSaved(app.currentFilePath);
-    showStatus(`Saved ${app.currentFilePath.split("/").pop()}`);
+    app.savedContentCache.set(path, content);
+    _tabManager.markSaved(path);
+    showStatus(`Saved ${path.split("/").pop()}`);
     // 保存后增量更新「符号出现」倒排索引(只重扫这一个文件、改内存,很轻),
     // 让 find-usages 立刻反映刚改的内容。
-    if (app.currentProjectPath && app.currentFilePath.endsWith(".java")) {
-      updateUsageIndexFile(app.currentProjectPath, app.currentFilePath).catch(() => {});
+    if (app.currentProjectPath && path.endsWith(".java")) {
+      updateUsageIndexFile(app.currentProjectPath, path).catch(() => {});
     }
     const changesActive = document.getElementById("commit-view")?.classList.contains("active");
     if (changesActive) loadChanges();
   } catch (e) {
     showStatus(`Save failed: ${e}`, true);
   }
+}
+
+export async function saveCurrentFile() {
+  if (!app.currentFilePath || !app.editorView) return;
+  await saveFile(app.currentFilePath, app.editorView);
 }
 
 /**
