@@ -270,11 +270,20 @@ pub async fn search_in_files(
             query.to_lowercase()
         };
 
+        // 交互式搜索跳过超大文件(日志/生成物):整读进内存逐行扫只拖慢出结果。
+        const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
+
         let files: Vec<PathBuf> = WalkDir::new(&project_path)
             .into_iter()
             .filter_entry(|e| !should_skip(&e.file_name().to_string_lossy()))
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().is_file() && !is_binary_ext(&e.file_name().to_string_lossy()))
+            .filter(|e| {
+                // file_type() 来自 readdir 不额外 stat;metadata() 这一次 stat
+                // 顶替了原先 path().is_file() 的那次,净系统调用数不变。
+                e.file_type().is_file()
+                    && !is_binary_ext(&e.file_name().to_string_lossy())
+                    && e.metadata().map(|m| m.len() <= MAX_FILE_SIZE).unwrap_or(false)
+            })
             .map(|e| e.path().to_path_buf())
             .collect();
 
@@ -292,17 +301,26 @@ pub async fn search_in_files(
                     Err(_) => return Vec::new(),
                 };
 
+                // 不区分大小写时整文件只做一次小写转换(原先每行一次堆分配);
+                // to_lowercase 不增删换行,行序与原文 zip 对齐。
+                let haystack_owned;
+                let haystack: &str = if case_sensitive {
+                    &content
+                } else {
+                    haystack_owned = content.to_lowercase();
+                    &haystack_owned
+                };
+                // 整文件预筛:绝大多数文件不含命中词,一次 contains 即可跳过逐行扫描。
+                if !haystack.contains(&query_cmp) {
+                    return Vec::new();
+                }
+
                 let mut file_results = Vec::new();
-                for (i, line_text) in content.lines().enumerate() {
+                for (i, (line_text, hay_line)) in content.lines().zip(haystack.lines()).enumerate() {
                     if found_count.load(Ordering::Relaxed) >= max as u64 {
                         break;
                     }
-                    let haystack = if case_sensitive {
-                        line_text.to_string()
-                    } else {
-                        line_text.to_lowercase()
-                    };
-                    if let Some(col) = haystack.find(&query_cmp) {
+                    if let Some(col) = hay_line.find(&query_cmp) {
                         found_count.fetch_add(1, Ordering::Relaxed);
                         file_results.push(SearchResult {
                             path: path.to_string_lossy().to_string(),
@@ -691,4 +709,49 @@ pub async fn run_maven_collect(
     })
     .await
     .map_err(|e| format!("Task failed: {}", e))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 搭一个最小项目树:普通命中文件、node_modules 干扰项、超过 2MB 的大文件。
+    fn setup_project(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("nib-search-test-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("src/a.ts"), "const Foo = 1;\nlet bar = foo();\n").unwrap();
+        std::fs::write(root.join("node_modules/pkg/b.ts"), "foo in dependency\n").unwrap();
+        std::fs::write(root.join("big.log"), format!("foo\n{}", "x".repeat(3 * 1024 * 1024))).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn search_case_insensitive_hits_and_skips() {
+        let root = setup_project("ci");
+        let results = search_in_files(root.to_string_lossy().to_string(), "foo".into(), Some(false), None)
+            .await
+            .unwrap();
+        // 不区分大小写:src/a.ts 的 Foo(行0)和 foo()(行1)都命中;
+        // node_modules 被 should_skip 跳过;big.log 超 2MB 上限被跳过。
+        let paths: Vec<&str> = results.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.iter().all(|p| p.ends_with("src/a.ts")), "unexpected paths: {:?}", paths);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].line, 0);
+        assert_eq!(results[1].line, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn search_case_sensitive_filters() {
+        let root = setup_project("cs");
+        let results = search_in_files(root.to_string_lossy().to_string(), "Foo".into(), Some(true), None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].line, 0);
+        assert_eq!(results[0].column, 6); // "const Foo" 中 Foo 的字节偏移
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
