@@ -31,6 +31,14 @@ where
         .expect("nib-core task panicked")
 }
 
+/// fire-and-forget:把后台任务交给 core runtime,不关心结果(如会话落盘)
+pub fn detach<F>(fut: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    runtime().spawn(fut);
+}
+
 /// spawn_blocking 的 core-runtime 版。core 内禁止裸用 tokio::task::spawn_blocking——
 /// 它抓「环境 runtime」,从非 tokio 线程(如 gpui 主线程)调用会直接 panic。
 pub(crate) fn spawn_blocking<T: Send + 'static>(
