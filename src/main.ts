@@ -670,6 +670,24 @@ window.addEventListener("beforeunload", () => {
   saveSession();
 });
 
+// ---- 卡顿哨兵 ----
+// rAF 心跳测帧间隔(WKWebView 不支持 Long Tasks API):主线程停顿 >250ms 即记入
+// console,日常使用中的任何卡顿自动留下证据——「无卡顿」可观察、可举证,
+// 而不是凭感觉。窗口切走/最小化时 rAF 暂停,恢复可见后重置基线避免误报。
+{
+  let lastBeat = performance.now();
+  document.addEventListener("visibilitychange", () => { lastBeat = performance.now(); });
+  const beat = (now: number) => {
+    const gap = now - lastBeat;
+    if (gap > 250 && document.visibilityState === "visible") {
+      console.warn(`[jank] 主线程停顿 ${Math.round(gap)}ms @ ${new Date().toISOString()}`);
+    }
+    lastBeat = now;
+    requestAnimationFrame(beat);
+  };
+  requestAnimationFrame(beat);
+}
+
 // ---- Startup ----
 
 const state = createEditorState(welcomeContent, "welcome.ts");
