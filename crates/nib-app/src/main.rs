@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
     h_flex,
@@ -52,6 +53,8 @@ struct Workbench {
     editor_state: Entity<InputState>,
     current_file: Option<PathBuf>,
     status: SharedString,
+    /// 主线程停顿哨兵计数(>32ms 漂移即记,对齐 webview 版 rAF 哨兵哲学:可举证,不凭感觉)
+    stall_count: usize,
 }
 
 impl Workbench {
@@ -83,7 +86,7 @@ impl Workbench {
                     Some(children) => children.iter().map(file_node_to_tree_item).collect(),
                     None => vec![file_node_to_tree_item(&node)],
                 };
-                let _ = tree_for_load.update(cx, |state, cx| state.set_items(items, cx));
+                tree_for_load.update(cx, |state, cx| state.set_items(items, cx));
             }
         })
         .detach();
@@ -108,13 +111,47 @@ impl Workbench {
         })
         .detach();
 
+        Self::start_stall_sentinel(cx);
+
         Self {
             window_handle: window.window_handle(),
             tree_state,
             editor_state,
             current_file: None,
             status: root.display().to_string().into(),
+            stall_count: 0,
         }
+    }
+
+    /// 帧时/主线程停顿哨兵(RFC v2 §5.6):每 100ms 一个心跳回主线程,
+    /// 漂移 >32ms 视为一次可感知停顿,记证据到 stderr + 状态栏计数。
+    fn start_stall_sentinel(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            const BEAT: std::time::Duration = std::time::Duration::from_millis(100);
+            const BUDGET: std::time::Duration = std::time::Duration::from_millis(32);
+            let mut last = std::time::Instant::now();
+            loop {
+                cx.background_executor().timer(BEAT).await;
+                let alive = this.update(cx, |this, cx| {
+                    let now = std::time::Instant::now();
+                    let drift = now.duration_since(last).saturating_sub(BEAT);
+                    if drift > BUDGET {
+                        this.stall_count += 1;
+                        eprintln!(
+                            "[nib-sentinel] 主线程停顿 ~{}ms(第 {} 次)",
+                            drift.as_millis(),
+                            this.stall_count
+                        );
+                        cx.notify();
+                    }
+                    last = now;
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -214,7 +251,15 @@ impl Render for Workbench {
                     .border_t_1()
                     .border_color(cx.theme().border)
                     .text_size(px(12.))
-                    .child(self.status.clone()),
+                    .child(self.status.clone())
+                    .when(self.stall_count > 0, |this| {
+                        this.child(
+                            div()
+                                .ml_auto()
+                                .text_color(cx.theme().danger)
+                                .child(format!("卡顿 ×{}", self.stall_count)),
+                        )
+                    }),
             )
     }
 }
