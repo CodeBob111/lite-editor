@@ -400,7 +400,11 @@ document.addEventListener("mousedown", (e) => {
   }
 });
 
-let lastLeftShiftDownAt = 0;
+// 双击 Shift 只认「纯点击」:按下到抬起之间没夹任何其他键。否则打大写/符号时
+// Shift 作为修饰键被快速连按两次(如输入 *A、连续大写),会误唤起 Quick Open
+// 并顶掉正开着的 Cmd+Shift+F 搜索框(两浮层互斥)。语义对齐 IDEA 的 Double Shift。
+let lastCleanShiftTapAt = 0; // 上一次纯点击 Shift 的抬起时刻;0 = 无待配对的点击
+let shiftTapDirty = false; // 本次 Shift 按住期间打过别的键 → 不是纯点击
 document.addEventListener("keydown", (e) => {
   if (e.defaultPrevented) return;
 
@@ -462,14 +466,17 @@ document.addEventListener("keydown", (e) => {
     app.editorView.dom.classList.add("cmd-held");
   }
 
-  if (!e.repeat && e.key === "Shift" && e.code === "ShiftLeft" && !e.metaKey && !e.ctrlKey && !e.altKey) {
-    const now = performance.now();
-    if (now - lastLeftShiftDownAt <= 420) {
+  if (e.key !== "Shift") {
+    // 任何非 Shift 键:本次按住沦为修饰用途,且打断已存在的双击序列。
+    shiftTapDirty = true;
+    lastCleanShiftTapAt = 0;
+  } else if (!e.repeat && e.code === "ShiftLeft" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+    if (performance.now() - lastCleanShiftTapAt <= 420) {
       e.preventDefault();
-      lastLeftShiftDownAt = 0;
+      lastCleanShiftTapAt = 0;
       openQuickOpenLazy();
     } else {
-      lastLeftShiftDownAt = now;
+      shiftTapDirty = false; // 开始跟踪这次按住是否纯点击
     }
   }
 });
@@ -477,6 +484,9 @@ document.addEventListener("keydown", (e) => {
 document.addEventListener("keyup", (e) => {
   if (e.key === "Meta" && app.editorView) {
     app.editorView.dom.classList.remove("cmd-held");
+  }
+  if (e.key === "Shift" && e.code === "ShiftLeft") {
+    lastCleanShiftTapAt = shiftTapDirty ? 0 : performance.now();
   }
 });
 window.addEventListener("blur", () => {
