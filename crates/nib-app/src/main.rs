@@ -48,6 +48,11 @@ actions!(
         GotoDefinition,
         FindUsages,
         ToggleMdPreview,
+        ArthasWatch,
+        ArthasTrace,
+        ArthasStack,
+        ArthasMonitor,
+        ArthasTt,
         PaletteConfirm,
         Quit
     ]
@@ -878,6 +883,50 @@ impl Workbench {
         }
     }
 
+    /// Arthas:光标处方法 → 命令 → 剪贴板(对齐旧版右键菜单链路)
+    fn arthas_command(&mut self, cmd: nib_core::arthas::ArthasCommand, cx: &mut Context<Self>) {
+        let Some(tab) = self.active() else { return };
+        if tab.lang != "java" {
+            self.status = "Arthas 仅支持 Java 文件".into();
+            cx.notify();
+            return;
+        }
+        let pos = tab.editor.read(cx).cursor_position();
+        let text = tab.editor.read(cx).value().to_string();
+        let file = tab.path.to_string_lossy().to_string();
+        let lsp = self.lsp.clone();
+        cx.spawn(async move |weak, cx| {
+            // FQCN:package 声明 + 文件名类(旧版同口径);方法:LSP 符号树,失败落声明行兜底
+            let pkg = nib_core::arthas::parse_package(&text);
+            let class = nib_core::arthas::class_name_from_file_path(&file);
+            let fqn = if pkg.is_empty() { class } else { format!("{}.{}", pkg, class) };
+            let method = match nib_core::lsp::lsp_document_symbols(file.clone(), &lsp).await {
+                Ok(symbols) => nib_core::arthas::find_method_at_position(
+                    &symbols,
+                    pos.line as u64,
+                    pos.character as u64,
+                ),
+                Err(_) => None,
+            }
+            .or_else(|| {
+                text.lines()
+                    .nth(pos.line as usize)
+                    .and_then(nib_core::arthas::method_name_from_decl_line)
+            });
+            let command =
+                nib_core::arthas::generate_arthas_command(&fqn, method.as_deref(), cmd);
+            let copied = nib_core::clipboard::copy_text_to_clipboard(command.clone());
+            let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                this.status = match copied {
+                    Ok(()) => format!("已复制: {}", command).into(),
+                    Err(err) => format!("复制失败: {}", err).into(),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn on_toggle_md_preview(
         &mut self,
         _: &ToggleMdPreview,
@@ -1120,6 +1169,21 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_goto_definition))
             .on_action(cx.listener(Self::on_find_usages))
             .on_action(cx.listener(Self::on_toggle_md_preview))
+            .on_action(cx.listener(|this: &mut Self, _: &ArthasWatch, _, cx| {
+                this.arthas_command(nib_core::arthas::ArthasCommand::Watch, cx)
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &ArthasTrace, _, cx| {
+                this.arthas_command(nib_core::arthas::ArthasCommand::Trace, cx)
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &ArthasStack, _, cx| {
+                this.arthas_command(nib_core::arthas::ArthasCommand::Stack, cx)
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &ArthasMonitor, _, cx| {
+                this.arthas_command(nib_core::arthas::ArthasCommand::Monitor, cx)
+            }))
+            .on_action(cx.listener(|this: &mut Self, _: &ArthasTt, _, cx| {
+                this.arthas_command(nib_core::arthas::ArthasCommand::Tt, cx)
+            }))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
             .child(
@@ -1329,6 +1393,13 @@ fn main() {
                 MenuItem::separator(),
                 MenuItem::action("保存", SaveFile),
                 MenuItem::action("关闭标签", CloseTab),
+            ]),
+            Menu::new("Arthas").items([
+                MenuItem::action("Watch 光标方法", ArthasWatch),
+                MenuItem::action("Trace 光标方法", ArthasTrace),
+                MenuItem::action("Stack 光标方法", ArthasStack),
+                MenuItem::action("Monitor 光标方法", ArthasMonitor),
+                MenuItem::action("TimeTunnel 光标方法", ArthasTt),
             ]),
             Menu::new("Go").items([
                 MenuItem::action("快速打开文件…", ToggleQuickOpen),
