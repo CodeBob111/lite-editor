@@ -115,6 +115,7 @@ struct Workbench {
     _overlay_sub: Option<Subscription>,
     watcher: Arc<nib_core::watch::WatcherState>,
     events_sink: Arc<ChannelSink>,
+    settings: session::EditorSettings,
     status: SharedString,
     /// 主线程停顿哨兵计数(>32ms 漂移即记,可举证不凭感觉)
     stall_count: usize,
@@ -183,6 +184,7 @@ impl Workbench {
             _overlay_sub: None,
             watcher: Arc::new(nib_core::watch::WatcherState::default()),
             events_sink: Arc::new(ChannelSink(tx)),
+            settings: session::EditorSettings::default(),
             status: "".into(),
             stall_count: 0,
             first_frame_logged: false,
@@ -190,6 +192,24 @@ impl Workbench {
             prev_modifiers: Modifiers::default(),
         };
         this.load_project(root, cx);
+
+        // 加载编辑器偏好(含旧 settings.json 一次性导入),回来后应用到已开标签
+        cx.spawn(async move |weak, cx| {
+            let settings = session::load_settings().await;
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                    this.settings = settings;
+                    for tab in &this.tabs {
+                        tab.editor.update(cx, |state, cx| {
+                            state.set_soft_wrap(settings.word_wrap, window, cx);
+                            state.set_folding(settings.folding, window, cx);
+                        });
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
 
         // 没传路径参数 → 恢复上次会话(项目 + 打开的标签)
         if arg_root.is_none() {
@@ -417,14 +437,17 @@ impl Workbench {
             return ix;
         }
         let lang = language_for(&path.to_string_lossy());
+        let settings = self.settings;
         let editor = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor(lang)
                 .multi_line(true)
                 .tab_size(TabSize {
-                    tab_size: 4,
+                    tab_size: settings.tab_size as usize,
                     ..Default::default()
                 })
+                .soft_wrap(settings.word_wrap)
+                .folding(settings.folding)
                 .default_value(text)
         });
         // 编辑即脏:订阅 Change 给标签点脏标记
@@ -850,7 +873,7 @@ impl Render for Workbench {
                                     Some(tab) => this.child(
                                         Input::new(&tab.editor)
                                             .font_family(cx.theme().mono_font_family.clone())
-                                            .text_size(cx.theme().mono_font_size)
+                                            .text_size(px(self.settings.font_size))
                                             .size_full(),
                                     ),
                                     None => this.child(

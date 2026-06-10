@@ -76,3 +76,47 @@ pub fn save(session: &PersistedSession) {
         });
     }
 }
+
+// ---- 编辑器偏好(沿用旧 Nib settings.json 的扁平键 schema) ----
+
+#[derive(Deserialize, Clone, Copy)]
+pub struct EditorSettings {
+    #[serde(rename = "editor.fontSize", default = "default_font_size")]
+    pub font_size: f32,
+    #[serde(rename = "editor.tabSize", default = "default_tab_size")]
+    pub tab_size: u32,
+    #[serde(rename = "editor.wordWrap", default)]
+    pub word_wrap: bool,
+    #[serde(rename = "editor.folding", default = "default_true")]
+    pub folding: bool,
+}
+
+fn default_font_size() -> f32 {
+    13.0
+}
+fn default_tab_size() -> u32 {
+    4
+}
+fn default_true() -> bool {
+    true
+}
+
+impl Default for EditorSettings {
+    fn default() -> Self {
+        Self {
+            font_size: default_font_size(),
+            tab_size: default_tab_size(),
+            word_wrap: false,
+            folding: true,
+        }
+    }
+}
+
+/// 读偏好(load() 的一次性导入已把旧 settings.json 搬进本地目录)
+pub async fn load_settings() -> EditorSettings {
+    let dirs = data_dirs();
+    match nib_core::session::load_settings(&dirs).await {
+        Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
+        _ => EditorSettings::default(),
+    }
+}
