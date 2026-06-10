@@ -7,6 +7,8 @@ mod diff_view;
 mod git_panel;
 mod maven_panel;
 mod merge_view;
+mod recents_view;
+mod settings_view;
 mod terminal_panel;
 mod usages_view;
 mod quick_open;
@@ -36,7 +38,9 @@ use git_panel::{GitPanel, GitPanelEvent};
 use maven_panel::MavenPanel;
 use merge_view::{MergeView, MergeViewEvent};
 use quick_open::{QuickOpen, QuickOpenEvent};
+use recents_view::{RecentsEvent, RecentsView};
 use search_panel::{SearchEvent, SearchPanel};
+use settings_view::{SettingsEvent, SettingsView};
 use terminal_panel::TerminalPanel;
 use usages_view::{UsagesEvent, UsagesView};
 
@@ -55,6 +59,8 @@ actions!(
         FindUsages,
         ToggleMdPreview,
         ToggleTerminal,
+        ShowRecentProjects,
+        OpenSettings,
         ArthasWatch,
         ArthasTrace,
         ArthasStack,
@@ -94,10 +100,16 @@ fn language_for(path: &str) -> &'static str {
     }
 }
 
-fn file_node_to_tree_item(node: &nib_core::fs::FileNode) -> TreeItem {
-    let item = TreeItem::new(node.path.clone(), node.name.clone());
+fn file_node_to_tree_item(
+    node: &nib_core::fs::FileNode,
+    expanded: &std::collections::HashSet<String>,
+) -> TreeItem {
+    let item = TreeItem::new(node.path.clone(), node.name.clone())
+        .expanded(expanded.contains(&node.path));
     match &node.children {
-        Some(children) => item.children(children.iter().map(file_node_to_tree_item)),
+        Some(children) => {
+            item.children(children.iter().map(|c| file_node_to_tree_item(c, expanded)))
+        }
         None => item,
     }
 }
@@ -117,15 +129,23 @@ enum Overlay {
     Diff(Entity<DiffView>),
     Usages(Entity<UsagesView>),
     Merge(Entity<MergeView>),
+    Recents(Entity<RecentsView>),
+    Settings(Entity<SettingsView>),
 }
+
+/// 标签上限(LRU 淘汰,脏标签豁免)
+const MAX_TABS: usize = 30;
 
 struct OpenTab {
     path: PathBuf,
     title: SharedString,
     lang: &'static str,
     dirty: bool,
+    last_used: Instant,
     editor: Entity<InputState>,
     _change_sub: Subscription,
+    /// 编辑器任何重绘(含光标移动)都触发本体重渲染,状态栏 Ln/Col 才跟手
+    _observe_sub: Subscription,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -153,6 +173,9 @@ struct Workbench {
     all_files: Arc<Vec<String>>,
     overlay: Option<Overlay>,
     _overlay_sub: Option<Subscription>,
+    /// 无输入框浮层(Usages/Merge/Recents)的焦点锚:不聚焦到浮层容器,
+    /// "QuickOpen" 上下文的 ↑↓/Enter/Esc 绑定就不在按键分发路径上
+    overlay_focus: FocusHandle,
     watcher: Arc<nib_core::watch::WatcherState>,
     lsp: Arc<nib_core::lsp::LspState>,
     events_sink: Arc<ChannelSink>,
@@ -160,6 +183,7 @@ struct Workbench {
     md_preview: bool,
     terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
+    expanded_paths: std::collections::HashSet<String>,
     status: SharedString,
     /// 主线程停顿哨兵计数(>32ms 漂移即记,可举证不凭感觉)
     stall_count: usize,
@@ -177,20 +201,34 @@ impl Workbench {
 
         let tree_state = cx.new(|cx| TreeState::new(cx));
 
-        // 树的选中变化(点击/键盘)→ 叶子节点即打开文件
+        // 树的选中变化(点击/键盘)→ 叶子打开文件;文件夹记录展开态
+        // (reload_tree 重建 items 时回放,目录树刷新不再把展开全折叠)
         cx.observe(&tree_state, |this: &mut Workbench, state, cx| {
-            let target = {
+            enum Sel {
+                Open(PathBuf),
+                Folder(String, bool),
+                None,
+            }
+            let sel = {
                 let state = state.read(cx);
-                state.selected_entry().and_then(|entry| {
-                    if entry.is_folder() {
-                        None
-                    } else {
-                        Some(PathBuf::from(entry.item().id.to_string()))
+                match state.selected_entry() {
+                    Some(entry) if entry.is_folder() => {
+                        Sel::Folder(entry.item().id.to_string(), entry.is_expanded())
                     }
-                })
+                    Some(entry) => Sel::Open(PathBuf::from(entry.item().id.to_string())),
+                    None => Sel::None,
+                }
             };
-            if let Some(path) = target {
-                this.open_file(path, cx);
+            match sel {
+                Sel::Open(path) => this.open_file(path, cx),
+                Sel::Folder(id, expanded) => {
+                    if expanded {
+                        this.expanded_paths.insert(id);
+                    } else {
+                        this.expanded_paths.remove(&id);
+                    }
+                }
+                Sel::None => {}
             }
         })
         .detach();
@@ -246,6 +284,7 @@ impl Workbench {
             all_files: Arc::new(Vec::new()),
             overlay: None,
             _overlay_sub: None,
+            overlay_focus: cx.focus_handle(),
             watcher: Arc::new(nib_core::watch::WatcherState::default()),
             lsp: Arc::new(nib_core::lsp::LspState::default()),
             events_sink: Arc::new(ChannelSink(tx)),
@@ -253,6 +292,7 @@ impl Workbench {
             md_preview: false,
             terminal: None,
             terminal_visible: false,
+            expanded_paths: std::collections::HashSet::new(),
             status: "".into(),
             stall_count: 0,
             first_frame_logged: false,
@@ -333,6 +373,8 @@ impl Workbench {
             .unwrap_or_else(|| root.display().to_string())
             .into();
         self.status = root.display().to_string().into();
+        self.expanded_paths.clear();
+        session::remember_recent(root.to_string_lossy().to_string());
         if let Some(panel) = &self.terminal {
             panel.update(cx, |panel, _| panel.set_project(root.clone()));
         }
@@ -363,7 +405,8 @@ impl Workbench {
         .detach();
     }
 
-    /// 重读目录树(项目加载/外部结构变化共用;core runtime 上跑,带陈旧守卫)
+    /// 重读目录树(项目加载/外部结构变化共用;core runtime 上跑,带陈旧守卫)。
+    /// 重建后回放展开态 + 恢复当前标签的选中(set_items 会清掉两者)。
     fn reload_tree(&mut self, cx: &mut Context<Self>) {
         let tree_for_load = self.tree_state.clone();
         let root_str = self.project_root.to_string_lossy().to_string();
@@ -371,18 +414,35 @@ impl Workbench {
         cx.spawn(async move |weak, cx| {
             let result = nib_core::fs::read_dir_tree(root_str, Some(12)).await;
             if let Ok(node) = result {
-                // 陈旧守卫:期间切了项目就丢弃
-                let still_current = weak
-                    .read_with(cx, |this, _| this.project_root == guard_root)
-                    .unwrap_or(false);
+                // 陈旧守卫:期间切了项目就丢弃;同帧取展开态与当前标签
+                let Ok((still_current, expanded, active_item)) = weak.read_with(cx, |this, _| {
+                    (
+                        this.project_root == guard_root,
+                        this.expanded_paths.clone(),
+                        this.active().map(|t| {
+                            (t.path.to_string_lossy().to_string(), t.title.clone())
+                        }),
+                    )
+                }) else {
+                    return;
+                };
                 if !still_current {
                     return;
                 }
-                let items = match &node.children {
-                    Some(children) => children.iter().map(file_node_to_tree_item).collect(),
-                    None => vec![file_node_to_tree_item(&node)],
+                let items: Vec<TreeItem> = match &node.children {
+                    Some(children) => children
+                        .iter()
+                        .map(|c| file_node_to_tree_item(c, &expanded))
+                        .collect(),
+                    None => vec![file_node_to_tree_item(&node, &expanded)],
                 };
-                tree_for_load.update(cx, |state, cx| state.set_items(items, cx));
+                tree_for_load.update(cx, |state, cx| {
+                    state.set_items(items, cx);
+                    if let Some((id, title)) = active_item {
+                        let item = TreeItem::new(id, title);
+                        state.set_selected_item(Some(&item), cx);
+                    }
+                });
             }
         })
         .detach();
@@ -623,13 +683,34 @@ impl Workbench {
             })
             .detach();
         }
+        // LRU 淘汰:超上限时关掉最久未用且不脏的标签(全脏则不淘汰,宁多勿丢)
+        if self.tabs.len() >= MAX_TABS {
+            let evict = self
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(ix, t)| !t.dirty && Some(*ix) != self.active_tab)
+                .min_by_key(|(_, t)| t.last_used)
+                .map(|(ix, _)| ix);
+            if let Some(evict_ix) = evict {
+                self.tabs.remove(evict_ix);
+                if let Some(active) = self.active_tab {
+                    if evict_ix < active {
+                        self.active_tab = Some(active - 1);
+                    }
+                }
+            }
+        }
+        let observe_sub = cx.observe(&editor, |_, _, cx| cx.notify());
         self.tabs.push(OpenTab {
             path,
             title,
             lang,
             dirty: false,
+            last_used: Instant::now(),
             editor,
             _change_sub: change_sub,
+            _observe_sub: observe_sub,
         });
         self.tabs.len() - 1
     }
@@ -639,6 +720,7 @@ impl Workbench {
             return;
         }
         self.active_tab = Some(ix);
+        self.tabs[ix].last_used = Instant::now();
         let tab = &self.tabs[ix];
         self.status = tab.path.display().to_string().into();
         let handle = tab.editor.read(cx).focus_handle(cx);
@@ -656,6 +738,7 @@ impl Workbench {
         if let Some(ix) = self.tabs.iter().position(|t| t.path == path) {
             if self.active_tab != Some(ix) {
                 self.active_tab = Some(ix);
+                self.tabs[ix].last_used = Instant::now();
                 self.status = path.display().to_string().into();
                 self.persist_session(cx);
                 cx.notify();
@@ -885,6 +968,7 @@ impl Workbench {
                             );
                             this.overlay = Some(Overlay::Usages(view));
                             this._overlay_sub = Some(sub);
+                            window.focus(&this.overlay_focus, cx);
                         }
                         Ok(_) => this.status = "未找到引用".into(),
                         Err(err) => this.status = format!("查找失败: {}", err).into(),
@@ -902,8 +986,10 @@ impl Workbench {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(Overlay::Usages(view)) = &self.overlay {
-            view.update(cx, |view, cx| view.confirm(cx));
+        match &self.overlay {
+            Some(Overlay::Usages(view)) => view.update(cx, |view, cx| view.confirm(cx)),
+            Some(Overlay::Recents(view)) => view.update(cx, |view, cx| view.confirm(cx)),
+            _ => {}
         }
     }
 
@@ -990,6 +1076,87 @@ impl Workbench {
         cx.notify();
     }
 
+    /// 设置浮层:保存即持久化 + 热应用(换行/折叠经运行时 setter 下发已开标签)
+    fn on_open_settings(
+        &mut self,
+        _: &OpenSettings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.overlay, Some(Overlay::Settings(_))) {
+            self.close_palette(window, cx);
+            return;
+        }
+        let view = cx.new(|cx| SettingsView::new(self.settings, window, cx));
+        let sub = cx.subscribe_in(
+            &view,
+            window,
+            |this: &mut Workbench, _, event: &SettingsEvent, window, cx| match event {
+                SettingsEvent::Apply(settings) => {
+                    let settings = *settings;
+                    this.settings = settings;
+                    session::save_settings(settings);
+                    for tab in &this.tabs {
+                        tab.editor.update(cx, |state, cx| {
+                            state.set_soft_wrap(settings.word_wrap, window, cx);
+                            state.set_folding(settings.folding, window, cx);
+                        });
+                    }
+                    this.status = "设置已保存 ✓".into();
+                    this.close_palette(window, cx);
+                }
+            },
+        );
+        self.overlay = Some(Overlay::Settings(view));
+        self._overlay_sub = Some(sub);
+        window.focus(&self.overlay_focus, cx);
+        cx.notify();
+    }
+
+    /// 最近项目浮层(File 菜单进入):读持久化列表 → 选中即切项目
+    fn on_show_recents(
+        &mut self,
+        _: &ShowRecentProjects,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(self.overlay, Some(Overlay::Recents(_))) {
+            self.close_palette(window, cx);
+            return;
+        }
+        let window_handle = self.window_handle;
+        cx.spawn(async move |weak, cx| {
+            let recents = session::load_recents().await;
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                    let view = cx.new(|_| RecentsView::new(recents));
+                    let sub = cx.subscribe_in(
+                        &view,
+                        window,
+                        |this: &mut Workbench, _, event: &RecentsEvent, window, cx| match event {
+                            RecentsEvent::Open(path) => {
+                                let root = PathBuf::from(path.clone());
+                                this.close_palette(window, cx);
+                                if root != this.project_root {
+                                    this.tabs.clear();
+                                    this.active_tab = None;
+                                    this.load_project(root, cx);
+                                    this.persist_session(cx);
+                                }
+                                cx.notify();
+                            }
+                        },
+                    );
+                    this.overlay = Some(Overlay::Recents(view));
+                    this._overlay_sub = Some(sub);
+                    window.focus(&this.overlay_focus, cx);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     fn on_open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -1069,6 +1236,16 @@ impl Workbench {
         );
         self.overlay = Some(Overlay::Merge(view));
         self._overlay_sub = Some(sub);
+        // 聚焦浮层锚点让 Esc 生效(本方法无 window,经窗口句柄异步聚焦)
+        let window_handle = self.window_handle;
+        cx.spawn(async move |weak, cx| {
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                    window.focus(&this.overlay_focus, cx);
+                });
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -1147,7 +1324,9 @@ impl Workbench {
             Some(Overlay::QuickOpen(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
             Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
             Some(Overlay::Usages(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
-            Some(Overlay::Diff(_)) | Some(Overlay::Merge(_)) | None => {}
+            Some(Overlay::Recents(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
+            Some(Overlay::Diff(_)) | Some(Overlay::Merge(_)) | Some(Overlay::Settings(_))
+            | None => {}
         }
     }
 
@@ -1156,7 +1335,9 @@ impl Workbench {
             Some(Overlay::QuickOpen(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
             Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
             Some(Overlay::Usages(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
-            Some(Overlay::Diff(_)) | Some(Overlay::Merge(_)) | None => {}
+            Some(Overlay::Recents(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
+            Some(Overlay::Diff(_)) | Some(Overlay::Merge(_)) | Some(Overlay::Settings(_))
+            | None => {}
         }
     }
 
@@ -1250,6 +1431,8 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_find_usages))
             .on_action(cx.listener(Self::on_toggle_md_preview))
             .on_action(cx.listener(Self::on_toggle_terminal))
+            .on_action(cx.listener(Self::on_show_recents))
+            .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(|this: &mut Self, _: &ArthasWatch, _, cx| {
                 this.arthas_command(nib_core::arthas::ArthasCommand::Watch, cx)
             }))
@@ -1426,6 +1609,13 @@ impl Render for Workbench {
                             .overflow_hidden()
                             .child(self.status.clone()),
                     )
+                    .when_some(
+                        self.active()
+                            .map(|t| t.editor.read(cx).cursor_position()),
+                        |this, pos| {
+                            this.child(format!("Ln {}, Col {}", pos.line + 1, pos.character + 1))
+                        },
+                    )
                     .when(!active_lang.is_empty(), |this| this.child(active_lang))
                     .when(self.stall_count > 0, |this| {
                         this.child(
@@ -1442,6 +1632,8 @@ impl Render for Workbench {
                     Overlay::Diff(p) => p.clone().into_any_element(),
                     Overlay::Usages(p) => p.clone().into_any_element(),
                     Overlay::Merge(p) => p.clone().into_any_element(),
+                    Overlay::Recents(p) => p.clone().into_any_element(),
+                    Overlay::Settings(p) => p.clone().into_any_element(),
                 };
                 this.child(
                     div()
@@ -1451,6 +1643,7 @@ impl Render for Workbench {
                         .flex_col()
                         .items_center()
                         .key_context("QuickOpen")
+                        .track_focus(&self.overlay_focus)
                         .on_action(cx.listener(Self::on_palette_up))
                         .on_action(cx.listener(Self::on_palette_down))
                         .on_action(cx.listener(Self::on_palette_dismiss))
@@ -1484,9 +1677,14 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         // 原生菜单栏(条目对齐旧版 lib.rs build_menu)
         cx.set_menus([
-            Menu::new("Nib").items([MenuItem::action("退出 Nib", Quit)]),
+            Menu::new("Nib").items([
+                MenuItem::action("设置…", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("退出 Nib", Quit),
+            ]),
             Menu::new("File").items([
                 MenuItem::action("打开文件夹…", OpenFolder),
+                MenuItem::action("最近项目…", ShowRecentProjects),
                 MenuItem::separator(),
                 MenuItem::action("保存", SaveFile),
                 MenuItem::action("关闭标签", CloseTab),
@@ -1516,6 +1714,7 @@ fn main() {
             KeyBinding::new("shift-f12", FindUsages, Some("Workbench")),
             KeyBinding::new("cmd-shift-v", ToggleMdPreview, Some("Workbench")),
             KeyBinding::new("ctrl-`", ToggleTerminal, Some("Workbench")),
+            KeyBinding::new("cmd-,", OpenSettings, Some("Workbench")),
             KeyBinding::new("enter", PaletteConfirm, Some("QuickOpen")),
             KeyBinding::new("cmd-s", SaveFile, Some("Workbench")),
             KeyBinding::new("cmd-w", CloseTab, Some("Workbench")),

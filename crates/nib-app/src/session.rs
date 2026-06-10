@@ -79,7 +79,7 @@ pub fn save(session: &PersistedSession) {
 
 // ---- 编辑器偏好(沿用旧 Nib settings.json 的扁平键 schema) ----
 
-#[derive(Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct EditorSettings {
     #[serde(rename = "editor.fontSize", default = "default_font_size")]
     pub font_size: f32,
@@ -119,4 +119,53 @@ pub async fn load_settings() -> EditorSettings {
         Ok(Some(raw)) => serde_json::from_str(&raw).unwrap_or_default(),
         _ => EditorSettings::default(),
     }
+}
+
+/// 写偏好(同一扁平键 schema,设置浮层保存时调;fire-and-forget)
+pub fn save_settings(settings: EditorSettings) {
+    nib_core::rt::detach(async move {
+        let dirs = data_dirs();
+        if let Ok(raw) = serde_json::to_string_pretty(&settings) {
+            let _ = nib_core::session::save_settings(&dirs, raw).await;
+        }
+    });
+}
+
+// ---- 最近项目(对齐旧版 recent-projects:上限 12,最近优先) ----
+// 旧版存 webview localStorage,原生版无法导入,从空列表重新积累(档案已声明)。
+
+const RECENTS_MAX: usize = 12;
+
+fn recents_path() -> PathBuf {
+    data_dirs().app_data.join("recent-projects.json")
+}
+
+pub async fn load_recents() -> Vec<String> {
+    nib_core::rt::run(async move {
+        std::fs::read_to_string(recents_path())
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .unwrap_or_default()
+    })
+    .await
+}
+
+/// 项目装载成功后调(fire-and-forget,core runtime 落盘)
+pub fn remember_recent(path: String) {
+    nib_core::rt::detach(async move {
+        let file = recents_path();
+        let mut list: Vec<String> = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        list.retain(|p| p != &path);
+        list.insert(0, path);
+        list.truncate(RECENTS_MAX);
+        if let Some(parent) = file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(&list) {
+            let _ = std::fs::write(&file, json);
+        }
+    });
 }
