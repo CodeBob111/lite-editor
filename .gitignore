@@ -6,3 +6,4 @@ src-tauri/target/
 CLAUDE.md
 .claude/
 .claude/sessions/
+package-lock.json
