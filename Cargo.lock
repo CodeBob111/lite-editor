@@ -3913,6 +3913,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "quick-xml 0.36.2",
  "rayon",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

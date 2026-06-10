@@ -6,6 +6,7 @@ mod astore_panel;
 mod diff_view;
 mod git_panel;
 mod maven_panel;
+mod merge_view;
 mod usages_view;
 mod quick_open;
 mod search_panel;
@@ -32,6 +33,7 @@ use diff_view::{DiffView, DiffViewEvent};
 use astore_panel::AstorePanel;
 use git_panel::{GitPanel, GitPanelEvent};
 use maven_panel::MavenPanel;
+use merge_view::{MergeView, MergeViewEvent};
 use quick_open::{QuickOpen, QuickOpenEvent};
 use search_panel::{SearchEvent, SearchPanel};
 use usages_view::{UsagesEvent, UsagesView};
@@ -111,6 +113,7 @@ enum Overlay {
     Search(Entity<SearchPanel>),
     Diff(Entity<DiffView>),
     Usages(Entity<UsagesView>),
+    Merge(Entity<MergeView>),
 }
 
 struct OpenTab {
@@ -195,6 +198,9 @@ impl Workbench {
             |this: &mut Workbench, _, event: &GitPanelEvent, cx| match event {
                 GitPanelEvent::OpenDiff { rel_path, abs_path } => {
                     this.open_diff(rel_path.clone(), abs_path.clone(), cx)
+                }
+                GitPanelEvent::OpenMerge { rel_path } => {
+                    this.open_merge(rel_path.clone(), cx)
                 }
             },
         );
@@ -1000,6 +1006,33 @@ impl Workbench {
         .detach();
     }
 
+    /// 打开 3-way merge 浮层(Git 面板点击冲突文件进来)。解决成功后
+    /// 关浮层并刷新 Git 面板;文件写回会触发 watcher,打开的标签自动重载。
+    fn open_merge(&mut self, rel_path: String, cx: &mut Context<Self>) {
+        let cwd = self.project_root.to_string_lossy().to_string();
+        let view = cx.new(|cx| MergeView::new(cwd, rel_path, cx));
+        let sub = cx.subscribe(
+            &view,
+            |this: &mut Workbench, _, event: &MergeViewEvent, cx| match event {
+                MergeViewEvent::Resolved => {
+                    this.git_panel.update(cx, |panel, cx| panel.refresh(cx));
+                    let window_handle = this.window_handle;
+                    cx.spawn(async move |weak, cx| {
+                        let _ = cx.update_window(window_handle, |_, window, cx| {
+                            let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                                this.close_palette(window, cx);
+                            });
+                        });
+                    })
+                    .detach();
+                }
+            },
+        );
+        self.overlay = Some(Overlay::Merge(view));
+        self._overlay_sub = Some(sub);
+        cx.notify();
+    }
+
     // ---- 浮层(quick-open / 全局搜索) ----
 
     fn on_toggle_quick_open(
@@ -1075,7 +1108,7 @@ impl Workbench {
             Some(Overlay::QuickOpen(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
             Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
             Some(Overlay::Usages(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
-            Some(Overlay::Diff(_)) | None => {}
+            Some(Overlay::Diff(_)) | Some(Overlay::Merge(_)) | None => {}
         }
     }
 
@@ -1084,7 +1117,7 @@ impl Workbench {
             Some(Overlay::QuickOpen(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
             Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
             Some(Overlay::Usages(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
-            Some(Overlay::Diff(_)) | None => {}
+            Some(Overlay::Diff(_)) | Some(Overlay::Merge(_)) | None => {}
         }
     }
 
@@ -1357,6 +1390,7 @@ impl Render for Workbench {
                     Overlay::Search(p) => p.clone().into_any_element(),
                     Overlay::Diff(p) => p.clone().into_any_element(),
                     Overlay::Usages(p) => p.clone().into_any_element(),
+                    Overlay::Merge(p) => p.clone().into_any_element(),
                 };
                 this.child(
                     div()

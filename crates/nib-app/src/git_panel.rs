@@ -17,6 +17,7 @@ use nib_core::git::{GitBranch, GitChange, GitCommit};
 
 pub enum GitPanelEvent {
     OpenDiff { rel_path: String, abs_path: PathBuf },
+    OpenMerge { rel_path: String },
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -32,6 +33,7 @@ pub struct GitPanel {
     view: GitView,
     branch: SharedString,
     changes: Vec<GitChange>,
+    conflicts: Vec<String>,
     branches: Vec<GitBranch>,
     log: Vec<GitCommit>,
     message_input: Entity<InputState>,
@@ -55,6 +57,7 @@ impl GitPanel {
             view: GitView::Changes,
             branch: "".into(),
             changes: Vec::new(),
+            conflicts: Vec::new(),
             branches: Vec::new(),
             log: Vec::new(),
             message_input,
@@ -69,6 +72,7 @@ impl GitPanel {
     pub fn set_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.project_root = root;
         self.changes.clear();
+        self.conflicts.clear();
         self.branches.clear();
         self.log.clear();
         self.branch = "".into();
@@ -85,6 +89,7 @@ impl GitPanel {
                 .await
                 .unwrap_or_default();
             let changes = nib_core::git::git_status(cwd.clone()).await;
+            let conflicts = nib_core::git::git_merge_conflicts(cwd.clone()).await;
             let branches = nib_core::git::git_list_branches(cwd.clone()).await;
             let log = if branch.is_empty() {
                 Ok(Vec::new())
@@ -97,6 +102,7 @@ impl GitPanel {
                 }
                 this.branch = branch.into();
                 this.changes = changes.unwrap_or_default();
+                this.conflicts = conflicts.unwrap_or_default();
                 this.branches = branches.unwrap_or_default();
                 this.log = log.unwrap_or_default();
                 cx.notify();
@@ -303,7 +309,12 @@ impl Render for GitPanel {
             .map(|(ix, change)| {
                 let abs = root.join(&change.path);
                 let rel = change.path.clone();
-                let color = Self::status_color(&change.status, cx);
+                let conflicted = self.conflicts.contains(&change.path);
+                let color = if conflicted {
+                    cx.theme().danger
+                } else {
+                    Self::status_color(&change.status, cx)
+                };
                 let mark: SharedString = change
                     .status
                     .chars()
@@ -322,10 +333,16 @@ impl Render for GitPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            cx.emit(GitPanelEvent::OpenDiff {
-                                rel_path: rel.clone(),
-                                abs_path: abs.clone(),
-                            });
+                            if conflicted {
+                                cx.emit(GitPanelEvent::OpenMerge {
+                                    rel_path: rel.clone(),
+                                });
+                            } else {
+                                cx.emit(GitPanelEvent::OpenDiff {
+                                    rel_path: rel.clone(),
+                                    abs_path: abs.clone(),
+                                });
+                            }
                             let _ = this;
                         }),
                     )
@@ -345,7 +362,15 @@ impl Render for GitPanel {
                             .text_size(px(12.))
                             .child(change.path.clone()),
                     )
-                    .when(change.staged, |s| {
+                    .when(conflicted, |s| {
+                        s.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(cx.theme().danger)
+                                .child("冲突"),
+                        )
+                    })
+                    .when(change.staged && !conflicted, |s| {
                         s.child(
                             div()
                                 .text_size(px(10.))

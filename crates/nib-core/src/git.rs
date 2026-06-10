@@ -813,19 +813,19 @@ pub async fn git_remote_url(cwd: String, remote: Option<String>) -> Result<Strin
 
 #[derive(Serialize)]
 pub struct ConflictChunk {
-    ours_start: usize,
-    ours_end: usize,
-    theirs_start: usize,
-    theirs_end: usize,
-    ours_text: String,
-    theirs_text: String,
+    pub ours_start: usize,
+    pub ours_end: usize,
+    pub theirs_start: usize,
+    pub theirs_end: usize,
+    pub ours_text: String,
+    pub theirs_text: String,
 }
 
 #[derive(Serialize)]
 pub struct ConflictParse {
-    ours: String,
-    theirs: String,
-    chunks: Vec<ConflictChunk>,
+    pub ours: String,
+    pub theirs: String,
+    pub chunks: Vec<ConflictChunk>,
 }
 
 pub(crate) fn parse_conflict_markers(text: &str) -> ConflictParse {
@@ -916,6 +916,29 @@ pub async fn parse_conflict_file(path: String) -> Result<ConflictParse, String> 
         let content = std::fs::read_to_string(&path)
             .map_err(|e| format!("Failed to read {}: {}", path, e))?;
         Ok(parse_conflict_markers(&content))
+    })
+    .await
+}
+
+/// 逐块选边落盘(merge 视图「应用」):重读文件 → resolve_conflicts 重组 →
+/// 写回 + git add。choices 数量不足(文件在视图打开后又新增了冲突块)时
+/// 不落盘直接报错,避免写出半解决文件。
+pub async fn git_resolve_by_choices(
+    cwd: String,
+    rel_path: String,
+    choices: Vec<crate::diff::MergeSide>,
+) -> Result<(), String> {
+    on_worker(move || {
+        let abs = Path::new(&cwd).join(&rel_path);
+        let content = std::fs::read_to_string(&abs)
+            .map_err(|e| format!("Failed to read {}: {}", rel_path, e))?;
+        let (resolved, unresolved) = crate::diff::resolve_conflicts(&content, &choices);
+        if unresolved > 0 {
+            return Err(format!("还有 {} 个冲突块未选边(文件可能已变化,请重开)", unresolved));
+        }
+        std::fs::write(&abs, &resolved).map_err(|e| format!("Failed to write file: {}", e))?;
+        run_git(&cwd, &["add", "--", &rel_path])?;
+        Ok(())
     })
     .await
 }

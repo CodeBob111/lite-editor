@@ -122,3 +122,102 @@ mod tests {
         assert_eq!(d.stat.removed, 0);
     }
 }
+
+// ---- 冲突选边重组(3-way merge 视图的写回内核) ----
+
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MergeSide {
+    Ours,
+    Theirs,
+}
+
+/// 按「第 n 个冲突块选哪边」重组含 git 标记的原文(语义对齐旧版 acceptChunk 链):
+/// 标记外的行原样保留;第 i 个 <<<<<<<…=======…>>>>>>> 块输出所选侧的行。
+/// choices 不足时多余块原样保留标记(视为未解决),返回 (text, unresolved)。
+pub fn resolve_conflicts(content: &str, choices: &[MergeSide]) -> (String, usize) {
+    let mut out: Vec<&str> = Vec::new();
+    let mut ours_buf: Vec<&str> = Vec::new();
+    let mut theirs_buf: Vec<&str> = Vec::new();
+    let mut raw_buf: Vec<&str> = Vec::new();
+    let mut in_ours = false;
+    let mut in_theirs = false;
+    let mut chunk_ix = 0usize;
+    let mut unresolved = 0usize;
+
+    for line in content.split('\n') {
+        if line.starts_with("<<<<<<<") {
+            in_ours = true;
+            in_theirs = false;
+            ours_buf.clear();
+            theirs_buf.clear();
+            raw_buf.clear();
+            raw_buf.push(line);
+            continue;
+        }
+        if line.starts_with("=======") && in_ours {
+            in_ours = false;
+            in_theirs = true;
+            raw_buf.push(line);
+            continue;
+        }
+        if line.starts_with(">>>>>>>") && in_theirs {
+            in_theirs = false;
+            raw_buf.push(line);
+            match choices.get(chunk_ix) {
+                Some(MergeSide::Ours) => out.extend(ours_buf.iter()),
+                Some(MergeSide::Theirs) => out.extend(theirs_buf.iter()),
+                None => {
+                    unresolved += 1;
+                    out.extend(raw_buf.iter());
+                }
+            }
+            chunk_ix += 1;
+            continue;
+        }
+        if in_ours {
+            ours_buf.push(line);
+            raw_buf.push(line);
+        } else if in_theirs {
+            theirs_buf.push(line);
+            raw_buf.push(line);
+        } else {
+            out.push(line);
+        }
+    }
+    // 未闭合块原样回灌(与 parse_conflict_markers 同语义)
+    if in_ours || in_theirs {
+        out.extend(raw_buf.iter());
+    }
+
+    (out.join("\n"), unresolved)
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    const SRC: &str = "a\n<<<<<<< HEAD\nx1\n=======\ny1\n>>>>>>> br\nmid\n<<<<<<< HEAD\nx2\n=======\ny2\n>>>>>>> br\nz\n";
+
+    #[test]
+    fn resolves_both_sides() {
+        let (text, un) = resolve_conflicts(SRC, &[MergeSide::Ours, MergeSide::Theirs]);
+        assert_eq!(text, "a\nx1\nmid\ny2\nz\n");
+        assert_eq!(un, 0);
+    }
+
+    #[test]
+    fn missing_choice_keeps_markers() {
+        let (text, un) = resolve_conflicts(SRC, &[MergeSide::Theirs]);
+        assert_eq!(un, 1);
+        assert!(text.contains(">>>>>>> br"), "未选边块保留标记");
+        assert!(text.starts_with("a\ny1\nmid\n"));
+    }
+
+    #[test]
+    fn crlf_lines_survive() {
+        let src = "a\r\n<<<<<<< HEAD\r\nx\r\n=======\r\ny\r\n>>>>>>> b\r\nz\r\n";
+        let (text, un) = resolve_conflicts(src, &[MergeSide::Ours]);
+        assert_eq!(text, "a\r\nx\r\nz\r\n");
+        assert_eq!(un, 0);
+    }
+}
