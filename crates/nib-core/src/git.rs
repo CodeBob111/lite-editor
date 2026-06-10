@@ -650,6 +650,11 @@ pub async fn git_show_file(cwd: String, rel_path: String) -> Result<String, Stri
     on_worker(move || run_git_raw(&cwd, &["show", &format!("HEAD:{}", rel_path)])).await
 }
 
+/// 同步取 HEAD 版本(供 diff 内核在 worker 线程内复用;新文件无 HEAD 版返回 Err)
+pub(crate) fn show_head_file_sync(cwd: &str, rel_path: &str) -> Result<String, String> {
+    run_git_raw(cwd, &["show", &format!("HEAD:{}", rel_path)])
+}
+
 pub async fn git_show_staged(cwd: String, rel_path: String) -> Result<String, String> {
     on_worker(move || run_git_raw(&cwd, &["show", &format!(":{}", rel_path)])).await
 }

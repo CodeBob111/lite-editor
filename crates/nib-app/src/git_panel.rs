@@ -16,7 +16,7 @@ use gpui_component::{
 use nib_core::git::{GitBranch, GitChange, GitCommit};
 
 pub enum GitPanelEvent {
-    OpenFile(PathBuf),
+    OpenDiff { rel_path: String, abs_path: PathBuf },
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -271,6 +271,7 @@ impl Render for GitPanel {
             .enumerate()
             .map(|(ix, change)| {
                 let abs = root.join(&change.path);
+                let rel = change.path.clone();
                 let color = Self::status_color(&change.status, cx);
                 let mark: SharedString = change
                     .status
@@ -290,7 +291,10 @@ impl Render for GitPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            cx.emit(GitPanelEvent::OpenFile(abs.clone()));
+                            cx.emit(GitPanelEvent::OpenDiff {
+                                rel_path: rel.clone(),
+                                abs_path: abs.clone(),
+                            });
                             let _ = this;
                         }),
                     )

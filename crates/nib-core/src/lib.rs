@@ -6,6 +6,7 @@
 
 pub mod astore;
 pub mod clipboard;
+pub mod diff;
 pub mod events;
 pub mod fs;
 pub mod git;

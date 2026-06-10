@@ -2,6 +2,7 @@
 // 性能纪律(RFC v2 §5):主线程零阻塞 IO——目录遍历/读写文件全部经 nib-core
 // 自持 runtime,结果回主线程更新实体;异步回灌一律带陈旧守卫。
 
+mod diff_view;
 mod git_panel;
 mod quick_open;
 mod search_panel;
@@ -24,6 +25,7 @@ use gpui_component::{
 };
 
 use futures::StreamExt as _;
+use diff_view::{DiffView, DiffViewEvent};
 use git_panel::{GitPanel, GitPanelEvent};
 use quick_open::{QuickOpen, QuickOpenEvent};
 use search_panel::{SearchEvent, SearchPanel};
@@ -92,6 +94,7 @@ impl nib_core::EventSink for ChannelSink {
 enum Overlay {
     QuickOpen(Entity<QuickOpen>),
     Search(Entity<SearchPanel>),
+    Diff(Entity<DiffView>),
 }
 
 struct OpenTab {
@@ -166,7 +169,9 @@ impl Workbench {
         let git_sub = cx.subscribe(
             &git_panel,
             |this: &mut Workbench, _, event: &GitPanelEvent, cx| match event {
-                GitPanelEvent::OpenFile(path) => this.open_file(path.clone(), cx),
+                GitPanelEvent::OpenDiff { rel_path, abs_path } => {
+                    this.open_diff(rel_path.clone(), abs_path.clone(), cx)
+                }
             },
         );
 
@@ -683,6 +688,38 @@ impl Workbench {
         .detach();
     }
 
+    /// 打开 diff 浮层(diff 在 core runtime 计算,回主线程建视图)
+    fn open_diff(&mut self, rel_path: String, abs_path: PathBuf, cx: &mut Context<Self>) {
+        let cwd = self.project_root.to_string_lossy().to_string();
+        let window_handle = self.window_handle;
+        cx.spawn(async move |weak, cx| {
+            let Ok(diff) = nib_core::diff::diff_file_against_head(cwd, rel_path.clone()).await
+            else {
+                return;
+            };
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                    let view = cx.new(|_| DiffView::new(rel_path.clone(), abs_path.clone(), diff));
+                    let sub = cx.subscribe_in(
+                        &view,
+                        window,
+                        |this: &mut Workbench, _, event: &DiffViewEvent, window, cx| match event {
+                            DiffViewEvent::OpenFile(path) => {
+                                let path = path.clone();
+                                this.close_palette(window, cx);
+                                this.open_file(path, cx);
+                            }
+                        },
+                    );
+                    this.overlay = Some(Overlay::Diff(view));
+                    this._overlay_sub = Some(sub);
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     // ---- 浮层(quick-open / 全局搜索) ----
 
     fn on_toggle_quick_open(
@@ -757,7 +794,7 @@ impl Workbench {
         match &self.overlay {
             Some(Overlay::QuickOpen(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
             Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
-            None => {}
+            Some(Overlay::Diff(_)) | None => {}
         }
     }
 
@@ -765,7 +802,7 @@ impl Workbench {
         match &self.overlay {
             Some(Overlay::QuickOpen(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
             Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
-            None => {}
+            Some(Overlay::Diff(_)) | None => {}
         }
     }
 
@@ -975,6 +1012,7 @@ impl Render for Workbench {
                 let content: AnyElement = match self.overlay.as_ref().unwrap() {
                     Overlay::QuickOpen(p) => p.clone().into_any_element(),
                     Overlay::Search(p) => p.clone().into_any_element(),
+                    Overlay::Diff(p) => p.clone().into_any_element(),
                 };
                 this.child(
                     div()
