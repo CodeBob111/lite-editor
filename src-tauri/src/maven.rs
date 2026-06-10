@@ -1,0 +1,672 @@
+// Maven 依赖分析:跑 mvn dependency:tree 并在 Rust 侧完成解析/冲突检测/扁平化,
+// 以及 pom.xml 的 exclusion 外科手术编辑。解析逻辑自前端 maven-helper.ts 迁入
+// (数据产生端与解析端同侧),两处申报过的行为修正:
+// 1. 深度计算保留前导空格——TS 正则贪婪 \s* 会把 last-child 后代的纯空格缩进吃掉,
+//    导致这类节点深度算浅、挂错父节点;
+// 2. direct_parent = depth-1 直接依赖——TS findDirectParent off-by-one 返回 depth-0
+//    模块自身,exclude 在 pom 里搜模块自身 GAV 永远失败。
+
+use crate::commands::{ci_cmp, on_worker};
+use serde::Serialize;
+use std::collections::{HashMap, HashSet};
+use std::process::{Command, Stdio};
+
+#[derive(Serialize, Clone)]
+pub struct DepCoordRef {
+    group_id: String,
+    artifact_id: String,
+}
+
+#[derive(Serialize)]
+pub struct DepNode {
+    group_id: String,
+    artifact_id: String,
+    #[serde(rename = "type")]
+    dep_type: String,
+    version: String,
+    scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omitted_for: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direct_parent: Option<DepCoordRef>,
+    children: Vec<DepNode>,
+}
+
+#[derive(Serialize)]
+pub struct ConflictNode {
+    group_id: String,
+    artifact_id: String,
+    version: String,
+    scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omitted_for: Option<String>,
+    /// 祖先 artifactId 链(模块根 → 直接父),冲突视图展示用
+    dep_path: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    direct_parent: Option<DepCoordRef>,
+}
+
+#[derive(Serialize)]
+pub struct MavenConflict {
+    group_id: String,
+    artifact_id: String,
+    versions: Vec<String>,
+    nodes: Vec<ConflictNode>,
+}
+
+#[derive(Serialize)]
+pub struct MavenFlatDep {
+    group_id: String,
+    artifact_id: String,
+    version: String,
+    scope: String,
+    is_conflict: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    omitted_for: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct MavenDepTree {
+    exit_code: i32,
+    /// exit_code != 0 时为 None;成功时是 synthetic 根(空坐标,children = 各模块根)
+    root: Option<DepNode>,
+    conflicts: Vec<MavenConflict>,
+    flat: Vec<MavenFlatDep>,
+}
+
+// ---- 坐标解析 ----
+
+struct RawCoord {
+    group_id: String,
+    artifact_id: String,
+    dep_type: String,
+    version: String,
+    scope: String,
+    omitted_for: Option<String>,
+}
+
+fn parse_dep_coord(raw: &str) -> Option<RawCoord> {
+    let mut text = raw.trim().to_string();
+    let mut omitted_for: Option<String> = None;
+
+    // 括号包裹的省略项:"(g:a:type:ver:scope - omitted for conflict with X)"
+    if text.starts_with('(') && text.ends_with(')') {
+        text = text[1..text.len() - 1].to_string();
+        const MARKER: &str = "omitted for conflict with";
+        if let Some(pos) = text.rfind(MARKER) {
+            let before = text[..pos].trim_end();
+            let after = text[pos + MARKER.len()..].trim();
+            if before.ends_with('-')
+                && !after.is_empty()
+                && after
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
+            {
+                omitted_for = Some(after.to_string());
+                text = before[..before.len() - 1].trim_end().to_string();
+            }
+        }
+    }
+
+    // 其余尾部括号说明,如 "(version managed from X)"
+    let t = text.trim_end();
+    if t.ends_with(')') {
+        if let Some(i) = t.find('(') {
+            text = t[..i].trim_end().to_string();
+        }
+    }
+
+    let parts: Vec<&str> = text.split(':').collect();
+    let coord = |g: &str, a: &str, t: &str, v: &str, s: &str| RawCoord {
+        group_id: g.to_string(),
+        artifact_id: a.to_string(),
+        dep_type: t.to_string(),
+        version: v.to_string(),
+        scope: s.to_string(),
+        omitted_for: omitted_for.clone(),
+    };
+    match parts.len() {
+        // groupId:artifactId:type:version[:scope] / groupId:artifactId:type:classifier:version:scope
+        4 => Some(coord(parts[0], parts[1], parts[2], parts[3], "compile")),
+        5 => Some(coord(parts[0], parts[1], parts[2], parts[3], parts[4])),
+        n if n >= 6 => Some(coord(parts[0], parts[1], parts[2], parts[4], parts[5])),
+        _ => None,
+    }
+}
+
+// ---- 树解析(扁平节点 + 父指针,便于算 dep_path / direct_parent) ----
+
+struct RawNode {
+    coord: RawCoord,
+    parent: Option<usize>,
+    /// 路径上的 depth-1 祖先(真实声明在 pom 里的直接依赖);自身 depth<=1 时无
+    direct_parent: Option<usize>,
+    children: Vec<usize>,
+}
+
+fn parse_tree_nodes(output: &str) -> Vec<RawNode> {
+    let mut nodes: Vec<RawNode> = Vec::new();
+    // stack[i] = 当前路径上第 i 层节点的下标
+    let mut stack: Vec<usize> = Vec::new();
+
+    for raw_line in output.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        let Some(rest) = line.strip_prefix("[INFO]") else {
+            continue;
+        };
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+
+        // 树前缀每层 3 字符("+- " / "|  " / "\- " / "   ");坐标以字母/数字/'(' 开头
+        let coord_start = rest
+            .find(|c: char| !matches!(c, '|' | '+' | '\\' | '-' | ' '))
+            .unwrap_or(rest.len());
+        let tree_prefix = &rest[..coord_start];
+        let coord_str = &rest[coord_start..];
+
+        if coord_str.starts_with("BUILD")
+            || coord_str.starts_with("Downloading")
+            || coord_str.starts_with("Downloaded")
+            || coord_str.starts_with("Verbose")
+            || coord_str.trim().is_empty()
+            || !coord_str.contains(':')
+        {
+            continue;
+        }
+        let Some(coord) = parse_dep_coord(coord_str) else {
+            continue;
+        };
+
+        let prefix_clean_len = tree_prefix.trim_end_matches(' ').len();
+        let depth = if prefix_clean_len == 0 {
+            0
+        } else {
+            (prefix_clean_len + 1) / 3
+        };
+
+        stack.truncate(depth);
+        let parent = stack.last().copied();
+        let direct_parent = if stack.len() >= 2 { Some(stack[1]) } else { None };
+
+        let idx = nodes.len();
+        nodes.push(RawNode {
+            coord,
+            parent,
+            direct_parent,
+            children: Vec::new(),
+        });
+        if let Some(p) = parent {
+            nodes[p].children.push(idx);
+        }
+        stack.push(idx);
+    }
+
+    nodes
+}
+
+fn coord_ref(nodes: &[RawNode], idx: usize) -> DepCoordRef {
+    DepCoordRef {
+        group_id: nodes[idx].coord.group_id.clone(),
+        artifact_id: nodes[idx].coord.artifact_id.clone(),
+    }
+}
+
+/// 祖先 artifactId 链:模块根 → … → 直接父
+fn dep_path(nodes: &[RawNode], idx: usize) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut cur = nodes[idx].parent;
+    while let Some(p) = cur {
+        path.push(nodes[p].coord.artifact_id.clone());
+        cur = nodes[p].parent;
+    }
+    path.reverse();
+    path
+}
+
+fn build_node(nodes: &[RawNode], idx: usize) -> DepNode {
+    let n = &nodes[idx];
+    DepNode {
+        group_id: n.coord.group_id.clone(),
+        artifact_id: n.coord.artifact_id.clone(),
+        dep_type: n.coord.dep_type.clone(),
+        version: n.coord.version.clone(),
+        scope: n.coord.scope.clone(),
+        omitted_for: n.coord.omitted_for.clone(),
+        direct_parent: n.direct_parent.map(|d| coord_ref(nodes, d)),
+        children: n.children.iter().map(|&c| build_node(nodes, c)).collect(),
+    }
+}
+
+pub(crate) fn build_dep_tree(exit_code: i32, output: &str) -> MavenDepTree {
+    let nodes = parse_tree_nodes(output);
+
+    // 冲突检测:同 groupId:artifactId 出现多版本,或任一节点带 omitted_for
+    let mut key_order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, n) in nodes.iter().enumerate() {
+        let key = format!("{}:{}", n.coord.group_id, n.coord.artifact_id);
+        let entry = groups.entry(key.clone()).or_default();
+        if entry.is_empty() {
+            key_order.push(key);
+        }
+        entry.push(i);
+    }
+
+    let mut conflicts: Vec<MavenConflict> = Vec::new();
+    for key in &key_order {
+        let idxs = &groups[key];
+        let mut versions: Vec<String> = Vec::new();
+        for &i in idxs {
+            let v = &nodes[i].coord.version;
+            if !versions.contains(v) {
+                versions.push(v.clone());
+            }
+        }
+        let has_omitted = idxs.iter().any(|&i| nodes[i].coord.omitted_for.is_some());
+        if versions.len() > 1 || has_omitted {
+            for &i in idxs {
+                if let Some(o) = &nodes[i].coord.omitted_for {
+                    if !versions.contains(o) {
+                        versions.push(o.clone());
+                    }
+                }
+            }
+            let (group_id, artifact_id) = key.split_once(':').unwrap();
+            conflicts.push(MavenConflict {
+                group_id: group_id.to_string(),
+                artifact_id: artifact_id.to_string(),
+                versions,
+                nodes: idxs
+                    .iter()
+                    .map(|&i| ConflictNode {
+                        group_id: nodes[i].coord.group_id.clone(),
+                        artifact_id: nodes[i].coord.artifact_id.clone(),
+                        version: nodes[i].coord.version.clone(),
+                        scope: nodes[i].coord.scope.clone(),
+                        omitted_for: nodes[i].coord.omitted_for.clone(),
+                        dep_path: dep_path(&nodes, i),
+                        direct_parent: nodes[i].direct_parent.map(|d| coord_ref(&nodes, d)),
+                    })
+                    .collect(),
+            });
+        }
+    }
+    conflicts.sort_by(|a, b| ci_cmp(&a.artifact_id, &b.artifact_id));
+
+    let conflict_keys: HashSet<String> = conflicts
+        .iter()
+        .map(|c| format!("{}:{}", c.group_id, c.artifact_id))
+        .collect();
+
+    // 扁平去重列表:g:a:v 首见为准
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut flat: Vec<MavenFlatDep> = Vec::new();
+    for n in &nodes {
+        let key = format!(
+            "{}:{}:{}",
+            n.coord.group_id, n.coord.artifact_id, n.coord.version
+        );
+        if seen.insert(key) {
+            flat.push(MavenFlatDep {
+                group_id: n.coord.group_id.clone(),
+                artifact_id: n.coord.artifact_id.clone(),
+                version: n.coord.version.clone(),
+                scope: n.coord.scope.clone(),
+                is_conflict: conflict_keys
+                    .contains(&format!("{}:{}", n.coord.group_id, n.coord.artifact_id)),
+                omitted_for: n.coord.omitted_for.clone(),
+            });
+        }
+    }
+    flat.sort_by(|a, b| ci_cmp(&a.artifact_id, &b.artifact_id));
+
+    // synthetic 根:空坐标,children = 各 depth-0 模块根(多模块 reactor 多棵树)
+    let root_children: Vec<DepNode> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.parent.is_none())
+        .map(|(i, _)| build_node(&nodes, i))
+        .collect();
+    let root = DepNode {
+        group_id: String::new(),
+        artifact_id: String::new(),
+        dep_type: String::new(),
+        version: String::new(),
+        scope: "compile".to_string(),
+        omitted_for: None,
+        direct_parent: None,
+        children: root_children,
+    };
+
+    MavenDepTree {
+        exit_code,
+        root: Some(root),
+        conflicts,
+        flat,
+    }
+}
+
+#[tauri::command]
+pub async fn maven_dependency_tree(project_path: String) -> Result<MavenDepTree, String> {
+    on_worker(move || {
+        let result = Command::new("mvn")
+            .arg("dependency:tree")
+            .current_dir(&project_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("Failed to run mvn: {}", e))?;
+
+        let exit_code = result.status.code().unwrap_or(-1);
+        if exit_code != 0 {
+            return Ok(MavenDepTree {
+                exit_code,
+                root: None,
+                conflicts: Vec::new(),
+                flat: Vec::new(),
+            });
+        }
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        Ok(build_dep_tree(exit_code, &stdout))
+    })
+    .await
+}
+
+// ---- pom.xml exclusion 外科手术编辑 ----
+
+pub(crate) fn add_exclusion(
+    content: &str,
+    parent_group_id: &str,
+    parent_artifact_id: &str,
+    exclude_group_id: &str,
+    exclude_artifact_id: &str,
+) -> Result<String, String> {
+    let mut lines: Vec<String> = content.split('\n').map(String::from).collect();
+
+    // 找匹配 parent GAV 的 <dependency> 块
+    let mut dep_start: Option<usize> = None;
+    let mut dep_end: Option<usize> = None;
+    let mut found_group = false;
+    let mut found_artifact = false;
+    let group_tag = format!("<groupId>{}</groupId>", parent_group_id);
+    let artifact_tag = format!("<artifactId>{}</artifactId>", parent_artifact_id);
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == "<dependency>" {
+            dep_start = Some(i);
+            found_group = false;
+            found_artifact = false;
+        }
+        if dep_start.is_some() {
+            if trimmed == group_tag {
+                found_group = true;
+            }
+            if trimmed == artifact_tag {
+                found_artifact = true;
+            }
+            if trimmed == "</dependency>" {
+                if found_group && found_artifact {
+                    dep_end = Some(i);
+                    break;
+                }
+                dep_start = None;
+            }
+        }
+    }
+
+    let (Some(ds), Some(de)) = (dep_start, dep_end) else {
+        return Err(format!(
+            "Cannot find <dependency> for {}:{}",
+            parent_group_id, parent_artifact_id
+        ));
+    };
+
+    // 探测缩进
+    let dep_indent: String = lines[ds]
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .collect();
+    let child_indent = format!("{}    ", dep_indent);
+    let grand_child_indent = format!("{}    ", child_indent);
+
+    // 该块内已有 <exclusions> 吗
+    let mut exclusions_start: Option<usize> = None;
+    let mut exclusions_end: Option<usize> = None;
+    for (i, line) in lines.iter().enumerate().take(de + 1).skip(ds) {
+        if line.trim() == "<exclusions>" {
+            exclusions_start = Some(i);
+        }
+        if line.trim() == "</exclusions>" {
+            exclusions_end = Some(i);
+        }
+    }
+
+    let exclusion_block = vec![
+        format!("{}<exclusion>", grand_child_indent),
+        format!(
+            "{}    <groupId>{}</groupId>",
+            grand_child_indent, exclude_group_id
+        ),
+        format!(
+            "{}    <artifactId>{}</artifactId>",
+            grand_child_indent, exclude_artifact_id
+        ),
+        format!("{}</exclusion>", grand_child_indent),
+    ];
+
+    if let (Some(_), Some(ee)) = (exclusions_start, exclusions_end) {
+        // 插到 </exclusions> 之前
+        lines.splice(ee..ee, exclusion_block);
+    } else {
+        // 在 </dependency> 之前插入整个 <exclusions> 块
+        let mut block = vec![format!("{}<exclusions>", child_indent)];
+        block.extend(exclusion_block);
+        block.push(format!("{}</exclusions>", child_indent));
+        lines.splice(de..de, block);
+    }
+
+    Ok(lines.join("\n"))
+}
+
+#[tauri::command]
+pub async fn maven_add_exclusion(
+    pom_path: String,
+    parent_group_id: String,
+    parent_artifact_id: String,
+    exclude_group_id: String,
+    exclude_artifact_id: String,
+) -> Result<(), String> {
+    on_worker(move || {
+        let content = std::fs::read_to_string(&pom_path)
+            .map_err(|e| format!("Failed to read {}: {}", pom_path, e))?;
+        let updated = add_exclusion(
+            &content,
+            &parent_group_id,
+            &parent_artifact_id,
+            &exclude_group_id,
+            &exclude_artifact_id,
+        )?;
+        std::fs::write(&pom_path, updated).map_err(|e| format!("Failed to write {}: {}", pom_path, e))
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "\
+[INFO] Scanning for projects...
+[INFO] --- maven-dependency-plugin:3.1.1:tree (default-cli) @ app ---
+[INFO] com.example:app:jar:1.0.0
+[INFO] +- org.alpha:lib-a:jar:1.0:compile
+[INFO] |  +- org.beta:lib-b:jar:2.0:compile
+[INFO] |  \\- (org.gamma:lib-c:jar:1.5:compile - omitted for conflict with 2.0)
+[INFO] \\- org.gamma:lib-c:jar:2.0:test
+[INFO]    \\- org.delta:lib-d:jar:3.0:test
+[INFO] BUILD SUCCESS
+[INFO] Total time: 2.5 s
+";
+
+    #[test]
+    fn parses_tree_shape_with_last_child_descendants() {
+        let tree = build_dep_tree(0, SAMPLE);
+        let root = tree.root.as_ref().unwrap();
+        assert_eq!(root.children.len(), 1, "单模块 → synthetic 根下一棵树");
+        let module = &root.children[0];
+        assert_eq!(module.artifact_id, "app");
+        assert_eq!(module.children.len(), 2);
+        let lib_a = &module.children[0];
+        assert_eq!(lib_a.children.len(), 2);
+        // 行为修正:`[INFO]    \- lib-d` 的纯空格缩进保留 → lib-d 是 lib-c 的孩子
+        let lib_c = &module.children[1];
+        assert_eq!(lib_c.artifact_id, "lib-c");
+        assert_eq!(lib_c.children.len(), 1);
+        assert_eq!(lib_c.children[0].artifact_id, "lib-d");
+    }
+
+    #[test]
+    fn direct_parent_is_depth1_ancestor() {
+        let tree = build_dep_tree(0, SAMPLE);
+        let module = &tree.root.unwrap().children[0];
+        // depth-1 节点自身无 direct_parent
+        assert!(module.children[0].direct_parent.is_none());
+        // depth-2 节点的 direct_parent = depth-1 直接依赖
+        let lib_b = &module.children[0].children[0];
+        assert_eq!(lib_b.direct_parent.as_ref().unwrap().artifact_id, "lib-a");
+        let lib_d = &module.children[1].children[0];
+        assert_eq!(lib_d.direct_parent.as_ref().unwrap().artifact_id, "lib-c");
+    }
+
+    #[test]
+    fn detects_conflicts_with_versions_and_dep_path() {
+        let tree = build_dep_tree(0, SAMPLE);
+        assert_eq!(tree.conflicts.len(), 1);
+        let c = &tree.conflicts[0];
+        assert_eq!(c.artifact_id, "lib-c");
+        assert_eq!(c.versions, vec!["1.5", "2.0"]);
+        assert_eq!(c.nodes.len(), 2);
+        let omitted = c.nodes.iter().find(|n| n.omitted_for.is_some()).unwrap();
+        assert_eq!(omitted.omitted_for.as_deref(), Some("2.0"));
+        assert_eq!(omitted.dep_path, vec!["app", "lib-a"]);
+        assert_eq!(omitted.direct_parent.as_ref().unwrap().artifact_id, "lib-a");
+    }
+
+    #[test]
+    fn flat_dedups_and_marks_conflicts() {
+        let tree = build_dep_tree(0, SAMPLE);
+        // app, lib-a, lib-b, lib-c:1.5, lib-c:2.0, lib-d
+        assert_eq!(tree.flat.len(), 6);
+        let lib_c_entries: Vec<_> = tree.flat.iter().filter(|f| f.artifact_id == "lib-c").collect();
+        assert_eq!(lib_c_entries.len(), 2);
+        assert!(lib_c_entries.iter().all(|f| f.is_conflict));
+        assert!(!tree.flat.iter().find(|f| f.artifact_id == "lib-b").unwrap().is_conflict);
+    }
+
+    #[test]
+    fn parses_coord_variants() {
+        let c = parse_dep_coord("g:a:jar:1.0").unwrap();
+        assert_eq!((c.version.as_str(), c.scope.as_str()), ("1.0", "compile"));
+        let c = parse_dep_coord("g:a:jar:1.0:test").unwrap();
+        assert_eq!((c.version.as_str(), c.scope.as_str()), ("1.0", "test"));
+        // 6 段:classifier 在第 4 段
+        let c = parse_dep_coord("g:a:jar:linux-x86_64:2.0:runtime").unwrap();
+        assert_eq!((c.version.as_str(), c.scope.as_str()), ("2.0", "runtime"));
+        // 尾部管理说明剥除
+        let c = parse_dep_coord("g:a:jar:1.0:compile (version managed from 2.0)").unwrap();
+        assert_eq!(c.version, "1.0");
+        assert!(parse_dep_coord("g:a").is_none());
+    }
+
+    #[test]
+    fn multi_module_reactor_yields_multiple_roots() {
+        let out = "\
+[INFO] com.example:mod-a:jar:1.0
+[INFO] +- org.x:dep-x:jar:1.0:compile
+[INFO] com.example:mod-b:jar:1.0
+[INFO] \\- org.y:dep-y:jar:1.0:compile
+";
+        let tree = build_dep_tree(0, out);
+        assert_eq!(tree.root.unwrap().children.len(), 2);
+    }
+
+    #[test]
+    fn empty_output_yields_empty_root() {
+        let tree = build_dep_tree(0, "[INFO] BUILD SUCCESS\n");
+        assert!(tree.root.unwrap().children.is_empty());
+        assert!(tree.conflicts.is_empty());
+        assert!(tree.flat.is_empty());
+    }
+
+    const POM: &str = "\
+<project>
+    <dependencies>
+        <dependency>
+            <groupId>org.alpha</groupId>
+            <artifactId>lib-a</artifactId>
+            <version>1.0</version>
+        </dependency>
+    </dependencies>
+</project>";
+
+    #[test]
+    fn inserts_new_exclusions_block_with_indent() {
+        let updated = add_exclusion(POM, "org.alpha", "lib-a", "org.gamma", "lib-c").unwrap();
+        let expected = "\
+<project>
+    <dependencies>
+        <dependency>
+            <groupId>org.alpha</groupId>
+            <artifactId>lib-a</artifactId>
+            <version>1.0</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.gamma</groupId>
+                    <artifactId>lib-c</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+    </dependencies>
+</project>";
+        assert_eq!(updated, expected);
+    }
+
+    #[test]
+    fn appends_into_existing_exclusions_block() {
+        let pom = "\
+<project>
+    <dependencies>
+        <dependency>
+            <groupId>org.alpha</groupId>
+            <artifactId>lib-a</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.old</groupId>
+                    <artifactId>lib-old</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+    </dependencies>
+</project>";
+        let updated = add_exclusion(pom, "org.alpha", "lib-a", "org.gamma", "lib-c").unwrap();
+        let new_pos = updated.find("lib-c").unwrap();
+        let old_pos = updated.find("lib-old").unwrap();
+        let close_pos = updated.find("</exclusions>").unwrap();
+        assert!(old_pos < new_pos && new_pos < close_pos, "新 exclusion 追加在既有项之后、闭合标签之前");
+    }
+
+    #[test]
+    fn missing_dependency_block_is_err() {
+        let err = add_exclusion(POM, "org.nope", "lib-nope", "g", "a").unwrap_err();
+        assert!(err.contains("org.nope:lib-nope"));
+    }
+
+    #[test]
+    fn crlf_pom_lines_still_match() {
+        let pom_crlf = POM.replace('\n', "\r\n");
+        let updated = add_exclusion(&pom_crlf, "org.alpha", "lib-a", "org.gamma", "lib-c").unwrap();
+        assert!(updated.contains("<exclusion>"));
+        // 既有行的 \r 原样保留(join("\n") 不重写老行)
+        assert!(updated.contains("<version>1.0</version>\r"));
+    }
+}

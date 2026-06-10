@@ -5,6 +5,7 @@ pub mod git;
 mod java_index;
 mod usage_index;
 mod lsp;
+mod maven;
 mod terminal;
 
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
@@ -140,7 +141,9 @@ pub fn run() {
             commands::list_all_files,
             commands::parse_maven_modules,
             commands::run_maven_command,
-            commands::run_maven_collect,
+            commands::render_markdown,
+            maven::maven_dependency_tree,
+            maven::maven_add_exclusion,
             commands::start_file_watcher,
             commands::stop_file_watcher,
             commands::save_session,
@@ -174,6 +177,7 @@ pub fn run() {
             git::git_push,
             git::git_merge,
             git::git_merge_conflicts,
+            git::parse_conflict_file,
             git::git_show_conflict_version,
             git::git_merge_abort,
             git::git_resolve_conflict_file,

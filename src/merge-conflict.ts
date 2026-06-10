@@ -6,17 +6,8 @@ import { appConfirm } from "./dialog";
 import {
   gitMergeConflicts, gitShowConflictVersion, gitMergeAbort,
   gitResolveConflictFile, gitCheckoutConflictSide,
-  readFile,
+  parseConflictFile, type ConflictChunk,
 } from "./tauri-api";
-
-interface ConflictChunk {
-  oursStart: number;
-  oursEnd: number;
-  theirsStart: number;
-  theirsEnd: number;
-  oursText: string;
-  theirsText: string;
-}
 
 interface MergeFileState {
   relPath: string;
@@ -113,62 +104,6 @@ function loadLang(filename: string): Promise<Extension> | null {
 
   langCache.set(normalKey, promise);
   return promise;
-}
-
-// ---- Conflict marker parsing ----
-
-function parseConflictMarkers(text: string): { ours: string; theirs: string; chunks: ConflictChunk[] } {
-  const lines = text.split("\n");
-  const oursLines: string[] = [];
-  const theirsLines: string[] = [];
-  const chunks: ConflictChunk[] = [];
-  let inOurs = false;
-  let inTheirs = false;
-  let chunkOursStart = 0;
-  let chunkTheirsStart = 0;
-  let chunkOursLines: string[] = [];
-  let chunkTheirsLines: string[] = [];
-
-  for (const line of lines) {
-    if (line.startsWith("<<<<<<<")) {
-      inOurs = true;
-      inTheirs = false;
-      chunkOursStart = oursLines.length;
-      chunkTheirsStart = theirsLines.length;
-      chunkOursLines = [];
-      chunkTheirsLines = [];
-      continue;
-    }
-    if (line.startsWith("=======") && inOurs) {
-      inOurs = false;
-      inTheirs = true;
-      continue;
-    }
-    if (line.startsWith(">>>>>>>") && inTheirs) {
-      inTheirs = false;
-      oursLines.push(...chunkOursLines);
-      theirsLines.push(...chunkTheirsLines);
-      chunks.push({
-        oursStart: chunkOursStart,
-        oursEnd: oursLines.length,
-        theirsStart: chunkTheirsStart,
-        theirsEnd: theirsLines.length,
-        oursText: chunkOursLines.join("\n"),
-        theirsText: chunkTheirsLines.join("\n"),
-      });
-      continue;
-    }
-    if (inOurs) {
-      chunkOursLines.push(line);
-    } else if (inTheirs) {
-      chunkTheirsLines.push(line);
-    } else {
-      oursLines.push(line);
-      theirsLines.push(line);
-    }
-  }
-
-  return { ours: oursLines.join("\n"), theirs: theirsLines.join("\n"), chunks };
 }
 
 // ---- Conflict highlight decorations ----
@@ -337,8 +272,8 @@ async function openMergeEditor(relPath: string) {
 
   try {
     const absPath = activeRepo + "/" + relPath;
-    const workingCopy = await readFile(absPath);
-    const parsed = parseConflictMarkers(workingCopy);
+    // 冲突标记解析在 Rust 侧完成(传 path,省去全文两趟 IPC)
+    const parsed = await parseConflictFile(absPath);
     activeConflicts = parsed.chunks;
 
     let oursText: string;
@@ -392,11 +327,11 @@ async function openMergeEditor(relPath: string) {
 
     const resultDoc = mergeResultView.state.doc;
     const initialChunks: ChunkPos[] = parsed.chunks.map((c, i) => {
-      const startLine = c.oursStart + 1;
-      const endLine = Math.min(c.oursEnd, resultDoc.lines);
+      const startLine = c.ours_start + 1;
+      const endLine = Math.min(c.ours_end, resultDoc.lines);
       const from = resultDoc.line(startLine).from;
       const to = endLine >= startLine ? resultDoc.line(endLine).to : from;
-      return { from, to, idx: i, oursText: c.oursText, theirsText: c.theirsText, resolved: false };
+      return { from, to, idx: i, oursText: c.ours_text, theirsText: c.theirs_text, resolved: false };
     });
     mergeResultView.dispatch({ effects: initChunksEffect.of(initialChunks) });
 
@@ -424,8 +359,8 @@ function applyLangToMergeEditors(filename: string) {
 function applyConflictHighlights() {
   if (!mergeOursView || !mergeTheirsView) return;
 
-  const oursRanges: [number, number][] = activeConflicts.map((c) => [c.oursStart, c.oursEnd]);
-  const theirsRanges: [number, number][] = activeConflicts.map((c) => [c.theirsStart, c.theirsEnd]);
+  const oursRanges: [number, number][] = activeConflicts.map((c) => [c.ours_start, c.ours_end]);
+  const theirsRanges: [number, number][] = activeConflicts.map((c) => [c.theirs_start, c.theirs_end]);
 
   applyHighlightsToView(mergeOursView, oursRanges, "ours");
   applyHighlightsToView(mergeTheirsView, theirsRanges, "theirs");
@@ -589,14 +524,14 @@ function navigateConflict(direction: 1 | -1) {
     const origChunk = activeConflicts[target.idx];
     if (origChunk && mergeOursView) {
       const oursDoc = mergeOursView.state.doc;
-      const oursLn = Math.min(origChunk.oursStart + 1, oursDoc.lines);
+      const oursLn = Math.min(origChunk.ours_start + 1, oursDoc.lines);
       mergeOursView.dispatch({
         effects: EditorView.scrollIntoView(oursDoc.line(oursLn).from, { y: "center" }),
       });
     }
     if (origChunk && mergeTheirsView) {
       const theirsDoc = mergeTheirsView.state.doc;
-      const theirsLn = Math.min(origChunk.theirsStart + 1, theirsDoc.lines);
+      const theirsLn = Math.min(origChunk.theirs_start + 1, theirsDoc.lines);
       mergeTheirsView.dispatch({
         effects: EditorView.scrollIntoView(theirsDoc.line(theirsLn).from, { y: "center" }),
       });

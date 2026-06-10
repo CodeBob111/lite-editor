@@ -1,177 +1,18 @@
-import { runMavenCollect, readFile, writeFile } from "./tauri-api";
+import {
+  mavenDependencyTree, mavenAddExclusion,
+  type DepNode, type MavenConflict, type MavenConflictNode, type MavenFlatDep, type DepCoordRef,
+} from "./tauri-api";
 import { app } from "./state";
 import { showStatus } from "./utils";
 
-// ---- Types ----
-
-export interface DepNode {
-  groupId: string;
-  artifactId: string;
-  type: string;
-  version: string;
-  scope: string;
-  omittedFor?: string;
-  children: DepNode[];
-  depth: number;
-  parent?: DepNode;
-}
-
-export interface Conflict {
-  groupId: string;
-  artifactId: string;
-  versions: string[];
-  nodes: DepNode[];
-}
-
-// ---- Parse dependency:tree output ----
-
-function parseDepCoord(raw: string): { groupId: string; artifactId: string; type: string; version: string; scope: string; omittedFor?: string } | null {
-  // Strip wrapping parens for omitted entries: "(group:artifact:type:ver:scope - omitted for conflict with X)"
-  let text = raw.trim();
-  let omittedFor: string | undefined;
-
-  if (text.startsWith("(") && text.endsWith(")")) {
-    text = text.slice(1, -1);
-    const omitMatch = text.match(/\s*-\s*omitted for conflict with\s+([\w.\-]+)\s*$/);
-    if (omitMatch) {
-      omittedFor = omitMatch[1];
-      text = text.slice(0, text.length - omitMatch[0].length);
-    }
-  }
-
-  // Also handle "version managed from X" or other suffixes
-  const managedMatch = text.match(/\s*\(.*?\)\s*$/);
-  if (managedMatch) text = text.slice(0, text.length - managedMatch[0].length);
-
-  const parts = text.split(":");
-  if (parts.length < 4) return null;
-
-  // groupId:artifactId:type:version[:scope]  or  groupId:artifactId:type:classifier:version:scope
-  if (parts.length === 4) {
-    return { groupId: parts[0], artifactId: parts[1], type: parts[2], version: parts[3], scope: "compile", omittedFor };
-  }
-  if (parts.length === 5) {
-    return { groupId: parts[0], artifactId: parts[1], type: parts[2], version: parts[3], scope: parts[4], omittedFor };
-  }
-  if (parts.length >= 6) {
-    return { groupId: parts[0], artifactId: parts[1], type: parts[2], version: parts[4], scope: parts[5], omittedFor };
-  }
-  return null;
-}
-
-export function parseDependencyTree(output: string): DepNode {
-  const root: DepNode = {
-    groupId: "", artifactId: "", type: "", version: "", scope: "compile",
-    children: [], depth: -1,
-  };
-  const stack: DepNode[] = [root];
-
-  for (const raw of output.split("\n")) {
-    const line = raw.replace(/\r$/, "");
-
-    // Match lines like: "[INFO] +- group:artifact:type:ver:scope"
-    // Or root: "[INFO] group:artifact:type:ver"
-    const m = line.match(/^\[INFO\]\s*((?:[|+\\\- ]+)?)(.+)$/);
-    if (!m) continue;
-
-    const [, treePrefix, coordStr] = m;
-
-    // Skip non-dependency lines
-    if (coordStr.startsWith("---") || coordStr.startsWith("BUILD") ||
-      coordStr.startsWith("Downloading") || coordStr.startsWith("Downloaded") ||
-      coordStr.startsWith("Verbose") || coordStr.trim() === "" ||
-      !coordStr.includes(":")) continue;
-
-    const coord = parseDepCoord(coordStr);
-    if (!coord) continue;
-
-    // Calculate depth from tree prefix chars. Each level is 3 chars: "+- " or "|  " or "\- "
-    const prefixClean = treePrefix.replace(/\s+$/, "");
-    const depth = prefixClean.length === 0 ? 0 : Math.floor((prefixClean.length + 1) / 3);
-
-    const node: DepNode = {
-      groupId: coord.groupId, artifactId: coord.artifactId,
-      type: coord.type, version: coord.version, scope: coord.scope,
-      children: [], depth,
-      ...(coord.omittedFor ? { omittedFor: coord.omittedFor } : {}),
-    };
-
-    while (stack.length > depth + 1) stack.pop();
-    const parent = stack[stack.length - 1];
-    node.parent = parent;
-    parent.children.push(node);
-    stack.push(node);
-  }
-
-  return root;
-}
-
-// ---- Conflict detection ----
-
-export function detectConflicts(root: DepNode): Conflict[] {
-  const map = new Map<string, DepNode[]>();
-
-  function walk(node: DepNode) {
-    if (node.artifactId) {
-      const key = `${node.groupId}:${node.artifactId}`;
-      let list = map.get(key);
-      if (!list) { list = []; map.set(key, list); }
-      list.push(node);
-    }
-    for (const c of node.children) walk(c);
-  }
-  walk(root);
-
-  const conflicts: Conflict[] = [];
-  for (const [key, nodes] of map) {
-    const versions = [...new Set(nodes.map((n) => n.version))];
-    if (versions.length > 1 || nodes.some((n) => n.omittedFor)) {
-      const allVersions = [...new Set([...versions, ...nodes.filter((n) => n.omittedFor).map((n) => n.omittedFor!)])];
-      const [groupId, artifactId] = key.split(":");
-      conflicts.push({ groupId, artifactId, versions: allVersions, nodes });
-    }
-  }
-
-  return conflicts.sort((a, b) => a.artifactId.localeCompare(b.artifactId));
-}
-
-// ---- Flatten for list view ----
-
-interface FlatDep {
-  groupId: string;
-  artifactId: string;
-  version: string;
-  scope: string;
-  isConflict: boolean;
-  omittedFor?: string;
-}
-
-function flattenUnique(root: DepNode, conflictKeys: Set<string>): FlatDep[] {
-  const seen = new Map<string, FlatDep>();
-  function walk(node: DepNode) {
-    if (node.artifactId) {
-      const key = `${node.groupId}:${node.artifactId}:${node.version}`;
-      if (!seen.has(key)) {
-        const ck = `${node.groupId}:${node.artifactId}`;
-        seen.set(key, {
-          groupId: node.groupId, artifactId: node.artifactId,
-          version: node.version, scope: node.scope,
-          isConflict: conflictKeys.has(ck),
-          omittedFor: node.omittedFor,
-        });
-      }
-    }
-    for (const c of node.children) walk(c);
-  }
-  walk(root);
-  return [...seen.values()].sort((a, b) => a.artifactId.localeCompare(b.artifactId));
-}
+// 解析/冲突检测/扁平化已迁入 Rust(src-tauri/src/maven.rs),本文件只剩视图状态与渲染。
 
 // ---- State ----
 
 let currentPomPath: string | null = null;
 let currentTree: DepNode | null = null;
-let currentConflicts: Conflict[] = [];
+let currentConflicts: MavenConflict[] = [];
+let currentFlat: MavenFlatDep[] = [];
 let currentView: "conflicts" | "list" | "tree" = "list";
 let searchQuery = "";
 let showGroupId = false;
@@ -179,93 +20,19 @@ let hideTestScope = false;
 let isLoading = false;
 let showSize = false;
 
-// ---- Exclude dependency (surgical pom.xml edit) ----
+// ---- Exclude dependency (pom.xml 编辑在 Rust 侧完成) ----
 
-export async function excludeDependency(
+async function excludeDependency(
   pomPath: string,
   parentGroupId: string, parentArtifactId: string,
   excludeGroupId: string, excludeArtifactId: string,
 ): Promise<void> {
-  const content = await readFile(pomPath);
-  const lines = content.split("\n");
-
-  // Find the <dependency> block matching parent
-  let depStart = -1;
-  let depEnd = -1;
-  let foundGroup = false;
-  let foundArtifact = false;
-
-  for (let i = 0; i < lines.length; i++) {
-    const trimmed = lines[i].trim();
-    if (trimmed === "<dependency>") {
-      depStart = i;
-      foundGroup = false;
-      foundArtifact = false;
-    }
-    if (depStart >= 0) {
-      if (trimmed === `<groupId>${parentGroupId}</groupId>`) foundGroup = true;
-      if (trimmed === `<artifactId>${parentArtifactId}</artifactId>`) foundArtifact = true;
-      if (trimmed === "</dependency>") {
-        if (foundGroup && foundArtifact) {
-          depEnd = i;
-          break;
-        }
-        depStart = -1;
-      }
-    }
+  try {
+    await mavenAddExclusion(pomPath, parentGroupId, parentArtifactId, excludeGroupId, excludeArtifactId);
+    showStatus(`Excluded ${excludeGroupId}:${excludeArtifactId}`);
+  } catch (err) {
+    showStatus(`${err}`, true);
   }
-
-  if (depStart < 0 || depEnd < 0) {
-    showStatus(`Cannot find <dependency> for ${parentGroupId}:${parentArtifactId}`, true);
-    return;
-  }
-
-  // Detect indentation
-  const depIndent = lines[depStart].match(/^(\s*)/)?.[1] ?? "        ";
-  const childIndent = depIndent + "    ";
-  const grandChildIndent = childIndent + "    ";
-
-  // Check if <exclusions> already exists within this dependency block
-  let exclusionsStart = -1;
-  let exclusionsEnd = -1;
-  for (let i = depStart; i <= depEnd; i++) {
-    if (lines[i].trim() === "<exclusions>") exclusionsStart = i;
-    if (lines[i].trim() === "</exclusions>") exclusionsEnd = i;
-  }
-
-  const exclusionBlock = [
-    `${grandChildIndent}<exclusion>`,
-    `${grandChildIndent}    <groupId>${excludeGroupId}</groupId>`,
-    `${grandChildIndent}    <artifactId>${excludeArtifactId}</artifactId>`,
-    `${grandChildIndent}</exclusion>`,
-  ];
-
-  if (exclusionsStart >= 0 && exclusionsEnd >= 0) {
-    // Insert before </exclusions>
-    lines.splice(exclusionsEnd, 0, ...exclusionBlock);
-  } else {
-    // Insert <exclusions>...</exclusions> before </dependency>
-    const newLines = [
-      `${childIndent}<exclusions>`,
-      ...exclusionBlock,
-      `${childIndent}</exclusions>`,
-    ];
-    lines.splice(depEnd, 0, ...newLines);
-  }
-
-  await writeFile(pomPath, lines.join("\n"));
-  showStatus(`Excluded ${excludeGroupId}:${excludeArtifactId}`);
-}
-
-// ---- Find which direct dependency brings in a transitive ----
-
-function findDirectParent(node: DepNode): DepNode | null {
-  let cur = node;
-  while (cur.parent && cur.parent.depth >= 0) {
-    if (cur.parent.depth === 0) return cur.parent;
-    cur = cur.parent;
-  }
-  return cur.depth === 0 ? null : cur;
 }
 
 // ---- UI Rendering ----
@@ -274,9 +41,16 @@ function getContainer(): HTMLElement {
   return document.getElementById("dep-analyzer-content")!;
 }
 
+function setPlaceholder(container: HTMLElement, text: string, isError = false) {
+  const div = document.createElement("div");
+  div.className = `dep-placeholder${isError ? " dep-error" : ""}`;
+  div.textContent = text;
+  container.replaceChildren(div);
+}
+
 function renderToolbar() {
   const toolbar = document.getElementById("dep-analyzer-toolbar")!;
-  toolbar.innerHTML = "";
+  toolbar.replaceChildren();
 
   // Row 1: Refresh + Reimport buttons
   const row1 = document.createElement("div");
@@ -351,7 +125,7 @@ function renderToolbar() {
 function renderContent() {
   const container = getContainer();
   if (!currentTree) {
-    container.innerHTML = '<div class="dep-placeholder">Click Refresh to analyze dependencies</div>';
+    setPlaceholder(container, "Click Refresh to analyze dependencies");
     return;
   }
 
@@ -364,22 +138,22 @@ function renderContent() {
   }
 }
 
-function matchesSearch(node: { groupId: string; artifactId: string; version: string }): boolean {
+function matchesSearch(node: { group_id: string; artifact_id: string; version: string }): boolean {
   if (!searchQuery) return true;
   const q = searchQuery.toLowerCase();
-  return node.artifactId.toLowerCase().includes(q) ||
-    node.groupId.toLowerCase().includes(q) ||
+  return node.artifact_id.toLowerCase().includes(q) ||
+    node.group_id.toLowerCase().includes(q) ||
     node.version.toLowerCase().includes(q);
 }
 
 function renderConflictsView(container: HTMLElement) {
-  container.innerHTML = "";
+  container.replaceChildren();
   const filtered = currentConflicts.filter((c) =>
-    matchesSearch({ groupId: c.groupId, artifactId: c.artifactId, version: c.versions[0] }),
+    matchesSearch({ group_id: c.group_id, artifact_id: c.artifact_id, version: c.versions[0] }),
   );
 
   if (filtered.length === 0) {
-    container.innerHTML = '<div class="dep-placeholder">No conflicts found</div>';
+    setPlaceholder(container, "No conflicts found");
     return;
   }
 
@@ -389,8 +163,8 @@ function renderConflictsView(container: HTMLElement) {
 
     const header = document.createElement("div");
     header.className = "dep-conflict-header";
-    const prefix = showGroupId ? `${conflict.groupId}:` : "";
-    header.textContent = `${prefix}${conflict.artifactId} — ${conflict.versions.join(" vs ")}`;
+    const prefix = showGroupId ? `${conflict.group_id}:` : "";
+    header.textContent = `${prefix}${conflict.artifact_id} — ${conflict.versions.join(" vs ")}`;
     section.appendChild(header);
 
     for (const node of conflict.nodes) {
@@ -403,39 +177,36 @@ function renderConflictsView(container: HTMLElement) {
 }
 
 function renderListView(container: HTMLElement) {
-  container.innerHTML = "";
-  if (!currentTree) return;
+  container.replaceChildren();
 
-  const conflictKeys = new Set(currentConflicts.map((c) => `${c.groupId}:${c.artifactId}`));
-  let deps = flattenUnique(currentTree, conflictKeys);
-
+  let deps = currentFlat;
   if (hideTestScope) deps = deps.filter((d) => d.scope !== "test");
   if (searchQuery) deps = deps.filter(matchesSearch);
 
   if (deps.length === 0) {
-    container.innerHTML = '<div class="dep-placeholder">Nothing to show</div>';
+    setPlaceholder(container, "Nothing to show");
     return;
   }
 
   for (const dep of deps) {
     const row = document.createElement("div");
-    row.className = `dep-list-item${dep.isConflict ? " dep-conflict" : ""}`;
-    const prefix = showGroupId ? `${dep.groupId}:` : "";
-    let text = `${prefix}${dep.artifactId} : ${dep.version}`;
-    if (dep.omittedFor) text += ` (omitted for conflict with ${dep.omittedFor})`;
+    row.className = `dep-list-item${dep.is_conflict ? " dep-conflict" : ""}`;
+    const prefix = showGroupId ? `${dep.group_id}:` : "";
+    let text = `${prefix}${dep.artifact_id} : ${dep.version}`;
+    if (dep.omitted_for) text += ` (omitted for conflict with ${dep.omitted_for})`;
     row.textContent = text;
     container.appendChild(row);
   }
 }
 
 function renderTreeView(container: HTMLElement) {
-  container.innerHTML = "";
+  container.replaceChildren();
   if (!currentTree) return;
 
-  const conflictKeys = new Set(currentConflicts.map((c) => `${c.groupId}:${c.artifactId}`));
+  const conflictKeys = new Set(currentConflicts.map((c) => `${c.group_id}:${c.artifact_id}`));
 
   function renderNode(node: DepNode, depth: number): HTMLElement | null {
-    if (!node.artifactId) {
+    if (!node.artifact_id) {
       // root — render children directly
       const frag = document.createElement("div");
       for (const c of node.children) {
@@ -447,7 +218,7 @@ function renderTreeView(container: HTMLElement) {
 
     if (hideTestScope && node.scope === "test") return null;
 
-    const isConflict = conflictKeys.has(`${node.groupId}:${node.artifactId}`);
+    const isConflict = conflictKeys.has(`${node.group_id}:${node.artifact_id}`);
     const matches = matchesSearch(node);
     const childEls: HTMLElement[] = [];
     for (const c of node.children) {
@@ -464,13 +235,13 @@ function renderTreeView(container: HTMLElement) {
     row.className = `dep-tree-row${isConflict ? " dep-conflict" : ""}`;
     row.style.paddingLeft = `${depth * 20 + 8}px`;
 
-    const prefix = showGroupId ? `${node.groupId}:` : "";
-    let text = `${prefix}${node.artifactId}:${node.version}`;
+    const prefix = showGroupId ? `${node.group_id}:` : "";
+    let text = `${prefix}${node.artifact_id}:${node.version}`;
     if (node.scope !== "compile") text += ` [${node.scope}]`;
-    if (node.omittedFor) text += ` (omitted for conflict with ${node.omittedFor})`;
+    if (node.omitted_for) text += ` (omitted for conflict with ${node.omitted_for})`;
     row.textContent = text;
 
-    if (isConflict && !node.omittedFor) {
+    if (isConflict && !node.omitted_for) {
       row.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         showExcludeMenu(e.clientX, e.clientY, node);
@@ -486,23 +257,22 @@ function renderTreeView(container: HTMLElement) {
   if (tree) container.appendChild(tree);
 }
 
-function createDepRow(node: DepNode, showPath: boolean): HTMLElement {
+function createDepRow(node: MavenConflictNode, showPath: boolean): HTMLElement {
   const row = document.createElement("div");
   row.className = "dep-conflict-row";
 
-  const prefix = showGroupId ? `${node.groupId}:` : "";
-  let text = `${prefix}${node.artifactId}:${node.version}`;
+  const prefix = showGroupId ? `${node.group_id}:` : "";
+  let text = `${prefix}${node.artifact_id}:${node.version}`;
   if (node.scope !== "compile") text += ` [${node.scope}]`;
-  if (node.omittedFor) text += ` (omitted → ${node.omittedFor})`;
+  if (node.omitted_for) text += ` (omitted → ${node.omitted_for})`;
 
-  if (showPath) {
-    const path = getDepPath(node);
-    if (path) text += `  ← ${path}`;
+  if (showPath && node.dep_path.length > 0) {
+    text += `  ← ${node.dep_path.join(" → ")}`;
   }
 
   row.textContent = text;
 
-  if (!node.omittedFor) {
+  if (!node.omitted_for) {
     row.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       showExcludeMenu(e.clientX, e.clientY, node);
@@ -512,19 +282,12 @@ function createDepRow(node: DepNode, showPath: boolean): HTMLElement {
   return row;
 }
 
-function getDepPath(node: DepNode): string {
-  const parts: string[] = [];
-  let cur = node.parent;
-  while (cur && cur.artifactId) {
-    parts.unshift(cur.artifactId);
-    cur = cur.parent;
-  }
-  return parts.join(" → ");
-}
-
 // ---- Exclude context menu ----
 
-function showExcludeMenu(x: number, y: number, node: DepNode) {
+function showExcludeMenu(
+  x: number, y: number,
+  node: { group_id: string; artifact_id: string; direct_parent?: DepCoordRef },
+) {
   let menu = document.getElementById("dep-exclude-menu") as HTMLElement | null;
   if (!menu) {
     menu = document.createElement("div");
@@ -532,9 +295,9 @@ function showExcludeMenu(x: number, y: number, node: DepNode) {
     menu.className = "context-menu";
     document.body.appendChild(menu);
   }
-  menu.innerHTML = "";
+  menu.replaceChildren();
 
-  const directParent = findDirectParent(node);
+  const directParent = node.direct_parent;
   if (!directParent || !currentPomPath) {
     menu.classList.add("hidden");
     return;
@@ -542,12 +305,12 @@ function showExcludeMenu(x: number, y: number, node: DepNode) {
 
   const item = document.createElement("div");
   item.className = "context-menu-item";
-  item.textContent = `Exclude ${node.artifactId} from ${directParent.artifactId}`;
+  item.textContent = `Exclude ${node.artifact_id} from ${directParent.artifact_id}`;
   item.addEventListener("click", async () => {
     menu!.classList.add("hidden");
     await excludeDependency(
-      currentPomPath!, directParent.groupId, directParent.artifactId,
-      node.groupId, node.artifactId,
+      currentPomPath!, directParent.group_id, directParent.artifact_id,
+      node.group_id, node.artifact_id,
     );
   });
   menu.appendChild(item);
@@ -577,6 +340,7 @@ export function resetDepAnalyzerState() {
   currentPomPath = null;
   currentTree = null;
   currentConflicts = [];
+  currentFlat = [];
   isLoading = false;
   preloadPromise = null;
   hideDepAnalyzer();
@@ -596,10 +360,10 @@ export async function showDepAnalyzer(pomPath: string) {
   if (currentTree) {
     renderContent();
   } else if (isLoading && preloadPromise) {
-    getContainer().innerHTML = '<div class="dep-placeholder">Loading dependency tree...</div>';
+    setPlaceholder(getContainer(), "Loading dependency tree...");
     await preloadPromise;
     if (currentTree) renderContent();
-    else getContainer().innerHTML = '<div class="dep-placeholder dep-error">mvn dependency:tree failed</div>';
+    else setPlaceholder(getContainer(), "mvn dependency:tree failed", true);
   } else {
     refreshDependencyTree();
   }
@@ -641,6 +405,7 @@ function preloadDependencyTree(pomPath: string) {
   currentPomPath = pomPath;
   currentTree = null;
   currentConflicts = [];
+  currentFlat = [];
   isLoading = true;
   preloadPromise = doFetchTree(pomPath);
 }
@@ -650,15 +415,14 @@ async function doFetchTree(pomPath: string) {
   isLoading = true;
   const moduleDir = pomPath.replace(/\/pom\.xml$/, "");
   try {
-    const result = await runMavenCollect(moduleDir, [
-      "dependency:tree",
-    ]);
-    if (result.exit_code !== 0) {
+    const result = await mavenDependencyTree(moduleDir);
+    if (result.exit_code !== 0 || !result.root) {
       isLoading = false;
       return;
     }
-    currentTree = parseDependencyTree(result.output);
-    currentConflicts = detectConflicts(currentTree);
+    currentTree = result.root;
+    currentConflicts = result.conflicts;
+    currentFlat = result.flat;
     isLoading = false;
     if (isDepAnalyzerActive()) renderContent();
   } catch {
@@ -670,12 +434,13 @@ export async function refreshDependencyTree() {
   if (!currentPomPath || !app.currentProjectPath) return;
   isLoading = true;
   const container = getContainer();
-  container.innerHTML = '<div class="dep-placeholder">Loading...</div>';
+  setPlaceholder(container, "Loading...");
   currentTree = null;
   currentConflicts = [];
+  currentFlat = [];
   preloadPromise = doFetchTree(currentPomPath);
   await preloadPromise;
   if (!currentTree) {
-    container.innerHTML = '<div class="dep-placeholder dep-error">mvn dependency:tree failed</div>';
+    setPlaceholder(container, "mvn dependency:tree failed", true);
   }
 }

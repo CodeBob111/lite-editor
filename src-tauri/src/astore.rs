@@ -637,12 +637,24 @@ pub async fn astore_set_env(
     Ok(())
 }
 
+// git remote URL 规范化(自前端 astore-panel.ts 迁入):scp 形态 git@host:path →
+// http://host/path;http(s) 等其余形态原样保留(原 TS 实现对已是 http 的 URL
+// 也替换首个冒号,会把 "http://x" 破坏成 "http///x")。
+fn normalize_git_url(url: &str) -> String {
+    let url = url.trim();
+    match url.strip_prefix("git@") {
+        Some(rest) => format!("http://{}", rest.replacen(':', "/", 1)),
+        None => url.to_string(),
+    }
+}
+
 #[tauri::command]
 pub async fn astore_sync_code(
     state: State<'_, AstoreState>,
     git_url: String,
     branch: String,
 ) -> Result<String, String> {
+    let git_url = normalize_git_url(&git_url);
     let session = state.session.lock().unwrap().clone();
     if session.sso_token.is_empty() {
         return Err("未登录".to_string());
@@ -996,4 +1008,29 @@ pub async fn astore_get_record_url(
 ) -> Result<String, String> {
     let session = state.session.lock().unwrap().clone();
     Ok(get_record_url(&session))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_git_url;
+
+    #[test]
+    fn normalizes_scp_form_to_http() {
+        assert_eq!(
+            normalize_git_url("git@gitlab.alibaba-inc.com:group/repo.git"),
+            "http://gitlab.alibaba-inc.com/group/repo.git"
+        );
+    }
+
+    #[test]
+    fn keeps_http_form_and_trims_whitespace() {
+        assert_eq!(
+            normalize_git_url("  http://gitlab.alibaba-inc.com/group/repo.git\n"),
+            "http://gitlab.alibaba-inc.com/group/repo.git"
+        );
+        assert_eq!(
+            normalize_git_url("https://github.com/a/b.git"),
+            "https://github.com/a/b.git"
+        );
+    }
 }

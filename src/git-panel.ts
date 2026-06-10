@@ -77,30 +77,11 @@ function remoteFromTracking(tracking: string | null): string {
   return tracking?.split("/")[0] || "origin";
 }
 
-function branchRank(branch: GitBranch) {
-  if (branch.current) return 0;
-  if (branch.name === "master") return 1;
-  if (branch.name === "main") return 2;
-  return 10;
-}
-
 function branchItemClass(repoPath: string, branch: GitBranch): string {
   const classes = ["git-branch-item"];
   if (branch.current) classes.push("current");
   if (gitActiveLogRepo === repoPath && gitActiveLogBranch === branch.name) classes.push("log-selected");
   return classes.join(" ");
-}
-
-function sortLocalBranches(branches: GitBranch[]) {
-  return [...branches].sort((a, b) => {
-    const rank = branchRank(a) - branchRank(b);
-    if (rank !== 0) return rank;
-    return a.name.localeCompare(b.name);
-  });
-}
-
-function sortedRemoteBranches(branches: GitBranch[]) {
-  return [...branches].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function formatCommitDate(value: string): string {
@@ -222,8 +203,8 @@ function renderGitPanel() {
       } else if (cached.error) {
         html += `<div class="git-repo-error">${escapeHtml(cached.error)}</div>`;
       } else {
-        const local = sortLocalBranches(cached.branches.filter((b) => !b.remote));
-        const remote = sortedRemoteBranches(cached.branches.filter((b) => b.remote));
+        const local = cached.branches.filter((b) => !b.remote);
+        const remote = cached.branches.filter((b) => b.remote);
         const visibleLocal = local.slice(0, LOCAL_BRANCH_RENDER_LIMIT);
         const visibleRemote = remote.slice(0, REMOTE_BRANCH_RENDER_LIMIT);
 
@@ -274,8 +255,8 @@ function renderGitRepoSection(repoPath: string) {
     } else if (cached.error) {
       html += `<div class="git-repo-error">${escapeHtml(cached.error)}</div>`;
     } else {
-      const local = sortLocalBranches(cached.branches.filter((b) => !b.remote));
-      const remote = sortedRemoteBranches(cached.branches.filter((b) => b.remote));
+      const local = cached.branches.filter((b) => !b.remote);
+      const remote = cached.branches.filter((b) => b.remote);
       const visibleLocal = local.slice(0, LOCAL_BRANCH_RENDER_LIMIT);
       const visibleRemote = remote.slice(0, REMOTE_BRANCH_RENDER_LIMIT);
 

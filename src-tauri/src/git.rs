@@ -1,4 +1,4 @@
-use crate::commands::on_worker;
+use crate::commands::{ci_cmp, on_worker};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::path::Path;
@@ -270,7 +270,28 @@ fn git_list_branches_sync(cwd: &str) -> Result<Vec<GitBranch>, String> {
         });
     }
 
+    // 返回即有序(排序自前端 git-panel.ts 迁入):local 按 current → master → main → 其余,
+    // 组内大小写不敏感字典序;remote 仅按名(rank 对 "origin/x" 恒为 10,等效名字序)。
+    branches.sort_by(|a, b| {
+        a.remote
+            .cmp(&b.remote)
+            .then_with(|| branch_rank(a).cmp(&branch_rank(b)))
+            .then_with(|| ci_cmp(&a.name, &b.name))
+    });
+
     Ok(branches)
+}
+
+fn branch_rank(branch: &GitBranch) -> u8 {
+    if branch.current {
+        0
+    } else if branch.name == "master" {
+        1
+    } else if branch.name == "main" {
+        2
+    } else {
+        10
+    }
 }
 
 #[tauri::command]
@@ -804,4 +825,174 @@ pub async fn git_remote_url(cwd: String, remote: Option<String>) -> Result<Strin
         run_git(&cwd, &["remote", "get-url", remote])
     })
     .await
+}
+
+// ---- 冲突标记解析(3-way merge 编辑器用) ----
+// 自前端 merge-conflict.ts 迁入。行分割 split('\n') + 重建 join("\n"):行内 \r 与
+// 尾部空行原样保留,CRLF 文件经 merge 保存不被静默 LF 化(字节级保真)。
+// 收 path 而非内容:省去全文下行+上行两趟 IPC(lock 文件冲突动辄数 MB)。
+
+#[derive(Serialize)]
+pub struct ConflictChunk {
+    ours_start: usize,
+    ours_end: usize,
+    theirs_start: usize,
+    theirs_end: usize,
+    ours_text: String,
+    theirs_text: String,
+}
+
+#[derive(Serialize)]
+pub struct ConflictParse {
+    ours: String,
+    theirs: String,
+    chunks: Vec<ConflictChunk>,
+}
+
+pub(crate) fn parse_conflict_markers(text: &str) -> ConflictParse {
+    let mut ours_lines: Vec<&str> = Vec::new();
+    let mut theirs_lines: Vec<&str> = Vec::new();
+    let mut chunks: Vec<ConflictChunk> = Vec::new();
+    let mut in_ours = false;
+    let mut in_theirs = false;
+    let mut chunk_ours_start = 0usize;
+    let mut chunk_theirs_start = 0usize;
+    let mut chunk_ours_lines: Vec<&str> = Vec::new();
+    let mut chunk_theirs_lines: Vec<&str> = Vec::new();
+
+    for line in text.split('\n') {
+        if line.starts_with("<<<<<<<") {
+            in_ours = true;
+            in_theirs = false;
+            chunk_ours_start = ours_lines.len();
+            chunk_theirs_start = theirs_lines.len();
+            chunk_ours_lines = Vec::new();
+            chunk_theirs_lines = Vec::new();
+            continue;
+        }
+        if line.starts_with("=======") && in_ours {
+            in_ours = false;
+            in_theirs = true;
+            continue;
+        }
+        if line.starts_with(">>>>>>>") && in_theirs {
+            in_theirs = false;
+            ours_lines.append(&mut chunk_ours_lines);
+            theirs_lines.append(&mut chunk_theirs_lines);
+            chunks.push(ConflictChunk {
+                ours_start: chunk_ours_start,
+                ours_end: ours_lines.len(),
+                theirs_start: chunk_theirs_start,
+                theirs_end: theirs_lines.len(),
+                ours_text: ours_lines[chunk_ours_start..].join("\n"),
+                theirs_text: theirs_lines[chunk_theirs_start..].join("\n"),
+            });
+            continue;
+        }
+        if in_ours {
+            chunk_ours_lines.push(line);
+        } else if in_theirs {
+            chunk_theirs_lines.push(line);
+        } else {
+            ours_lines.push(line);
+            theirs_lines.push(line);
+        }
+    }
+
+    ConflictParse {
+        ours: ours_lines.join("\n"),
+        theirs: theirs_lines.join("\n"),
+        chunks,
+    }
+}
+
+#[tauri::command]
+pub async fn parse_conflict_file(path: String) -> Result<ConflictParse, String> {
+    on_worker(move || {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {}", path, e))?;
+        Ok(parse_conflict_markers(&content))
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_two_conflict_chunks() {
+        let text = "head\n<<<<<<< HEAD\na1\n=======\nb1\n>>>>>>> branch\nmid\n<<<<<<< HEAD\na2\na3\n=======\nb2\n>>>>>>> branch\ntail\n";
+        let parsed = parse_conflict_markers(text);
+        assert_eq!(parsed.ours, "head\na1\nmid\na2\na3\ntail\n");
+        assert_eq!(parsed.theirs, "head\nb1\nmid\nb2\ntail\n");
+        assert_eq!(parsed.chunks.len(), 2);
+        let c1 = &parsed.chunks[0];
+        assert_eq!((c1.ours_start, c1.ours_end), (1, 2));
+        assert_eq!(c1.ours_text, "a1");
+        assert_eq!(c1.theirs_text, "b1");
+        let c2 = &parsed.chunks[1];
+        assert_eq!((c2.ours_start, c2.ours_end), (3, 5));
+        assert_eq!(c2.ours_text, "a2\na3");
+    }
+
+    #[test]
+    fn no_markers_passes_through() {
+        let text = "line1\nline2\n";
+        let parsed = parse_conflict_markers(text);
+        assert_eq!(parsed.ours, text);
+        assert_eq!(parsed.theirs, text);
+        assert!(parsed.chunks.is_empty());
+    }
+
+    #[test]
+    fn crlf_content_is_preserved_byte_for_byte() {
+        let text = "a\r\n<<<<<<< HEAD\r\nx\r\n=======\r\ny\r\n>>>>>>> branch\r\nz\r\n";
+        let parsed = parse_conflict_markers(text);
+        // 行内 \r 与尾部空行原样保留,merge 保存不重写行尾
+        assert_eq!(parsed.ours, "a\r\nx\r\nz\r\n");
+        assert_eq!(parsed.theirs, "a\r\ny\r\nz\r\n");
+        assert_eq!(parsed.chunks[0].ours_text, "x\r");
+    }
+
+    #[test]
+    fn orphan_separator_is_kept_in_both_sides() {
+        let text = "a\n=======\nb";
+        let parsed = parse_conflict_markers(text);
+        assert_eq!(parsed.ours, text);
+        assert_eq!(parsed.theirs, text);
+        assert!(parsed.chunks.is_empty());
+    }
+
+    #[test]
+    fn local_branches_sort_by_rank_then_ci_name() {
+        let mk = |name: &str, current: bool, remote: bool| GitBranch {
+            name: name.to_string(),
+            current,
+            remote,
+            ahead: 0,
+            behind: 0,
+            tracking: None,
+            upstream_gone: false,
+        };
+        let mut branches = [
+            mk("Zeta", false, false),
+            mk("alpha", false, false),
+            mk("main", false, false),
+            mk("feature/x", true, false),
+            mk("origin/beta", false, true),
+            mk("origin/Alpha", false, true),
+        ];
+        branches.sort_by(|a, b| {
+            a.remote
+                .cmp(&b.remote)
+                .then_with(|| branch_rank(a).cmp(&branch_rank(b)))
+                .then_with(|| ci_cmp(&a.name, &b.name))
+        });
+        let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["feature/x", "main", "alpha", "Zeta", "origin/Alpha", "origin/beta"]
+        );
+    }
 }

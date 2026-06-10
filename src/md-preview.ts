@@ -1,14 +1,8 @@
-import { marked } from "marked";
-import { readFile } from "./tauri-api";
+import { readFile, renderMarkdown } from "./tauri-api";
 
-const renderer = new marked.Renderer();
-renderer.code = ({ text, lang }: { text: string; lang?: string }) => {
-  const cls = lang ? ` class="language-${lang}"` : "";
-  const escaped = text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  return `<pre><code${cls}>${escaped}</code></pre>`;
-};
-
-marked.setOptions({ renderer, breaks: false, gfm: true });
+// 渲染已迁入 Rust(comrak,GFM 扩展对齐原 marked gfm:true / breaks:false 配置)。
+// 真异步 IPC 下两次在飞的渲染可能乱序返回,用单调递增 seq 保证旧结果不覆盖新结果。
+let renderSeq = 0;
 
 let previewEl: HTMLElement;
 let splitHandle: HTMLElement;
@@ -57,7 +51,9 @@ export function isMdPreviewActive(): boolean {
 
 export async function showMdPreview(filePath: string, content?: string) {
   const text = content ?? await readFile(filePath);
-  const html = await marked.parse(text);
+  const seq = ++renderSeq;
+  const html = await renderMarkdown(text);
+  if (seq !== renderSeq) return;
   previewEl.innerHTML = `<div class="md-body">${html}</div>`;
 
   editorArea.classList.add("md-split-active");
@@ -88,7 +84,9 @@ export function toggleMdPreview(filePath: string, content?: string) {
 
 export async function refreshMdPreview(content: string) {
   if (!active) return;
-  const html = await marked.parse(content);
+  const seq = ++renderSeq;
+  const html = await renderMarkdown(content);
+  if (seq !== renderSeq) return;
   const scrollTop = previewEl.scrollTop;
   previewEl.innerHTML = `<div class="md-body">${html}</div>`;
   previewEl.scrollTop = scrollTop;

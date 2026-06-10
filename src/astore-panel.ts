@@ -317,9 +317,8 @@ function setStatus(text: string) {
 }
 
 async function getGitRemoteUrl(): Promise<string> {
-  let url = await gitRemoteUrl(currentProjectPath);
-  url = url.trim().replace(":", "/").replace("git@", "http://");
-  return url;
+  // URL 规范化已迁入 Rust(astore_sync_code 入口统一处理)
+  return gitRemoteUrl(currentProjectPath);
 }
 
 async function getGitBranch(): Promise<string> {

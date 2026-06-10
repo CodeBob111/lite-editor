@@ -37,6 +37,13 @@ pub(crate) async fn on_worker<T: Send + 'static>(
         .map_err(|e| format!("Task failed: {}", e))?
 }
 
+/// 大小写不敏感字典序(近似前端 localeCompare 的 ASCII 行为),原串 tie-break
+pub(crate) fn ci_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    a.to_lowercase()
+        .cmp(&b.to_lowercase())
+        .then_with(|| a.cmp(b))
+}
+
 // ---- File tree ----
 
 #[derive(Serialize, Clone)]
@@ -692,37 +699,23 @@ pub fn run_maven_command(
     Ok(())
 }
 
-#[derive(Serialize, Clone)]
-pub struct MavenCollectResult {
-    pub exit_code: i32,
-    pub output: String,
+// ---- Markdown 渲染(md 预览用) ----
+// 自前端 marked 迁入(comrak,GFM 扩展对齐 marked gfm:true;不开硬换行 = breaks:false)。
+
+fn markdown_to_html(text: &str) -> String {
+    let mut options = comrak::Options::default();
+    options.extension.autolink = true;
+    options.extension.table = true;
+    options.extension.strikethrough = true;
+    options.extension.tasklist = true;
+    // 沿用 marked 的原始 HTML 透传现状(本地文件预览,信任模型不变)
+    options.render.r#unsafe = true;
+    comrak::markdown_to_html(text, &options)
 }
 
 #[tauri::command]
-pub async fn run_maven_collect(
-    project_path: String,
-    goals: Vec<String>,
-) -> Result<MavenCollectResult, String> {
-    tokio::task::spawn_blocking(move || {
-        let result = Command::new("mvn")
-            .args(&goals)
-            .current_dir(&project_path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("Failed to run mvn: {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&result.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&result.stderr).to_string();
-        let output = if stderr.is_empty() { stdout } else { format!("{}\n{}", stdout, stderr) };
-
-        Ok(MavenCollectResult {
-            exit_code: result.status.code().unwrap_or(-1),
-            output,
-        })
-    })
-    .await
-    .map_err(|e| format!("Task failed: {}", e))?
+pub async fn render_markdown(text: String) -> Result<String, String> {
+    on_worker(move || Ok(markdown_to_html(&text))).await
 }
 
 #[cfg(test)]
@@ -767,5 +760,25 @@ mod tests {
         assert_eq!(results[0].line, 0);
         assert_eq!(results[0].column, 6); // "const Foo" 中 Foo 的字节偏移
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn markdown_render_matches_marked_gfm_behavior() {
+        // fenced code:语言 class + HTML 转义(对齐原 marked 自定义 renderer)
+        let html = markdown_to_html("```rust\nlet a = 1 < 2;\n```\n");
+        assert!(html.contains("<pre><code class=\"language-rust\">"), "html: {}", html);
+        assert!(html.contains("1 &lt; 2"));
+        // GFM autolink:裸 URL 可点
+        let html = markdown_to_html("see https://example.com/x\n");
+        assert!(html.contains("<a href=\"https://example.com/x\""), "html: {}", html);
+        // GFM 表格
+        let html = markdown_to_html("| a | b |\n| - | - |\n| 1 | 2 |\n");
+        assert!(html.contains("<table>"));
+        // 原始 HTML 透传(marked 默认不消毒,行为保持)
+        let html = markdown_to_html("<div class=\"x\">hi</div>\n");
+        assert!(html.contains("<div class=\"x\">hi</div>"));
+        // 软换行不转 <br>(对齐 breaks:false)
+        let html = markdown_to_html("line1\nline2\n");
+        assert!(!html.contains("<br"));
     }
 }

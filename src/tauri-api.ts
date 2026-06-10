@@ -115,6 +115,12 @@ export async function listAllFiles(projectPath: string): Promise<string[]> {
   return invoke<string[]>("list_all_files", { projectPath });
 }
 
+// ---- Markdown ----
+
+export async function renderMarkdown(text: string): Promise<string> {
+  return invoke<string>("render_markdown", { text });
+}
+
 // ---- Maven ----
 
 export async function parseMavenModules(projectPath: string): Promise<MavenModule[]> {
@@ -125,13 +131,67 @@ export async function runMavenCommand(projectPath: string, goals: string[]): Pro
   return invoke<void>("run_maven_command", { projectPath, goals });
 }
 
-export interface MavenCollectResult {
-  exit_code: number;
-  output: string;
+export interface DepCoordRef {
+  group_id: string;
+  artifact_id: string;
 }
 
-export async function runMavenCollect(projectPath: string, goals: string[]): Promise<MavenCollectResult> {
-  return invoke<MavenCollectResult>("run_maven_collect", { projectPath, goals });
+export interface DepNode {
+  group_id: string;
+  artifact_id: string;
+  type: string;
+  version: string;
+  scope: string;
+  omitted_for?: string;
+  direct_parent?: DepCoordRef;
+  children: DepNode[];
+}
+
+export interface MavenConflictNode {
+  group_id: string;
+  artifact_id: string;
+  version: string;
+  scope: string;
+  omitted_for?: string;
+  dep_path: string[];
+  direct_parent?: DepCoordRef;
+}
+
+export interface MavenConflict {
+  group_id: string;
+  artifact_id: string;
+  versions: string[];
+  nodes: MavenConflictNode[];
+}
+
+export interface MavenFlatDep {
+  group_id: string;
+  artifact_id: string;
+  version: string;
+  scope: string;
+  is_conflict: boolean;
+  omitted_for?: string;
+}
+
+export interface MavenDepTree {
+  exit_code: number;
+  root: DepNode | null;
+  conflicts: MavenConflict[];
+  flat: MavenFlatDep[];
+}
+
+export async function mavenDependencyTree(projectPath: string): Promise<MavenDepTree> {
+  return invoke<MavenDepTree>("maven_dependency_tree", { projectPath });
+}
+
+export async function mavenAddExclusion(
+  pomPath: string,
+  parentGroupId: string, parentArtifactId: string,
+  excludeGroupId: string, excludeArtifactId: string,
+): Promise<void> {
+  return invoke<void>("maven_add_exclusion", {
+    pomPath, parentGroupId, parentArtifactId, excludeGroupId, excludeArtifactId,
+  });
 }
 
 export function onMavenOutput(callback: (line: string) => void): Promise<UnlistenFn> {
@@ -404,6 +464,25 @@ export interface MergeResult {
 
 export async function gitMerge(cwd: string, branch: string): Promise<MergeResult> {
   return invoke<MergeResult>("git_merge", { cwd, branch });
+}
+
+export interface ConflictChunk {
+  ours_start: number;
+  ours_end: number;
+  theirs_start: number;
+  theirs_end: number;
+  ours_text: string;
+  theirs_text: string;
+}
+
+export interface ConflictParse {
+  ours: string;
+  theirs: string;
+  chunks: ConflictChunk[];
+}
+
+export async function parseConflictFile(path: string): Promise<ConflictParse> {
+  return invoke<ConflictParse>("parse_conflict_file", { path });
 }
 
 export async function gitMergeConflicts(cwd: string): Promise<string[]> {
