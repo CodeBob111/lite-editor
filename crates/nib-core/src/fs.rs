@@ -6,11 +6,11 @@ use std::path::Path;
 
 #[derive(Serialize, Clone)]
 pub struct FileNode {
-    name: String,
-    path: String,
+    pub name: String,
+    pub path: String,
     #[serde(rename = "isDir")]
-    is_dir: bool,
-    children: Option<Vec<FileNode>>,
+    pub is_dir: bool,
+    pub children: Option<Vec<FileNode>>,
 }
 
 pub async fn read_dir_tree(path: String, max_depth: Option<usize>) -> Result<FileNode, String> {
