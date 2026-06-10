@@ -2,6 +2,7 @@
 // 性能纪律(RFC v2 §5):主线程零阻塞 IO——目录遍历/读写文件全部经 nib-core
 // 自持 runtime,结果回主线程更新实体;异步回灌一律带陈旧守卫。
 
+mod astore_panel;
 mod diff_view;
 mod git_panel;
 mod maven_panel;
@@ -28,6 +29,7 @@ use gpui_component::{
 
 use futures::StreamExt as _;
 use diff_view::{DiffView, DiffViewEvent};
+use astore_panel::AstorePanel;
 use git_panel::{GitPanel, GitPanelEvent};
 use maven_panel::MavenPanel;
 use quick_open::{QuickOpen, QuickOpenEvent};
@@ -125,6 +127,7 @@ enum SidebarView {
     Files,
     Git,
     Maven,
+    Astore,
 }
 
 struct Workbench {
@@ -132,6 +135,7 @@ struct Workbench {
     sidebar_view: SidebarView,
     git_panel: Entity<GitPanel>,
     maven_panel: Entity<MavenPanel>,
+    astore_panel: Entity<AstorePanel>,
     _git_sub: Subscription,
     window_handle: AnyWindowHandle,
     project_root: PathBuf,
@@ -185,6 +189,7 @@ impl Workbench {
 
         let git_panel = cx.new(|cx| GitPanel::new(root.clone(), window, cx));
         let maven_panel = cx.new(|cx| MavenPanel::new(root.clone(), cx));
+        let astore_panel = cx.new(|cx| AstorePanel::new(root.clone(), window, cx));
         let git_sub = cx.subscribe(
             &git_panel,
             |this: &mut Workbench, _, event: &GitPanelEvent, cx| match event {
@@ -219,6 +224,7 @@ impl Workbench {
             sidebar_view: SidebarView::Files,
             git_panel,
             maven_panel,
+            astore_panel,
             _git_sub: git_sub,
             window_handle: window.window_handle(),
             project_root: root.clone(),
@@ -320,6 +326,8 @@ impl Workbench {
         self.git_panel
             .update(cx, |panel, cx| panel.set_project(git_root.clone(), cx));
         self.maven_panel
+            .update(cx, |panel, cx| panel.set_project(git_root.clone(), cx));
+        self.astore_panel
             .update(cx, |panel, cx| panel.set_project(git_root, cx));
 
         // quick-open 文件清单预载
@@ -1205,6 +1213,7 @@ impl Render for Workbench {
                                         SidebarView::Files => 0,
                                         SidebarView::Git => 1,
                                         SidebarView::Maven => 2,
+                                        SidebarView::Astore => 3,
                                     })
                                     .on_click(cx.listener(|this, ix: &usize, _, cx| {
                                         this.sidebar_view = match *ix {
@@ -1214,13 +1223,15 @@ impl Render for Workbench {
                                                 SidebarView::Git
                                             }
                                             2 => SidebarView::Maven,
+                                            3 => SidebarView::Astore,
                                             _ => SidebarView::Files,
                                         };
                                         cx.notify();
                                     }))
                                     .child(Tab::new().label("文件"))
                                     .child(Tab::new().label("Git"))
-                                    .child(Tab::new().label("Maven")),
+                                    .child(Tab::new().label("Maven"))
+                                    .child(Tab::new().label("Astore")),
                             )
                             .child(div().flex_1().min_h_0().map(|this| {
                                 match self.sidebar_view {
@@ -1228,6 +1239,7 @@ impl Render for Workbench {
                                         .child(tree(&self.tree_state, Self::render_tree_item)),
                                     SidebarView::Git => this.child(self.git_panel.clone()),
                                     SidebarView::Maven => this.child(self.maven_panel.clone()),
+                                    SidebarView::Astore => this.child(self.astore_panel.clone()),
                                 }
                             })),
                     )
