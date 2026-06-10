@@ -1,6 +1,6 @@
 mod astore;
 pub mod clipboard;
-mod commands;
+pub mod commands;
 pub mod git;
 mod java_index;
 mod usage_index;

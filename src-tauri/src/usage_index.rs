@@ -415,6 +415,32 @@ mod tests {
     }
 
     #[test]
+    fn token_table_stays_small_across_many_files() {
+        // 内存有界性的可断言代理:300 个文件共享同一批符号时,全局 token 表
+        // 只存一份文本(≈ 唯一符号数),而不是 300 × 每文件符号数。
+        let dir = std::env::temp_dir().join(format!("usage_idx_scale_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body: String = (0..40).map(|i| format!("  sharedSymbol{}();\n", i)).collect();
+        let mut files = Vec::new();
+        for i in 0..300 {
+            let f = dir.join(format!("C{}.java", i));
+            std::fs::write(&f, format!("class C{} {{\n{}}}\n", i, body)).unwrap();
+            files.push(f);
+        }
+
+        let idx = build(&files, None);
+        assert_eq!(idx.files.len(), 300);
+        // 词汇表 = 40 个共享符号 + 300 个类名,远小于「按文件重复存」的 300×41
+        assert!(
+            idx.tokens.len() <= 40 + 300 + 10,
+            "token 表未去重: {} 项",
+            idx.tokens.len()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn serde_roundtrip_works_as_incremental_base() {
         let dir = std::env::temp_dir().join(format!("usage_idx_serde_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
