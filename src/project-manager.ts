@@ -129,9 +129,12 @@ export async function addProject(folderPath: string) {
   try {
     const tree = await readDirTree(folderPath);
     newProject.treeRoot = tree;
-    _fileTree.setRoot(tree);
-    astoreProjectChanged(folderPath);
-    document.title = `${name} — Nib`;
+    // await 期间用户可能切走;切走则只缓存树,不回灌可见 UI,避免盖掉新激活项目。
+    if (app.currentProjectPath === folderPath) {
+      _fileTree.setRoot(tree);
+      astoreProjectChanged(folderPath);
+      document.title = `${name} — Nib`;
+    }
 
     autoStartLsp(folderPath);
     loadMavenModules(folderPath);
@@ -462,6 +465,8 @@ export async function refreshTree() {
 
 async function doRefreshTree() {
   if (!app.currentProjectPath) return;
+  // readDirTree 是异步 IPC,大仓库可能耗时数秒;捕获发起时的项目,期间用户可能切走。
+  const pathAtStart = app.currentProjectPath;
   const project = currentProject();
   try {
     const expandedPaths = new Set<string>();
@@ -469,15 +474,19 @@ async function doRefreshTree() {
     // setRoot→rebuild 会把滚动位置重置到顶部,删除/新建后记下并还原,避免展开的子树滚出视野。
     const scrollTop = _fileTree.getScrollTop();
 
-    const tree = await readDirTree(app.currentProjectPath, 4);
+    const tree = await readDirTree(pathAtStart, 4);
     requestAnimationFrame(() => {
       if (expandedPaths.size > 0) applyExpandedPaths(tree, expandedPaths);
+      // 缓存读到的是 pathAtStart 项目自己的树,无论是否仍激活都该回写,利于切回时直接复用。
       if (project) {
         project.treeRoot = tree;
         project.allFilePathsCache = null;
       }
-      _fileTree.setRoot(tree);
-      _fileTree.setScrollTop(scrollTop);
+      // 只有 pathAtStart 仍是当前项目时才回灌可见文件树,否则会把已切换走的旧项目树盖回来。
+      if (app.currentProjectPath === pathAtStart) {
+        _fileTree.setRoot(tree);
+        _fileTree.setScrollTop(scrollTop);
+      }
     });
   } catch {
     // ignore refresh failures
