@@ -4,6 +4,7 @@
 
 mod diff_view;
 mod git_panel;
+mod usages_view;
 mod quick_open;
 mod search_panel;
 mod session;
@@ -29,6 +30,7 @@ use diff_view::{DiffView, DiffViewEvent};
 use git_panel::{GitPanel, GitPanelEvent};
 use quick_open::{QuickOpen, QuickOpenEvent};
 use search_panel::{SearchEvent, SearchPanel};
+use usages_view::{UsagesEvent, UsagesView};
 
 actions!(
     nib,
@@ -42,6 +44,8 @@ actions!(
         PaletteDismiss,
         OpenFolder,
         GotoDefinition,
+        FindUsages,
+        PaletteConfirm,
         Quit
     ]
 );
@@ -96,6 +100,7 @@ enum Overlay {
     QuickOpen(Entity<QuickOpen>),
     Search(Entity<SearchPanel>),
     Diff(Entity<DiffView>),
+    Usages(Entity<UsagesView>),
 }
 
 struct OpenTab {
@@ -793,6 +798,72 @@ impl Workbench {
         .detach();
     }
 
+    /// Shift+F12 查引用:core lsp_find_references → 浮层列表
+    fn on_find_usages(&mut self, _: &FindUsages, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active() else { return };
+        if tab.lang != "java" {
+            return;
+        }
+        let pos = tab.editor.read(cx).cursor_position();
+        let file = tab.path.to_string_lossy().to_string();
+        let title = tab.title.to_string();
+        let lsp = self.lsp.clone();
+        let window_handle = self.window_handle;
+        self.status = "查找引用…".into();
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let result =
+                nib_core::lsp::lsp_find_references(file, pos.line, pos.character, &lsp).await;
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                    match result {
+                        Ok(usages) if !usages.is_empty() => {
+                            this.status = format!("{} 处引用", usages.len()).into();
+                            let view = cx.new(|_| UsagesView::new(title.clone(), usages));
+                            let sub = cx.subscribe_in(
+                                &view,
+                                window,
+                                |this: &mut Workbench,
+                                 _,
+                                 event: &UsagesEvent,
+                                 window,
+                                 cx| match event {
+                                    UsagesEvent::Open {
+                                        path,
+                                        line,
+                                        character,
+                                    } => {
+                                        let (path, line, character) =
+                                            (path.clone(), *line, *character);
+                                        this.close_palette(window, cx);
+                                        this.open_file_at(path, line, character, window, cx);
+                                    }
+                                },
+                            );
+                            this.overlay = Some(Overlay::Usages(view));
+                            this._overlay_sub = Some(sub);
+                        }
+                        Ok(_) => this.status = "未找到引用".into(),
+                        Err(err) => this.status = format!("查找失败: {}", err).into(),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn on_palette_confirm(
+        &mut self,
+        _: &PaletteConfirm,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(Overlay::Usages(view)) = &self.overlay {
+            view.update(cx, |view, cx| view.confirm(cx));
+        }
+    }
+
     fn on_open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -922,6 +993,7 @@ impl Workbench {
         match &self.overlay {
             Some(Overlay::QuickOpen(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
             Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
+            Some(Overlay::Usages(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
             Some(Overlay::Diff(_)) | None => {}
         }
     }
@@ -930,6 +1002,7 @@ impl Workbench {
         match &self.overlay {
             Some(Overlay::QuickOpen(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
             Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
+            Some(Overlay::Usages(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
             Some(Overlay::Diff(_)) | None => {}
         }
     }
@@ -1021,6 +1094,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_toggle_search))
             .on_action(cx.listener(Self::on_open_folder))
             .on_action(cx.listener(Self::on_goto_definition))
+            .on_action(cx.listener(Self::on_find_usages))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
             .child(
@@ -1142,6 +1216,7 @@ impl Render for Workbench {
                     Overlay::QuickOpen(p) => p.clone().into_any_element(),
                     Overlay::Search(p) => p.clone().into_any_element(),
                     Overlay::Diff(p) => p.clone().into_any_element(),
+                    Overlay::Usages(p) => p.clone().into_any_element(),
                 };
                 this.child(
                     div()
@@ -1154,6 +1229,7 @@ impl Render for Workbench {
                         .on_action(cx.listener(Self::on_palette_up))
                         .on_action(cx.listener(Self::on_palette_down))
                         .on_action(cx.listener(Self::on_palette_dismiss))
+                        .on_action(cx.listener(Self::on_palette_confirm))
                         .child(div().mt(px(110.)).child(content)),
                 )
             })
@@ -1194,6 +1270,7 @@ fn main() {
                 MenuItem::action("快速打开文件…", ToggleQuickOpen),
                 MenuItem::action("在项目中搜索…", ToggleSearch),
                 MenuItem::action("跳转到定义", GotoDefinition),
+                MenuItem::action("查找引用", FindUsages),
             ]),
         ]);
 
@@ -1201,6 +1278,8 @@ fn main() {
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-o", OpenFolder, Some("Workbench")),
             KeyBinding::new("f12", GotoDefinition, Some("Workbench")),
+            KeyBinding::new("shift-f12", FindUsages, Some("Workbench")),
+            KeyBinding::new("enter", PaletteConfirm, Some("QuickOpen")),
             KeyBinding::new("cmd-s", SaveFile, Some("Workbench")),
             KeyBinding::new("cmd-w", CloseTab, Some("Workbench")),
             KeyBinding::new("cmd-p", ToggleQuickOpen, Some("Workbench")),
