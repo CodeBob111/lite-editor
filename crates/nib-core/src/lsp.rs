@@ -4,8 +4,10 @@ use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::path::PathBuf;
 use std::time::Duration;
-use tauri::{Emitter, State};
+
+use crate::events::{CoreEvent, EventSink};
 
 #[derive(Default)]
 pub struct LspState {
@@ -54,12 +56,12 @@ pub struct LspUsage {
 
 // ---- Tauri commands ----
 
-#[tauri::command]
 pub async fn start_lsp(
     language: String,
     root_path: String,
-    app: tauri::AppHandle,
-    state: State<'_, LspState>,
+    events: Arc<dyn EventSink>,
+    jdtls_root: PathBuf,
+    state: &LspState,
 ) -> Result<(), String> {
     let key = (language.clone(), root_path.clone());
 
@@ -78,9 +80,8 @@ pub async fn start_lsp(
 
     let lang = language.clone();
     let rp = root_path.clone();
-    let app_handle = app.clone();
-    let server = tokio::task::spawn_blocking(move || {
-        start_lsp_blocking(lang, rp, app_handle)
+    let server = crate::rt::spawn_blocking(move || {
+        start_lsp_blocking(lang, rp, events, jdtls_root)
     })
     .await
     .map_err(|e| format!("Task failed: {}", e))??;
@@ -93,7 +94,8 @@ pub async fn start_lsp(
 fn start_lsp_blocking(
     language: String,
     root_path: String,
-    app: tauri::AppHandle,
+    events: Arc<dyn EventSink>,
+    jdtls_root: PathBuf,
 ) -> Result<LspServer, String> {
     let jdtls_data_dir;
     let (cmd, args): (&str, Vec<String>) = match language.as_str() {
@@ -101,11 +103,7 @@ fn start_lsp_blocking(
         "typescript" | "javascript" => ("typescript-language-server", vec!["--stdio".into()]),
         "java" => {
             let hash = root_path.replace('/', "_");
-            jdtls_data_dir = format!(
-                "{}/Library/Caches/lite-editor/jdtls/{}",
-                std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
-                hash
-            );
+            jdtls_data_dir = jdtls_root.join(hash).to_string_lossy().to_string();
             let _ = std::fs::create_dir_all(&jdtls_data_dir);
             ("jdtls", vec![
                 "--jvm-arg=-Xmx1536m".into(),
@@ -172,7 +170,7 @@ fn start_lsp_blocking(
     let ready_flag = Arc::new(AtomicBool::new(false));
     let ready_clone = ready_flag.clone();
     let lang_clone = language.clone();
-    let app_handle = app.clone();
+    let events_for_reader = events;
     let stdin_for_reader = Arc::new(Mutex::new(std::io::BufWriter::new(stdin)));
     let stdin_for_server = stdin_for_reader.clone();
 
@@ -258,7 +256,8 @@ fn start_lsp_blocking(
                         match method.as_str() {
                             "textDocument/publishDiagnostics" => {
                                 if let Some(params) = msg.get("params") {
-                                    let _ = app_handle.emit("lsp-diagnostics", params.clone());
+                                    events_for_reader
+                                        .emit(CoreEvent::LspDiagnostics(params.clone()));
                                 }
                             }
                             "$/progress" => {
@@ -271,15 +270,12 @@ fn start_lsp_blocking(
                                     let percentage =
                                         value.get("percentage").and_then(|p| p.as_u64());
 
-                                    let _ = app_handle.emit(
-                                        "lsp-progress",
-                                        serde_json::json!({
-                                            "language": lang_clone,
-                                            "kind": kind,
-                                            "message": message,
-                                            "percentage": percentage,
-                                        }),
-                                    );
+                                    events_for_reader.emit(CoreEvent::LspProgress {
+                                        language: lang_clone.clone(),
+                                        kind: kind.to_string(),
+                                        message: message.to_string(),
+                                        percentage,
+                                    });
 
                                     if kind == "end" {
                                         ready_clone.store(true, Ordering::Relaxed);
@@ -374,11 +370,10 @@ fn start_lsp_blocking(
     Ok(server)
 }
 
-#[tauri::command]
 pub async fn stop_lsp(
     language: String,
     root_path: String,
-    state: State<'_, LspState>,
+    state: &LspState,
 ) -> Result<(), String> {
     let server = {
         let mut servers = state.servers.lock().map_err(|e| e.to_string())?;
@@ -386,7 +381,7 @@ pub async fn stop_lsp(
     };
     if let Some(server) = server {
         // shutdown 握手最长等 3s:放到阻塞线程池,不能让调用方(主线程)跟着等。
-        let _ = tokio::task::spawn_blocking(move || {
+        let _ = crate::rt::spawn_blocking(move || {
             let id = server.next_id.fetch_add(1, Ordering::Relaxed);
             let _ = request_and_wait(
                 &server,
@@ -406,8 +401,7 @@ pub async fn stop_lsp(
     Ok(())
 }
 
-#[tauri::command]
-pub fn lsp_is_ready(file_path: String, state: State<'_, LspState>) -> Result<bool, String> {
+pub fn lsp_is_ready(file_path: String, state: &LspState) -> Result<bool, String> {
     let lang = detect_language(&file_path);
     let server = {
         let servers = state.servers.lock().map_err(|e| e.to_string())?;
@@ -421,19 +415,18 @@ pub fn lsp_is_ready(file_path: String, state: State<'_, LspState>) -> Result<boo
 
 // didOpen/didChange 往 LSP stdin 写整份文件内容:jdtls 忙(索引中)不读管道时,
 // 64K 管道缓冲一满 write 就阻塞——必须离开主线程。
-#[tauri::command]
 pub async fn lsp_did_open(
     file_path: String,
     language_id: String,
     content: String,
-    state: State<'_, LspState>,
+    state: &LspState,
 ) -> Result<(), String> {
     let server = {
         let servers = state.servers.lock().map_err(|e| e.to_string())?;
         find_server_for_file(&servers, &file_path, &language_id)?
     };
 
-    tokio::task::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         let params = serde_json::json!({
             "textDocument": {
                 "uri": format!("file://{}", file_path),
@@ -448,11 +441,10 @@ pub async fn lsp_did_open(
     .map_err(|e| format!("Task failed: {}", e))?
 }
 
-#[tauri::command]
 pub async fn lsp_did_change(
     file_path: String,
     content: String,
-    state: State<'_, LspState>,
+    state: &LspState,
 ) -> Result<(), String> {
     let lang = detect_language(&file_path);
     let server = {
@@ -463,7 +455,7 @@ pub async fn lsp_did_change(
         }
     };
 
-    tokio::task::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         let params = serde_json::json!({
             "textDocument": {
                 "uri": format!("file://{}", file_path),
@@ -477,12 +469,11 @@ pub async fn lsp_did_change(
     .map_err(|e| format!("Task failed: {}", e))?
 }
 
-#[tauri::command]
 pub async fn lsp_find_references(
     file_path: String,
     line: u32,
     character: u32,
-    state: State<'_, LspState>,
+    state: &LspState,
 ) -> Result<Vec<LspUsage>, String> {
     let lang = detect_language(&file_path);
     let server = {
@@ -508,12 +499,11 @@ pub async fn lsp_find_references(
     parse_locations(response)
 }
 
-#[tauri::command]
 pub async fn lsp_goto_definition(
     file_path: String,
     line: u32,
     character: u32,
-    state: State<'_, LspState>,
+    state: &LspState,
 ) -> Result<Option<LspUsage>, String> {
     let lang = detect_language(&file_path);
     let server = {
@@ -542,10 +532,9 @@ pub async fn lsp_goto_definition(
 /// 返回整份文档的符号树(textDocument/documentSymbol)的原始 LSP result,
 /// 前端据此按 range 命中找到光标所在的方法(像 IDEA 用 PSI 那样结构化解析,
 /// 不靠正则猜方法名)。jdtls 返回层级化的 DocumentSymbol[]。
-#[tauri::command]
 pub async fn lsp_document_symbols(
     file_path: String,
-    state: State<'_, LspState>,
+    state: &LspState,
 ) -> Result<serde_json::Value, String> {
     let lang = detect_language(&file_path);
     let server = {
@@ -780,7 +769,7 @@ async fn request_and_wait_on_worker(
     params: serde_json::Value,
     timeout: Duration,
 ) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         request_and_wait(&server, id, method, params, timeout)
     })
     .await
@@ -840,14 +829,19 @@ pub struct DecompiledClass {
     pub content: String,
 }
 
-#[tauri::command]
-pub async fn find_class_in_maven(fqn: String) -> Result<Option<DecompiledClass>, String> {
-    tokio::task::spawn_blocking(move || find_class_in_maven_blocking(&fqn))
+pub async fn find_class_in_maven(
+    fqn: String,
+    decompiled_dir: PathBuf,
+) -> Result<Option<DecompiledClass>, String> {
+    crate::rt::spawn_blocking(move || find_class_in_maven_blocking(&fqn, &decompiled_dir))
         .await
         .map_err(|e| format!("Task failed: {}", e))?
 }
 
-fn find_class_in_maven_blocking(fqn: &str) -> Result<Option<DecompiledClass>, String> {
+fn find_class_in_maven_blocking(
+    fqn: &str,
+    decompiled_dir: &std::path::Path,
+) -> Result<Option<DecompiledClass>, String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
     let m2_repo = format!("{}/.m2/repository", home);
     let class_path = fqn.replace('.', "/") + ".class";
@@ -856,7 +850,7 @@ fn find_class_in_maven_blocking(fqn: &str) -> Result<Option<DecompiledClass>, St
     if let Some(jar_path) = &source_jar {
         let java_path = fqn.replace('.', "/") + ".java";
         if let Ok(content) = extract_from_jar(jar_path, &java_path) {
-            let cache_dir = format!("{}/Library/Caches/lite-editor/decompiled", home);
+            let cache_dir = decompiled_dir.to_string_lossy().to_string();
             let _ = std::fs::create_dir_all(&cache_dir);
             let file_name = fqn.split('.').next_back().unwrap_or("Unknown");
             let cache_path = format!("{}/{}.java", cache_dir, file_name);
@@ -871,7 +865,7 @@ fn find_class_in_maven_blocking(fqn: &str) -> Result<Option<DecompiledClass>, St
     let class_jar = find_class_jar(&m2_repo, &class_path);
     if let Some(jar_path) = class_jar {
         if let Ok(content) = decompile_class(&jar_path, fqn) {
-            let cache_dir = format!("{}/Library/Caches/lite-editor/decompiled", home);
+            let cache_dir = decompiled_dir.to_string_lossy().to_string();
             let _ = std::fs::create_dir_all(&cache_dir);
             let file_name = fqn.split('.').next_back().unwrap_or("Unknown");
             let cache_path = format!("{}/{}.java", cache_dir, file_name);
@@ -884,7 +878,7 @@ fn find_class_in_maven_blocking(fqn: &str) -> Result<Option<DecompiledClass>, St
     }
 
     if let Some(content) = find_class_in_jdk_src(fqn) {
-        let cache_dir = format!("{}/Library/Caches/lite-editor/decompiled", home);
+        let cache_dir = decompiled_dir.to_string_lossy().to_string();
         let _ = std::fs::create_dir_all(&cache_dir);
         let file_name = fqn.split('.').next_back().unwrap_or("Unknown");
         let cache_path = format!("{}/{}.java", cache_dir, file_name);

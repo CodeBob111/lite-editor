@@ -2,8 +2,9 @@
 // 60 个混合命令(文件读 / git status / 项目搜索)同时打满,断言全部正确完成
 // 且总耗时有界:任何一处引入锁顺序死锁、锁中毒或串行化瓶颈,这里会超时/失败。
 
-use lite_editor_lib::commands::{read_file, search_in_files};
-use lite_editor_lib::git::git_status;
+use nib_core::fs::read_file;
+use nib_core::search::search_in_files;
+use nib_core::git::git_status;
 use std::time::{Duration, Instant};
 
 fn run(cwd: &std::path::Path, args: &[&str]) {

@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
-use tauri::State;
 use walkdir::WalkDir;
 
 #[derive(Default)]
@@ -87,13 +86,9 @@ pub struct Usage {
 // 旧版磁盘缓存反序列化失败或版本不符都会被丢弃,触发一次全量重建。
 const INDEX_VERSION: u32 = 2;
 
-fn cache_path(project_path: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+fn cache_path(cache_dir: &Path, project_path: &str) -> PathBuf {
     let hash = project_path.replace('/', "_");
-    PathBuf::from(format!(
-        "{}/Library/Caches/lite-editor/usage-index/{}.json",
-        home, hash
-    ))
+    cache_dir.join(format!("{}.json", hash))
 }
 
 fn file_modified_secs(path: &Path) -> u64 {
@@ -203,14 +198,14 @@ fn build(files: &[PathBuf], old: Option<&UsageIndex>) -> UsageIndex {
     index
 }
 
-#[tauri::command]
 pub async fn build_usage_index(
     project_path: String,
-    state: State<'_, UsageIndexState>,
+    cache_dir: PathBuf,
+    state: &UsageIndexState,
 ) -> Result<u32, String> {
     let pp = project_path.clone();
-    let index = tokio::task::spawn_blocking(move || {
-        let cp = cache_path(&pp);
+    let index = crate::rt::spawn_blocking(move || {
+        let cp = cache_path(&cache_dir, &pp);
         let old = if cp.exists() {
             std::fs::read_to_string(&cp)
                 .ok()
@@ -238,12 +233,11 @@ pub async fn build_usage_index(
     Ok(count)
 }
 
-#[tauri::command]
 pub async fn query_usages(
     project_path: String,
     symbol: String,
     limit: usize,
-    state: State<'_, UsageIndexState>,
+    state: &UsageIndexState,
 ) -> Result<Vec<Usage>, String> {
     // 锁内只收集命中 (file, line),随后释放锁再读文件文本,避免持锁做 I/O。
     let mut hits: Vec<(String, u32)> = Vec::new();
@@ -270,7 +264,7 @@ pub async fn query_usages(
     }
 
     // 命中行的文本要读一批文件:同步命令跑在主线程会卡 UI,搬到阻塞线程池。
-    tokio::task::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         hits.sort();
         let cap = if limit == 0 { usize::MAX } else { limit };
 
@@ -306,14 +300,13 @@ pub async fn query_usages(
 
 // 文件保存时:只重扫该文件、更新内存(不写盘——大索引逐次写盘太慢;
 // 下次构建/启动的 mtime 增量会把磁盘补齐)。
-#[tauri::command]
 pub async fn update_usage_index_file(
     project_path: String,
     file_path: String,
-    state: State<'_, UsageIndexState>,
+    state: &UsageIndexState,
 ) -> Result<(), String> {
     let fp = file_path.clone();
-    let scanned = tokio::task::spawn_blocking(move || {
+    let scanned = crate::rt::spawn_blocking(move || {
         let path = Path::new(&fp);
         if !path.exists() || path.extension().is_none_or(|e| e != "java") {
             return Ok(None);
@@ -334,11 +327,10 @@ pub async fn update_usage_index_file(
     Ok(())
 }
 
-#[tauri::command]
 pub fn remove_usage_index_file(
     project_path: String,
     file_path: String,
-    state: State<'_, UsageIndexState>,
+    state: &UsageIndexState,
 ) -> Result<(), String> {
     let mut indices = state.indices.lock().map_err(|e| e.to_string())?;
     if let Some(index) = indices.get_mut(&project_path) {

@@ -1,0 +1,3 @@
+# gpui 跟随 Zed 要求新近 stable;alacritty_terminal 0.26 要求 ≥1.85(RFC v2 §2 环境前提)
+[toolchain]
+channel = "stable"

@@ -1,4 +1,4 @@
-use lite_editor_lib::git::{git_pull_sync, parse_git_status, run_git_with_timeout};
+use nib_core::git::{git_pull_sync, parse_git_status, run_git_with_timeout};
 use std::time::{Duration, Instant};
 
 fn run(cwd: &std::path::Path, args: &[&str]) {

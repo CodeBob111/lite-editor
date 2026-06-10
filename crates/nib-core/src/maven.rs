@@ -6,10 +6,13 @@
 // 2. direct_parent = depth-1 直接依赖——TS findDirectParent off-by-one 返回 depth-0
 //    模块自身,exclude 在 pom 里搜模块自身 GAV 永远失败。
 
-use crate::commands::on_worker;
+use crate::events::{CoreEvent, EventSink};
+use crate::rt::on_worker;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::io::BufRead;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 #[derive(Serialize, Clone)]
 pub struct DepCoordRef {
@@ -349,7 +352,6 @@ pub(crate) fn build_dep_tree(exit_code: i32, output: &str) -> MavenDepTree {
     }
 }
 
-#[tauri::command]
 pub async fn maven_dependency_tree(project_path: String) -> Result<MavenDepTree, String> {
     on_worker(move || {
         let result = Command::new("mvn")
@@ -484,7 +486,6 @@ pub(crate) fn add_exclusion(
     Ok(lines.join("\n"))
 }
 
-#[tauri::command]
 pub async fn maven_add_exclusion(
     pom_path: String,
     parent_group_id: String,
@@ -731,4 +732,168 @@ mod tests {
         // 既有行的 \r 原样保留(join("\n") 不重写老行)
         assert!(updated.contains("<version>1.0</version>\r"));
     }
+}
+
+// ---- Maven 模块扫描与构建(自 src-tauri commands.rs 迁入,逻辑不变) ----
+
+#[derive(Serialize)]
+pub struct MavenModule {
+    name: String,
+    group_id: String,
+    artifact_id: String,
+    version: String,
+    packaging: String,
+    pom_path: String,
+    modules: Vec<String>,
+}
+
+pub async fn parse_maven_modules(project_path: String) -> Result<Vec<MavenModule>, String> {
+    on_worker(move || {
+        let mut modules = Vec::new();
+
+        for entry in walkdir::WalkDir::new(&project_path)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.file_name() == "pom.xml" {
+                if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                    if let Some(module) =
+                        parse_pom(&content, entry.path().to_string_lossy().to_string())
+                    {
+                        modules.push(module);
+                    }
+                }
+            }
+        }
+
+        Ok(modules)
+    })
+    .await
+}
+
+fn local_tag_name(raw: &[u8]) -> String {
+    let full = String::from_utf8_lossy(raw).to_string();
+    full.rsplit_once(':')
+        .map_or(full.clone(), |(_, local)| local.to_string())
+}
+
+fn parse_pom(content: &str, pom_path: String) -> Option<MavenModule> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(content);
+    let mut buf = Vec::new();
+    let mut current_tag = String::new();
+    let mut group_id = String::new();
+    let mut artifact_id = String::new();
+    let mut version = String::new();
+    let mut packaging = String::from("jar");
+    let mut child_modules = Vec::new();
+    let mut depth = 0;
+    let mut in_parent = false;
+    let mut in_modules = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                depth += 1;
+                let tag = local_tag_name(e.name().as_ref());
+                if tag == "parent" {
+                    in_parent = true;
+                }
+                if tag == "modules" {
+                    in_modules = true;
+                }
+                current_tag = tag;
+            }
+            Ok(Event::End(e)) => {
+                let tag = local_tag_name(e.name().as_ref());
+                if tag == "parent" {
+                    in_parent = false;
+                }
+                if tag == "modules" {
+                    in_modules = false;
+                }
+                depth -= 1;
+            }
+            Ok(Event::Text(e)) => {
+                let text = e.unescape().unwrap_or_default().trim().to_string();
+                if !in_parent && depth == 2 {
+                    match current_tag.as_str() {
+                        "groupId" => group_id = text.clone(),
+                        "artifactId" => artifact_id = text.clone(),
+                        "version" => version = text.clone(),
+                        "packaging" => packaging = text.clone(),
+                        _ => {}
+                    }
+                }
+                if in_modules && current_tag == "module" && !text.is_empty() {
+                    child_modules.push(text);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    if artifact_id.is_empty() {
+        return None;
+    }
+
+    Some(MavenModule {
+        name: artifact_id.clone(),
+        group_id,
+        artifact_id,
+        version,
+        packaging,
+        pom_path,
+        modules: child_modules,
+    })
+}
+
+/// 流式跑 mvn:stdout/stderr 逐行经 EventSink 推送,结束推 MavenDone。
+/// (低频构建场景;高频洪峰的批量收编是 UI 侧职责,见 RFC v2 §3)
+pub fn run_maven_command(
+    project_path: String,
+    goals: Vec<String>,
+    events: Arc<dyn EventSink>,
+) -> Result<(), String> {
+    let mut child = Command::new("mvn")
+        .args(&goals)
+        .current_dir(&project_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run mvn: {}", e))?;
+
+    let stdout = child.stdout.take().ok_or("Failed to capture mvn stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to capture mvn stderr")?;
+
+    let ev_out = events.clone();
+    let ev_err = events.clone();
+
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            ev_out.emit(CoreEvent::MavenOutput(line));
+        }
+    });
+
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            ev_err.emit(CoreEvent::MavenOutput(line));
+        }
+    });
+
+    std::thread::spawn(move || {
+        let status = child.wait();
+        let code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+        events.emit(CoreEvent::MavenDone(code));
+    });
+
+    Ok(())
 }

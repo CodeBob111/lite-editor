@@ -1,3 +1,5 @@
+# 过渡期旧 Nib(Tauri 壳)。刻意不加入根 workspace(独立 Cargo.lock):
+# 隔离 tauri 与 gpui 两棵依赖树,升级互不扰动(RFC v2 §3)。
 [package]
 name = "lite-editor"
 version = "0.1.0"
@@ -15,26 +17,15 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+nib-core = { path = "../crates/nib-core" }
 tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-walkdir = "2"
-ignore = "0.4"
-quick-xml = "0.36"
 tokio = { version = "1", features = ["full"] }
-notify = "6"
-rayon = "1"
 portable-pty = "0.8"
 libc = "0.2"
-reqwest = { version = "0.12", features = ["json", "native-tls"] }
-md-5 = "0.10"
-hex = "0.4"
 dirs = "5"
-comrak = { version = "0.52.0", default-features = false }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", features = ["NSPasteboard", "NSPasteboardItem"] }
-objc2-foundation = { version = "0.3.2", features = ["NSString", "NSArray", "NSURL"] }
+[workspace]

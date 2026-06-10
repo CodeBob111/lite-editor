@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tauri::State;
 
 // ── Constants ──
 
@@ -81,40 +80,36 @@ pub struct AstoreState {
     pub session: Mutex<AstoreSession>,
     pub password: Mutex<Option<String>>,
     client: Client,
+    /// 会话持久化文件,由宿主注入(旧 Nib 沿用历史路径,原生 app 用独立目录)
+    session_file: PathBuf,
 }
 
-impl Default for AstoreState {
-    fn default() -> Self {
+impl AstoreState {
+    pub fn new(session_file: PathBuf) -> Self {
         let client = Client::builder()
             .danger_accept_invalid_certs(true)
             .timeout(std::time::Duration::from_secs(50))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_else(|_| Client::new());
-        let session = load_session_from_disk().unwrap_or_default();
+        let session = load_session_from_disk(&session_file).unwrap_or_default();
         Self {
             session: Mutex::new(session),
             password: Mutex::new(None),
             client,
+            session_file,
         }
     }
 }
 
 // ── Persistence ──
 
-fn session_file_path() -> PathBuf {
-    let base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("lite-editor").join("astore-session.json")
-}
-
-fn load_session_from_disk() -> Option<AstoreSession> {
-    let path = session_file_path();
+fn load_session_from_disk(path: &PathBuf) -> Option<AstoreSession> {
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
 
-fn save_session_to_disk(session: &AstoreSession) {
-    let path = session_file_path();
+fn save_session_to_disk(path: &PathBuf, session: &AstoreSession) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -562,9 +557,8 @@ fn detect_project(dir_name: &str) -> (String, Option<i64>) {
 
 // ── Tauri Commands ──
 
-#[tauri::command]
 pub async fn astore_login(
-    state: State<'_, AstoreState>,
+    state: &AstoreState,
     username: String,
     password: String,
 ) -> Result<AstoreSession, String> {
@@ -583,13 +577,12 @@ pub async fn astore_login(
         session.current_env = old.current_env;
     }
 
-    save_session_to_disk(&session);
+    save_session_to_disk(&state.session_file, &session);
     *state.session.lock().unwrap() = session.clone();
     Ok(session)
 }
 
-#[tauri::command]
-pub async fn astore_logout(state: State<'_, AstoreState>) -> Result<(), String> {
+pub async fn astore_logout(state: &AstoreState) -> Result<(), String> {
     let mut session = state.session.lock().unwrap();
     session.username.clear();
     session.nick_name.clear();
@@ -598,19 +591,17 @@ pub async fn astore_logout(state: State<'_, AstoreState>) -> Result<(), String> 
     session.access_token.clear();
     session.refresh_token.clear();
     session.sso_token.clear();
-    save_session_to_disk(&session);
+    save_session_to_disk(&state.session_file, &session);
     *state.password.lock().unwrap() = None;
     Ok(())
 }
 
-#[tauri::command]
-pub async fn astore_get_session(state: State<'_, AstoreState>) -> Result<AstoreSession, String> {
+pub async fn astore_get_session(state: &AstoreState) -> Result<AstoreSession, String> {
     Ok(state.session.lock().unwrap().clone())
 }
 
-#[tauri::command]
 pub async fn astore_detect_project(
-    state: State<'_, AstoreState>,
+    state: &AstoreState,
     project_path: String,
 ) -> Result<AstoreSession, String> {
     let dir_name = std::path::Path::new(&project_path)
@@ -622,18 +613,17 @@ pub async fn astore_detect_project(
     let mut session = state.session.lock().unwrap();
     session.project_type = ptype;
     session.template_id = template_id;
-    save_session_to_disk(&session);
+    save_session_to_disk(&state.session_file, &session);
     Ok(session.clone())
 }
 
-#[tauri::command]
 pub async fn astore_set_env(
-    state: State<'_, AstoreState>,
+    state: &AstoreState,
     env: String,
 ) -> Result<(), String> {
     let mut session = state.session.lock().unwrap();
     session.current_env = env;
-    save_session_to_disk(&session);
+    save_session_to_disk(&state.session_file, &session);
     Ok(())
 }
 
@@ -648,9 +638,8 @@ fn normalize_git_url(url: &str) -> String {
     }
 }
 
-#[tauri::command]
 pub async fn astore_sync_code(
-    state: State<'_, AstoreState>,
+    state: &AstoreState,
     git_url: String,
     branch: String,
 ) -> Result<String, String> {
@@ -694,9 +683,8 @@ pub async fn astore_sync_code(
     }
 }
 
-#[tauri::command]
 pub async fn astore_publish(
-    state: State<'_, AstoreState>,
+    state: &AstoreState,
 ) -> Result<String, String> {
     let session = state.session.lock().unwrap().clone();
     if session.sso_token.is_empty() {
@@ -717,7 +705,7 @@ pub async fn astore_publish(
         s.site_id = record.site_id;
         s.tenant_code = record.tenant_code.clone();
         s.biz_code = record.biz_code.clone();
-        save_session_to_disk(&s);
+        save_session_to_disk(&state.session_file, &s);
     }
 
     if is_daily {
@@ -728,7 +716,7 @@ pub async fn astore_publish(
 }
 
 async fn get_change_record(
-    state: &State<'_, AstoreState>,
+    state: &&AstoreState,
     template_id: i64,
     is_inside: bool,
 ) -> Result<ChangeRecord, String> {
@@ -789,7 +777,7 @@ async fn get_change_record(
 }
 
 async fn publish_daily(
-    state: &State<'_, AstoreState>,
+    state: &&AstoreState,
     record: &ChangeRecord,
     is_inside: bool,
 ) -> Result<String, String> {
@@ -927,7 +915,7 @@ async fn publish_daily(
 }
 
 async fn publish_pre(
-    state: &State<'_, AstoreState>,
+    state: &&AstoreState,
     record: &ChangeRecord,
     is_inside: bool,
 ) -> Result<String, String> {
@@ -983,9 +971,8 @@ fn get_record_url(session: &AstoreSession) -> String {
     }
 }
 
-#[tauri::command]
 pub async fn astore_get_editor_url(
-    state: State<'_, AstoreState>,
+    state: &AstoreState,
 ) -> Result<String, String> {
     let session = state.session.lock().unwrap().clone();
     let tid = session.template_id.ok_or("未检测到模板 ID")?;
@@ -1002,9 +989,8 @@ pub async fn astore_get_editor_url(
     }
 }
 
-#[tauri::command]
 pub async fn astore_get_record_url(
-    state: State<'_, AstoreState>,
+    state: &AstoreState,
 ) -> Result<String, String> {
     let session = state.session.lock().unwrap().clone();
     Ok(get_record_url(&session))

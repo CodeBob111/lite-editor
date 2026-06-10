@@ -4,8 +4,9 @@
 // (网络挂死的 git fetch、数百文件的全量扫描)进行中,并发调用真实的 async 命令入口,
 // 断言它们仍在毫秒级返回。若有人把命令改回同步阻塞或在 async 体里串行等待,测试立刻红。
 
-use lite_editor_lib::commands::{read_file, search_in_files};
-use lite_editor_lib::git::{git_status, run_git_with_timeout};
+use nib_core::fs::read_file;
+use nib_core::search::search_in_files;
+use nib_core::git::{git_status, run_git_with_timeout};
 use std::time::{Duration, Instant};
 
 fn run(cwd: &std::path::Path, args: &[&str]) {

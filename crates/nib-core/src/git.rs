@@ -1,4 +1,4 @@
-use crate::commands::on_worker;
+use crate::rt::on_worker;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::path::Path;
@@ -116,7 +116,6 @@ pub fn run_git_with_timeout_raw(
 
 // 注意:本文件所有命令都会 spawn git 子进程并等待;同步 Tauri 命令在主线程执行,
 // 等待期间整个 UI 冻住(clone 超时 600s)。因此全部包成 async + on_worker。
-#[tauri::command]
 pub async fn git_current_branch(cwd: String) -> Result<String, String> {
     on_worker(move || run_git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"])).await
 }
@@ -128,9 +127,8 @@ pub struct BatchResult<T: Serialize> {
     pub error: Option<String>,
 }
 
-#[tauri::command]
 pub async fn git_current_branch_batch(paths: Vec<String>) -> Vec<BatchResult<String>> {
-    tokio::task::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         paths
             .par_iter()
             .map(|cwd| match run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]) {
@@ -143,9 +141,8 @@ pub async fn git_current_branch_batch(paths: Vec<String>) -> Vec<BatchResult<Str
     .unwrap_or_default()
 }
 
-#[tauri::command]
 pub async fn git_status_batch(paths: Vec<String>) -> Vec<BatchResult<Vec<GitChange>>> {
-    tokio::task::spawn_blocking(move || {
+    crate::rt::spawn_blocking(move || {
         paths
             .par_iter()
             .map(|cwd| match parse_git_status(cwd) {
@@ -193,7 +190,6 @@ pub fn parse_git_status(cwd: &str) -> Result<Vec<GitChange>, String> {
     Ok(changes)
 }
 
-#[tauri::command]
 pub async fn git_list_branches(cwd: String) -> Result<Vec<GitBranch>, String> {
     on_worker(move || git_list_branches_sync(&cwd)).await
 }
@@ -301,7 +297,6 @@ fn branch_rank(branch: &GitBranch) -> u8 {
     }
 }
 
-#[tauri::command]
 pub async fn git_checkout(cwd: String, branch: String, force: Option<bool>) -> Result<String, String> {
     on_worker(move || {
         if force.unwrap_or(false) {
@@ -313,12 +308,10 @@ pub async fn git_checkout(cwd: String, branch: String, force: Option<bool>) -> R
     .await
 }
 
-#[tauri::command]
 pub async fn git_new_branch(cwd: String, branch: String, start_point: String) -> Result<String, String> {
     on_worker(move || run_git(&cwd, &["checkout", "-b", &branch, &start_point])).await
 }
 
-#[tauri::command]
 pub async fn git_delete_branch(cwd: String, branch: String, force: bool) -> Result<String, String> {
     on_worker(move || {
         let flag = if force { "-D" } else { "-d" };
@@ -331,7 +324,6 @@ fn prune_sync(cwd: &str, remote: &str) -> Result<String, String> {
     run_git_with_timeout(cwd, &["fetch", "--prune", remote], Duration::from_secs(60))
 }
 
-#[tauri::command]
 pub async fn git_prune(cwd: String, remote: Option<String>) -> Result<String, String> {
     on_worker(move || {
         let remote_name = remote.unwrap_or_else(|| "origin".to_string());
@@ -340,7 +332,6 @@ pub async fn git_prune(cwd: String, remote: Option<String>) -> Result<String, St
     .await
 }
 
-#[tauri::command]
 pub async fn git_pull(
     cwd: String,
     branch: Option<String>,
@@ -440,12 +431,10 @@ fn ensure_remote_branch_exists(cwd: &str, remote: &str, branch: &str) -> Result<
     }
 }
 
-#[tauri::command]
 pub async fn git_fetch_branch(cwd: String, remote: String, branch: String) -> Result<String, String> {
     on_worker(move || run_git_with_timeout(&cwd, &["fetch", &remote, &branch], Duration::from_secs(60))).await
 }
 
-#[tauri::command]
 pub async fn git_push(cwd: String, branch: String) -> Result<String, String> {
     on_worker(move || run_git_with_timeout(&cwd, &["push", "origin", &branch], Duration::from_secs(60))).await
 }
@@ -457,7 +446,6 @@ pub struct MergeResult {
     pub conflicts: Vec<String>,
 }
 
-#[tauri::command]
 pub async fn git_merge(cwd: String, branch: String) -> Result<MergeResult, String> {
     on_worker(move || {
         match run_git_with_timeout(&cwd, &["merge", &branch], Duration::from_secs(30)) {
@@ -484,12 +472,10 @@ fn list_unmerged_files(cwd: &str) -> Vec<String> {
         .collect()
 }
 
-#[tauri::command]
 pub async fn git_merge_conflicts(cwd: String) -> Result<Vec<String>, String> {
     on_worker(move || Ok(list_unmerged_files(&cwd))).await
 }
 
-#[tauri::command]
 pub async fn git_show_conflict_version(cwd: String, rel_path: String, stage: u32) -> Result<String, String> {
     on_worker(move || {
         if !(1..=3).contains(&stage) {
@@ -500,12 +486,10 @@ pub async fn git_show_conflict_version(cwd: String, rel_path: String, stage: u32
     .await
 }
 
-#[tauri::command]
 pub async fn git_merge_abort(cwd: String) -> Result<String, String> {
     on_worker(move || run_git(&cwd, &["merge", "--abort"])).await
 }
 
-#[tauri::command]
 pub async fn git_resolve_conflict_file(cwd: String, rel_path: String, content: String) -> Result<String, String> {
     on_worker(move || {
         let abs_path = Path::new(&cwd).join(&rel_path);
@@ -516,7 +500,6 @@ pub async fn git_resolve_conflict_file(cwd: String, rel_path: String, content: S
     .await
 }
 
-#[tauri::command]
 pub async fn git_checkout_conflict_side(cwd: String, rel_path: String, side: String) -> Result<String, String> {
     on_worker(move || {
         let flag = match side.as_str() {
@@ -534,7 +517,6 @@ pub async fn git_checkout_conflict_side(cwd: String, rel_path: String, side: Str
 /// - Untracked: no committed version exists, so rolling back removes the file.
 /// - Added (staged-new): unstage, then remove from the working tree.
 /// - Tracked (Modified/Deleted/...): restore both index and working tree from HEAD.
-#[tauri::command]
 pub async fn git_discard_changes(cwd: String, rel_path: String, status: String) -> Result<String, String> {
     on_worker(move || {
         match status.as_str() {
@@ -555,12 +537,10 @@ pub async fn git_discard_changes(cwd: String, rel_path: String, status: String) 
     .await
 }
 
-#[tauri::command]
 pub async fn git_rebase(cwd: String, branch: String) -> Result<String, String> {
     on_worker(move || run_git_with_timeout(&cwd, &["rebase", &branch], Duration::from_secs(30))).await
 }
 
-#[tauri::command]
 pub async fn git_rename_branch(
     cwd: String,
     old_name: String,
@@ -569,7 +549,6 @@ pub async fn git_rename_branch(
     on_worker(move || run_git(&cwd, &["branch", "-m", &old_name, &new_name])).await
 }
 
-#[tauri::command]
 pub async fn git_log(cwd: String, branch: String, limit: Option<u32>) -> Result<Vec<GitCommit>, String> {
     on_worker(move || git_log_sync(&cwd, &branch, limit)).await
 }
@@ -614,27 +593,22 @@ fn git_log_sync(cwd: &str, branch: &str, limit: Option<u32>) -> Result<Vec<GitCo
     Ok(commits)
 }
 
-#[tauri::command]
 pub async fn git_commit_patch(cwd: String, hash: String) -> Result<String, String> {
     on_worker(move || run_git_raw(&cwd, &["format-patch", "-1", "--stdout", &hash])).await
 }
 
-#[tauri::command]
 pub async fn git_cherry_pick(cwd: String, hash: String) -> Result<String, String> {
     on_worker(move || run_git_with_timeout(&cwd, &["cherry-pick", &hash], Duration::from_secs(60))).await
 }
 
-#[tauri::command]
 pub async fn git_checkout_revision(cwd: String, hash: String) -> Result<String, String> {
     on_worker(move || run_git(&cwd, &["checkout", &hash])).await
 }
 
-#[tauri::command]
 pub async fn git_revert_commit(cwd: String, hash: String) -> Result<String, String> {
     on_worker(move || run_git_with_timeout(&cwd, &["revert", "--no-edit", &hash], Duration::from_secs(60))).await
 }
 
-#[tauri::command]
 pub async fn git_new_branch_at_commit(
     cwd: String,
     branch: String,
@@ -651,7 +625,6 @@ pub struct GitChange {
     staged: bool,
 }
 
-#[tauri::command]
 pub async fn git_commit(cwd: String, files: Vec<String>, message: String) -> Result<String, String> {
     on_worker(move || {
         if files.is_empty() {
@@ -669,17 +642,14 @@ pub async fn git_commit(cwd: String, files: Vec<String>, message: String) -> Res
     .await
 }
 
-#[tauri::command]
 pub async fn git_status(cwd: String) -> Result<Vec<GitChange>, String> {
     on_worker(move || parse_git_status(&cwd)).await
 }
 
-#[tauri::command]
 pub async fn git_show_file(cwd: String, rel_path: String) -> Result<String, String> {
     on_worker(move || run_git_raw(&cwd, &["show", &format!("HEAD:{}", rel_path)])).await
 }
 
-#[tauri::command]
 pub async fn git_show_staged(cwd: String, rel_path: String) -> Result<String, String> {
     on_worker(move || run_git_raw(&cwd, &["show", &format!(":{}", rel_path)])).await
 }
@@ -696,9 +666,8 @@ fn classify_status(c: char) -> String {
     }
 }
 
-#[tauri::command]
 pub async fn git_discover_repos(root: String) -> Vec<GitRepo> {
-    tokio::task::spawn_blocking(move || git_discover_repos_sync(root))
+    crate::rt::spawn_blocking(move || git_discover_repos_sync(root))
         .await
         .unwrap_or_default()
 }
@@ -737,7 +706,6 @@ pub struct BlameLine {
     pub timestamp: i64,
 }
 
-#[tauri::command]
 pub async fn git_blame(cwd: String, file_path: String) -> Result<Vec<BlameLine>, String> {
     on_worker(move || git_blame_sync(&cwd, &file_path)).await
 }
@@ -798,7 +766,6 @@ fn git_blame_sync(cwd: &str, file_path: &str) -> Result<Vec<BlameLine>, String> 
     Ok(lines)
 }
 
-#[tauri::command]
 pub async fn git_clone(url: String, directory: String) -> Result<String, String> {
     on_worker(move || {
         let dir_path = std::path::Path::new(&directory);
@@ -825,7 +792,6 @@ pub async fn git_clone(url: String, directory: String) -> Result<String, String>
     .await
 }
 
-#[tauri::command]
 pub async fn git_remote_url(cwd: String, remote: Option<String>) -> Result<String, String> {
     on_worker(move || {
         let remote = remote.as_deref().unwrap_or("origin");
@@ -940,7 +906,6 @@ pub(crate) fn parse_conflict_markers(text: &str) -> ConflictParse {
     }
 }
 
-#[tauri::command]
 pub async fn parse_conflict_file(path: String) -> Result<ConflictParse, String> {
     on_worker(move || {
         let content = std::fs::read_to_string(&path)

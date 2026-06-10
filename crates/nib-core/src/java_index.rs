@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::State;
 use walkdir::WalkDir;
 
 #[derive(Default)]
@@ -33,13 +32,9 @@ pub struct ClassLocation {
     pub fqn: String,
 }
 
-fn index_cache_path(project_path: &str) -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+fn index_cache_path(cache_dir: &Path, project_path: &str) -> PathBuf {
     let hash = project_path.replace('/', "_");
-    PathBuf::from(format!(
-        "{}/Library/Caches/lite-editor/java-index/{}.json",
-        home, hash
-    ))
+    cache_dir.join(format!("{}.json", hash))
 }
 
 fn file_modified_secs(path: &Path) -> u64 {
@@ -151,14 +146,14 @@ fn build_index_from_files(files: &[PathBuf], old_index: Option<&JavaIndex>) -> J
     }
 }
 
-#[tauri::command]
 pub async fn build_java_index(
     project_path: String,
-    state: State<'_, JavaIndexState>,
+    cache_dir: PathBuf,
+    state: &JavaIndexState,
 ) -> Result<u32, String> {
     let pp = project_path.clone();
-    let (index, class_count) = tokio::task::spawn_blocking(move || {
-        let cache_path = index_cache_path(&pp);
+    let (index, class_count) = crate::rt::spawn_blocking(move || {
+        let cache_path = index_cache_path(&cache_dir, &pp);
         let old_index = if cache_path.exists() {
             std::fs::read_to_string(&cache_path)
                 .ok()
@@ -185,14 +180,14 @@ pub async fn build_java_index(
     Ok(class_count)
 }
 
-#[tauri::command]
 pub async fn load_java_index(
     project_path: String,
-    state: State<'_, JavaIndexState>,
+    cache_dir: PathBuf,
+    state: &JavaIndexState,
 ) -> Result<u32, String> {
     let pp = project_path.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        let cache_path = index_cache_path(&pp);
+    let result = crate::rt::spawn_blocking(move || {
+        let cache_path = index_cache_path(&cache_dir, &pp);
         if !cache_path.exists() {
             return Ok(None);
         }
@@ -216,11 +211,10 @@ pub async fn load_java_index(
     }
 }
 
-#[tauri::command]
 pub fn search_java_class(
     project_path: String,
     class_name: String,
-    state: State<'_, JavaIndexState>,
+    state: &JavaIndexState,
 ) -> Result<Vec<ClassLocation>, String> {
     let indices = state.indices.lock().map_err(|e| e.to_string())?;
     let index = match indices.get(&project_path) {
@@ -248,10 +242,10 @@ pub fn search_java_class(
 }
 
 // 序列化后的整份索引落盘:JSON 可达数 MB,同步命令里写盘会卡主线程,统一丢到阻塞线程池。
-fn persist_index_async(project_path: &str, index: &JavaIndex) {
-    let cache_path = index_cache_path(project_path);
+fn persist_index_async(cache_dir: &Path, project_path: &str, index: &JavaIndex) {
+    let cache_path = index_cache_path(cache_dir, project_path);
     if let Ok(json) = serde_json::to_string(index) {
-        tokio::task::spawn_blocking(move || {
+        crate::rt::spawn_blocking(move || {
             if let Some(parent) = cache_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -260,14 +254,14 @@ fn persist_index_async(project_path: &str, index: &JavaIndex) {
     }
 }
 
-#[tauri::command]
 pub async fn update_java_index_file(
     project_path: String,
     file_path: String,
-    state: State<'_, JavaIndexState>,
+    cache_dir: PathBuf,
+    state: &JavaIndexState,
 ) -> Result<(), String> {
     let fp = file_path.clone();
-    let parsed = tokio::task::spawn_blocking(move || {
+    let parsed = crate::rt::spawn_blocking(move || {
         let path = Path::new(&fp);
         if !path.exists() || path.extension().is_none_or(|e| e != "java") {
             return Ok(None);
@@ -302,15 +296,15 @@ pub async fn update_java_index_file(
         });
     }
 
-    persist_index_async(&project_path, index);
+    persist_index_async(&cache_dir, &project_path, index);
     Ok(())
 }
 
-#[tauri::command]
 pub async fn remove_java_index_file(
     project_path: String,
     file_path: String,
-    state: State<'_, JavaIndexState>,
+    cache_dir: PathBuf,
+    state: &JavaIndexState,
 ) -> Result<(), String> {
     let path = Path::new(&file_path);
     let class_name = match path.file_stem().and_then(|n| n.to_str()) {
@@ -331,6 +325,6 @@ pub async fn remove_java_index_file(
         }
     }
 
-    persist_index_async(&project_path, index);
+    persist_index_async(&cache_dir, &project_path, index);
     Ok(())
 }

@@ -9,7 +9,7 @@
 
 #![cfg(target_os = "macos")]
 
-use lite_editor_lib::clipboard::{copy_files_to_clipboard, copy_text_to_clipboard};
+use nib_core::clipboard::{copy_files_to_clipboard, copy_text_to_clipboard};
 use std::process::Command;
 use std::sync::Mutex;
 

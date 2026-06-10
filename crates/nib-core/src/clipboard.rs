@@ -3,7 +3,6 @@
 // JS 的 navigator.clipboard 只能放纯文本，放不了文件引用，所以必须走原生 AppKit。
 
 /// 把若干文件路径写入系统剪贴板（macOS）。支持多选：一次写入多个 file-url。
-#[tauri::command]
 pub fn copy_files_to_clipboard(paths: Vec<String>) -> Result<(), String> {
     if paths.is_empty() {
         return Err("no files to copy".into());
@@ -44,7 +43,6 @@ pub fn copy_files_to_clipboard(paths: Vec<String>) -> Result<(), String> {
 /// 把纯文本写入系统剪贴板(macOS)。走原生 NSPasteboard,不依赖浏览器的
 /// navigator.clipboard —— 后者要求处于「用户手势」上下文,异步 await 之后会失效
 /// (Arthas 命令要点两遍才进剪贴板的根因)。这里同步写入,一次到位。
-#[tauri::command]
 pub fn copy_text_to_clipboard(text: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
