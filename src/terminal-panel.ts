@@ -296,6 +296,9 @@ export function initTerminalPanel() {
   let pollingClaude = false;
   setInterval(async () => {
     if (pollingClaude) return;
+    // 终端面板不可见时徽标也不可见,跳过本轮,不发无意义的 IPC(也省电)。
+    const container = document.getElementById("terminal-container");
+    if (!container || container.offsetWidth === 0) return;
     pollingClaude = true;
     try {
       let changed = false;

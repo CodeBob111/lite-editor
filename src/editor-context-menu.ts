@@ -4,7 +4,13 @@ import { positionContextMenu, showStatus } from "./utils";
 import { isBlameActive, toggleBlame } from "./git-blame-gutter";
 import { copyTextToClipboard } from "./tauri-api";
 
+// 上一次打开的菜单的清理函数。再次打开时先执行它:否则上一次注册的 document
+// `contextmenu` dismiss 会在本次右键事件冒泡到 document 时把刚显示的菜单立刻藏掉
+// (表现为「连续两次右键,第二次菜单不出来」),监听器也会残留。
+let activeCleanup: (() => void) | null = null;
+
 export function showEditorContextMenu(view: EditorView, x: number, y: number) {
+  activeCleanup?.();
   const menu = document.getElementById("editor-context-menu")!;
   const blameItem = menu.querySelector<HTMLElement>('[data-action="toggle-blame"]')!;
   blameItem.textContent = isBlameActive(view) ? "Close Git Blame" : "Annotate with Git Blame";
@@ -60,6 +66,7 @@ export function showEditorContextMenu(view: EditorView, x: number, y: number) {
   arthasTrigger.addEventListener("click", toggleSub);
 
   const cleanup = () => {
+    if (activeCleanup === cleanup) activeCleanup = null;
     arthasSub.style.display = "none";
     arthasTrigger.removeEventListener("mouseenter", showSub);
     arthasTrigger.removeEventListener("mouseleave", hideSub);
@@ -69,6 +76,7 @@ export function showEditorContextMenu(view: EditorView, x: number, y: number) {
     document.removeEventListener("contextmenu", dismiss);
     document.removeEventListener("wheel", dismiss);
   };
+  activeCleanup = cleanup;
   const handler = (e: MouseEvent) => {
     const action = (e.target as HTMLElement).dataset.action;
     if (!action) return;

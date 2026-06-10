@@ -11,6 +11,16 @@
 
 use lite_editor_lib::clipboard::{copy_files_to_clipboard, copy_text_to_clipboard};
 use std::process::Command;
+use std::sync::Mutex;
+
+// 系统剪贴板是全局共享状态:cargo test 默认并行,三个测试互相覆盖对方刚写入的
+// 内容,产生随机失败。串行化「写入→读回」整段;锁中毒(别的测试断言失败)不影响
+// 剪贴板本身,取回继续即可。
+static PASTEBOARD: Mutex<()> = Mutex::new(());
+
+fn pasteboard_guard() -> std::sync::MutexGuard<'static, ()> {
+    PASTEBOARD.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn make_temp_file(name: &str) -> String {
     let dir = std::env::temp_dir().join(format!("lite_editor_clip_{}", std::process::id()));
@@ -27,6 +37,7 @@ fn make_temp_file(name: &str) -> String {
 
 #[test]
 fn single_file_lands_as_a_readable_file_url() {
+    let _pb = pasteboard_guard();
     let path = make_temp_file("readme.md");
     copy_files_to_clipboard(vec![path.clone()]).expect("write to pasteboard");
 
@@ -50,6 +61,7 @@ fn single_file_lands_as_a_readable_file_url() {
 
 #[test]
 fn multiple_files_each_land_as_a_distinct_file_url() {
+    let _pb = pasteboard_guard();
     let a = make_temp_file("a.txt");
     let b = make_temp_file("b.txt");
     copy_files_to_clipboard(vec![a.clone(), b.clone()]).expect("write to pasteboard");
@@ -65,6 +77,7 @@ fn multiple_files_each_land_as_a_distinct_file_url() {
 // rejected after an await. Write text, read it back with pbpaste, expect exact match.
 #[test]
 fn text_lands_on_pasteboard_verbatim() {
+    let _pb = pasteboard_guard();
     let s = format!(
         "trace com.alibaba.business.app.taobao.tradereview.utils.UserTagUtil buildUserTagVOListNew -n 5 --skipJDKMethod false [{}]",
         std::process::id()

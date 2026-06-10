@@ -439,19 +439,22 @@ pub async fn save_session(data: String, app: tauri::AppHandle) -> Result<(), Str
 }
 
 #[tauri::command]
-pub fn load_session(app: tauri::AppHandle) -> Result<Option<String>, String> {
+pub async fn load_session(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let app_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-    let session_file = app_dir.join("session.json");
-    if session_file.exists() {
-        let data = std::fs::read_to_string(session_file)
-            .map_err(|e| format!("Failed to read session: {}", e))?;
-        Ok(Some(data))
-    } else {
-        Ok(None)
-    }
+    on_worker(move || {
+        let session_file = app_dir.join("session.json");
+        if session_file.exists() {
+            let data = std::fs::read_to_string(session_file)
+                .map_err(|e| format!("Failed to read session: {}", e))?;
+            Ok(Some(data))
+        } else {
+            Ok(None)
+        }
+    })
+    .await
 }
 
 // ---- Settings (preferences) ----
@@ -475,19 +478,22 @@ pub async fn save_settings(data: String, app: tauri::AppHandle) -> Result<(), St
 }
 
 #[tauri::command]
-pub fn load_settings(app: tauri::AppHandle) -> Result<Option<String>, String> {
+pub async fn load_settings(app: tauri::AppHandle) -> Result<Option<String>, String> {
     let app_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to get app data dir: {}", e))?;
-    let settings_file = app_dir.join("settings.json");
-    if settings_file.exists() {
-        let data = std::fs::read_to_string(settings_file)
-            .map_err(|e| format!("Failed to read settings: {}", e))?;
-        Ok(Some(data))
-    } else {
-        Ok(None)
-    }
+    on_worker(move || {
+        let settings_file = app_dir.join("settings.json");
+        if settings_file.exists() {
+            let data = std::fs::read_to_string(settings_file)
+                .map_err(|e| format!("Failed to read settings: {}", e))?;
+            Ok(Some(data))
+        } else {
+            Ok(None)
+        }
+    })
+    .await
 }
 
 // ---- Maven ----

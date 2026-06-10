@@ -29,8 +29,10 @@ pub struct TerminalState {
     next_id: AtomicU32,
 }
 
+// 终端命令统一 async:同步命令在主线程执行,openpty/spawn、PTY 写满时的阻塞写
+// 都不该有冻住 UI 的可能(async 后跑在 runtime 线程,最坏只占一个 worker)。
 #[tauri::command]
-pub fn spawn_terminal(
+pub async fn spawn_terminal(
     cwd: String,
     cols: u16,
     rows: u16,
@@ -116,7 +118,7 @@ pub fn spawn_terminal(
 }
 
 #[tauri::command]
-pub fn write_terminal(
+pub async fn write_terminal(
     id: u32,
     data: String,
     state: State<'_, TerminalState>,
@@ -137,7 +139,7 @@ pub fn write_terminal(
 }
 
 #[tauri::command]
-pub fn resize_terminal(
+pub async fn resize_terminal(
     id: u32,
     cols: u16,
     rows: u16,
@@ -160,7 +162,7 @@ pub fn resize_terminal(
 }
 
 #[tauri::command]
-pub fn close_terminal(id: u32, state: State<'_, TerminalState>) -> Result<(), String> {
+pub async fn close_terminal(id: u32, state: State<'_, TerminalState>) -> Result<(), String> {
     let inst = {
         let mut terminals = state.terminals.lock().map_err(|e| e.to_string())?;
         terminals.remove(&id)
