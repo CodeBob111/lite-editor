@@ -185,6 +185,9 @@ fn copy_dir_recursive(src: &str, dest: &str) -> Result<(), String> {
 
 pub async fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
     on_worker(move || {
+        if !Path::new(&old_path).exists() {
+            return Err(format!("Path does not exist: {}", old_path));
+        }
         if Path::new(&new_path).exists() {
             return Err(format!("Target already exists: {}", new_path));
         }
