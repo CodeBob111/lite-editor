@@ -415,6 +415,37 @@ mod tests {
     }
 
     #[test]
+    fn three_thousand_file_index_stays_bounded() {
+        // 超大仓代理:3000 个文件、共享 200 个符号的词汇表。断言索引的序列化体积
+        // (内存占用的稳定代理)保持在量级预期内——若有人改坏去重或把文件内容
+        // 整体留在索引里,这里会先红。
+        let dir = std::env::temp_dir().join(format!("usage_idx_big_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = Vec::new();
+        for i in 0..3000 {
+            let body: String = (0..15)
+                .map(|j| format!("  commonSymbol{}();\n", (i * 7 + j * 13) % 200))
+                .collect();
+            let f = dir.join(format!("Big{}.java", i));
+            std::fs::write(&f, format!("class Big{} {{\n{}}}\n", i, body)).unwrap();
+            files.push(f);
+        }
+
+        let idx = build(&files, None);
+        assert_eq!(idx.files.len(), 3000);
+        // 词汇表 ≈ 200 共享符号 + 3000 类名
+        assert!(idx.tokens.len() < 3300, "token 表膨胀: {}", idx.tokens.len());
+        let json = serde_json::to_string(&idx).unwrap();
+        assert!(
+            json.len() < 8_000_000,
+            "3000 文件索引序列化 {} bytes,超出量级预期(每文件应为几百字节的 id/行号表)",
+            json.len()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn token_table_stays_small_across_many_files() {
         // 内存有界性的可断言代理:300 个文件共享同一批符号时,全局 token 表
         // 只存一份文本(≈ 唯一符号数),而不是 300 × 每文件符号数。
