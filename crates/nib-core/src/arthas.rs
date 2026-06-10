@@ -378,44 +378,42 @@ mod tests {
     }
 }
 
-/// LSP Position.character 是 UTF-16 码元;本模块各函数收的 col 是**字节列**。
-/// 行内有非 ASCII(中文字符串字面量/注释)时两者错位,必须先经这里换算。
-pub fn utf16_col_to_byte(line: &str, utf16_col: usize) -> usize {
-    let mut units = 0usize;
-    for (byte_ix, ch) in line.char_indices() {
-        if units >= utf16_col {
-            return byte_ix;
-        }
-        units += ch.len_utf16();
-    }
-    line.len()
+/// gpui-component InputState::cursor_position().character 是**字符列**
+/// (Unicode 标量个数,见 rope_ext.rs offset_to_position: chars().count());
+/// 本模块各解析函数收的 col 是**字节列**,行内有非 ASCII 时必须先经这里换算。
+/// (注意:这不是 LSP 线协议的 UTF-16 码元——单位是字符,emoji 也只算 1)
+pub fn char_col_to_byte(line: &str, char_col: usize) -> usize {
+    line.char_indices()
+        .nth(char_col)
+        .map(|(byte_ix, _)| byte_ix)
+        .unwrap_or(line.len())
 }
 
 #[cfg(test)]
-mod utf16_tests {
+mod char_col_tests {
     use super::*;
 
     #[test]
     fn ascii_is_identity() {
-        assert_eq!(utf16_col_to_byte("abc def", 4), 4);
-        assert_eq!(utf16_col_to_byte("abc", 99), 3, "越界钉到行尾");
+        assert_eq!(char_col_to_byte("abc def", 4), 4);
+        assert_eq!(char_col_to_byte("abc", 99), 3, "越界钉到行尾");
     }
 
     #[test]
     fn chinese_before_cursor_shifts_bytes() {
-        // "中文" 占 2 个 UTF-16 码元、6 个字节;光标在 x 上(UTF-16 列 2)
+        // "中文" 占 2 个字符、6 个字节;光标在 x 上(字符列 2)
         let line = "中文x.foo()";
-        let byte_col = utf16_col_to_byte(line, 2);
+        let byte_col = char_col_to_byte(line, 2);
         assert_eq!(byte_col, 6);
         let (ident, _, _) = identifier_at(line, byte_col).expect("应取到标识符");
         assert_eq!(ident, "x");
     }
 
     #[test]
-    fn emoji_surrogate_pair_counts_two_units() {
-        // 😀 = 2 个 UTF-16 码元、4 字节
+    fn emoji_counts_one_char() {
+        // 😀 = 1 个字符、4 字节(字符列语义下只算 1,区别于 UTF-16 的 2)
         let line = "😀ab";
-        assert_eq!(utf16_col_to_byte(line, 2), 4);
-        assert_eq!(utf16_col_to_byte(line, 3), 5);
+        assert_eq!(char_col_to_byte(line, 1), 4);
+        assert_eq!(char_col_to_byte(line, 2), 5);
     }
 }

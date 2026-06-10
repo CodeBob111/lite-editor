@@ -1032,10 +1032,10 @@ impl Workbench {
             let self_fqn = if pkg.is_empty() { class } else { format!("{}.{}", pkg, class) };
 
             // 旧版语义第一优先:光标停在调用点(标识符后跟'(',非声明行)→ 命令打在被调方上。
-            // LSP character 是 UTF-16 码元,先换算字节列再做文本解析。
+            // cursor_position().character 是字符列(组件实证,非 UTF-16),换算字节列再解析。
             let call_target = text.lines().nth(pos.line as usize).and_then(|line| {
                 let byte_col =
-                    nib_core::arthas::utf16_col_to_byte(line, pos.character as usize);
+                    nib_core::arthas::char_col_to_byte(line, pos.character as usize);
                 let (word, s, e) = nib_core::arthas::identifier_at(line, byte_col)?;
                 if !nib_core::arthas::followed_by_paren(line, e) {
                     return None;
