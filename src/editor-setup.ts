@@ -151,9 +151,19 @@ function debouncedAutoSave(path: string, view: EditorView) {
   if (existing) clearTimeout(existing);
   autoSaveTimers.set(path, setTimeout(() => {
     autoSaveTimers.delete(path);
-    // 标签已关闭 = 用户已选择丢弃未保存改动,不再落盘
-    if (_tabManager.hasTab(path)) saveFile(path, view);
+    saveFile(path, view);
   }, 1000));
+}
+
+// 关闭标签 = 用户选择丢弃未保存改动:必须取消该文件待触发的自动保存。
+// 只在触发时查 hasTab 不够——关闭后 1s 内又重新打开同一文件,hasTab 为 true,
+// 旧 view 里被丢弃的内容会被写回磁盘,再经文件监听 reload 回灌进新编辑器。
+export function cancelPendingAutoSave(path: string) {
+  const timer = autoSaveTimers.get(path);
+  if (timer) {
+    clearTimeout(timer);
+    autoSaveTimers.delete(path);
+  }
 }
 
 async function saveFile(path: string, view: EditorView) {

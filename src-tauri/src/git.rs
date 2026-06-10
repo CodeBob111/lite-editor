@@ -200,14 +200,14 @@ pub async fn git_list_branches(cwd: String) -> Result<Vec<GitBranch>, String> {
 
 fn git_list_branches_sync(cwd: &str) -> Result<Vec<GitBranch>, String> {
     let local_output = run_git(
-        &cwd,
+        cwd,
         &[
             "branch",
             "--format=%(HEAD)\t%(refname:short)\t%(upstream:short)\t%(upstream:track,nobracket)",
         ],
     )?;
     let remote_output =
-        run_git(&cwd, &["branch", "-r", "--format=%(refname:short)"]).unwrap_or_default();
+        run_git(cwd, &["branch", "-r", "--format=%(refname:short)"]).unwrap_or_default();
 
     let mut branches = Vec::new();
 
@@ -216,7 +216,7 @@ fn git_list_branches_sync(cwd: &str) -> Result<Vec<GitBranch>, String> {
             continue;
         }
         let parts: Vec<&str> = line.splitn(4, '\t').collect();
-        let current = parts.first().map_or(false, |h| *h == "*");
+        let current = parts.first().is_some_and(|h| *h == "*");
         let name = parts.get(1).unwrap_or(&"").to_string();
         let tracking_raw = parts.get(2).unwrap_or(&"").to_string();
         let track_info = parts.get(3).unwrap_or(&"").to_string();
@@ -329,9 +329,9 @@ pub fn git_pull_sync(
     match (branch, tracking) {
         (Some(local_branch), Some(upstream)) => {
             let (remote, remote_branch) = parse_upstream(&upstream)?;
-            ensure_remote_branch_exists(&cwd, remote, remote_branch)?;
+            ensure_remote_branch_exists(cwd, remote, remote_branch)?;
             run_git_with_timeout(
-                &cwd,
+                cwd,
                 &[
                     "fetch",
                     remote,
@@ -346,18 +346,18 @@ pub fn git_pull_sync(
         )),
         (None, _) => {
             match run_git(
-                &cwd,
+                cwd,
                 &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
             ) {
                 Ok(upstream) => {
                     let (remote, remote_branch) = parse_upstream(&upstream)?;
-                    ensure_remote_branch_exists(&cwd, remote, remote_branch)?;
-                    run_git_with_timeout(&cwd, &["pull", "--no-rebase"], Duration::from_secs(60))
+                    ensure_remote_branch_exists(cwd, remote, remote_branch)?;
+                    run_git_with_timeout(cwd, &["pull", "--no-rebase"], Duration::from_secs(60))
                 }
                 // No upstream configured. If origin has a same-named branch, adopt
                 // it as the upstream and pull; otherwise there's nothing to pull.
                 Err(_) => {
-                    let branch = run_git(&cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+                    let branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
                     if branch.is_empty() || branch == "HEAD" {
                         return Err("Detached HEAD has no upstream to pull from.".to_string());
                     }
@@ -366,15 +366,15 @@ pub fn git_pull_sync(
                     // remote (clear error if not) and creates the remote-tracking
                     // ref that --set-upstream-to requires.
                     run_git_with_timeout(
-                        &cwd,
+                        cwd,
                         &["fetch", remote, branch.as_str()],
                         Duration::from_secs(60),
                     )?;
                     run_git(
-                        &cwd,
+                        cwd,
                         &["branch", &format!("--set-upstream-to={}/{}", remote, branch)],
                     )?;
-                    run_git_with_timeout(&cwd, &["pull", "--no-rebase"], Duration::from_secs(60))
+                    run_git_with_timeout(cwd, &["pull", "--no-rebase"], Duration::from_secs(60))
                 }
             }
         }
@@ -549,7 +549,7 @@ pub async fn git_log(cwd: String, branch: String, limit: Option<u32>) -> Result<
 fn git_log_sync(cwd: &str, branch: &str, limit: Option<u32>) -> Result<Vec<GitCommit>, String> {
     let max_count = limit.unwrap_or(200).clamp(1, 1000).to_string();
     let output = run_git_raw(
-        &cwd,
+        cwd,
         &[
             "log",
             "--date=iso-strict",

@@ -160,7 +160,7 @@ fn collect_java_files(project_path: &str) -> Vec<PathBuf> {
             !skip_dirs.contains(&name.as_ref())
         })
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file() && e.path().extension().map_or(false, |ext| ext == "java"))
+        .filter(|e| e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "java"))
         .map(|e| e.path().to_path_buf())
         .collect()
 }
@@ -315,7 +315,7 @@ pub async fn update_usage_index_file(
     let fp = file_path.clone();
     let scanned = tokio::task::spawn_blocking(move || {
         let path = Path::new(&fp);
-        if !path.exists() || path.extension().map_or(true, |e| e != "java") {
+        if !path.exists() || path.extension().is_none_or(|e| e != "java") {
             return Ok(None);
         }
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -398,7 +398,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f1 = dir.join("A.java");
         std::fs::write(&f1, "class A {\n  void m() { helperMethod(); }\n}").unwrap();
-        let idx1 = build(&[f1.clone()], None);
+        let idx1 = build(std::slice::from_ref(&f1), None);
 
         // 新增 B 后增量重建:A mtime 未变走 Reused(id 指旧表),B 走 Fresh intern
         let f2 = dir.join("B.java");
@@ -446,13 +446,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f1 = dir.join("A.java");
         std::fs::write(&f1, "class A {\n  void m() { helperMethod(); }\n}").unwrap();
-        let idx = build(&[f1.clone()], None);
+        let idx = build(std::slice::from_ref(&f1), None);
 
         // 落盘 → 回读(token_ids 是 #[serde(skip)],回读后为空)→ 作为增量基底重建
         let json = serde_json::to_string(&idx).unwrap();
         let loaded: UsageIndex = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.version, INDEX_VERSION);
-        let rebuilt = build(&[f1.clone()], Some(&loaded));
+        let rebuilt = build(std::slice::from_ref(&f1), Some(&loaded));
 
         let f1s = f1.to_string_lossy().to_string();
         assert_eq!(lines_of(&rebuilt, &f1s, "helperMethod"), Some(vec![2]));

@@ -65,8 +65,12 @@ export function showEditorContextMenu(view: EditorView, x: number, y: number) {
   arthasSub.addEventListener("mouseleave", hideSub);
   arthasTrigger.addEventListener("click", toggleSub);
 
+  let attachTimer: ReturnType<typeof setTimeout> | null = null;
   const cleanup = () => {
     if (activeCleanup === cleanup) activeCleanup = null;
+    // dismiss 监听是 setTimeout 延迟注册的:cleanup 若在注册前执行(理论路径),
+    // 必须取消注册,否则会留下一组没人移除的孤儿监听器。
+    if (attachTimer !== null) { clearTimeout(attachTimer); attachTimer = null; }
     arthasSub.style.display = "none";
     arthasTrigger.removeEventListener("mouseenter", showSub);
     arthasTrigger.removeEventListener("mouseleave", hideSub);
@@ -94,7 +98,8 @@ export function showEditorContextMenu(view: EditorView, x: number, y: number) {
   };
 
   menu.onclick = handler;
-  setTimeout(() => {
+  attachTimer = setTimeout(() => {
+    attachTimer = null;
     document.addEventListener("click", dismiss);
     document.addEventListener("contextmenu", dismiss);
     // 滚动(滚轮)时关闭菜单 —— 否则菜单是 fixed 浮层,代码滚走了它还钉在原地。

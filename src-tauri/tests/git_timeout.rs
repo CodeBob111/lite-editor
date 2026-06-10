@@ -37,11 +37,10 @@ fn test_git_branch_fast() {
     let result = run_git_with_timeout(tmp.to_str().unwrap(), &["branch"], Duration::from_secs(5));
     assert!(
         result.is_ok()
-            || result
+            || !result
                 .as_ref()
                 .unwrap_err()
                 .contains("not a git repository")
-                == false
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

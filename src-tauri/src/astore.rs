@@ -457,6 +457,7 @@ async fn get_daily_sso(
     get_sso_token(client, &access_token, true).await
 }
 
+#[allow(dead_code)] // 预留:SSO 过期后的刷新路径,尚未接线
 async fn refresh_sso(client: &Client, session: &mut AstoreSession) -> Result<(), String> {
     let time = millis();
     let params = [
@@ -785,7 +786,8 @@ async fn publish_daily(
 
     // Generate publish info
     let gen_url = if is_inside {
-        let url = build_url(
+        
+        build_url(
             true,
             "/changeRecord/generatePublishInfo.do",
             &[
@@ -794,8 +796,7 @@ async fn publish_daily(
                 ("nick", &session.nick_name),
                 ("name", &session.username),
             ],
-        );
-        url
+        )
     } else {
         let url = build_url(
             false,
@@ -878,12 +879,12 @@ async fn publish_daily(
 
     // Sync daily
     let sync_url = if is_inside {
-        let url = build_url(
+        
+        build_url(
             true,
             "/changeRecord/syncDaily.do",
             &[("changeRecordId", &record_id)],
-        );
-        url
+        )
     } else {
         let url = build_url(
             false,

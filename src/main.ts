@@ -37,7 +37,7 @@ import {
 import { hydrateEditorLanguage } from "./editor-language";
 import { isDiffTab, diffDataStore, destroyActiveDiff, renderDiffInEditor, openDiffAsTab, initDiffTabs } from "./diff-tabs";
 import { initRecentProjects, showRecentProjects, hideRecentProjects } from "./recent-projects";
-import { createEditorState, saveCurrentFile, initEditorSetup, applyExternalContent } from "./editor-setup";
+import { createEditorState, saveCurrentFile, initEditorSetup, applyExternalContent, cancelPendingAutoSave } from "./editor-setup";
 import { ensureJavaLspForFile, initLspManager, initJavaIndex, loadMavenModules, lastMavenModules, isJavaIndexBuilding } from "./lsp-manager";
 import {
   addProject, switchProject, closeProject, renderProjectBar,
@@ -178,6 +178,7 @@ const tabManager = new TabManager(
       diffDataStore.delete(closedPath);
       destroyActiveDiff();
     } else {
+      cancelPendingAutoSave(closedPath);
       destroyCachedView(closedPath);
       editorScrollByPath.delete(closedPath);
     }

@@ -148,10 +148,8 @@ fn start_lsp_blocking(
                 .open(&log_path)
             {
                 use std::io::Write;
-                for line in reader.lines() {
-                    if let Ok(line) = line {
-                        let _ = writeln!(file, "{}", line);
-                    }
+                for line in reader.lines().map_while(Result::ok) {
+                    let _ = writeln!(file, "{}", line);
                 }
             }
         });
@@ -170,9 +168,8 @@ fn start_lsp_blocking(
 
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
-        loop {
-            match read_next_message(&mut reader) {
-                Ok(msg) => {
+        while let Ok(msg) = read_next_message(&mut reader) {
+            {
                     let has_id = msg.get("id").is_some();
                     let method = msg.get("method").and_then(|m| m.as_str()).map(String::from);
 
@@ -282,8 +279,6 @@ fn start_lsp_blocking(
                             _ => {}
                         }
                     }
-                }
-                Err(_) => break,
             }
         }
     });
@@ -853,7 +848,7 @@ fn find_class_in_maven_blocking(fqn: &str) -> Result<Option<DecompiledClass>, St
         if let Ok(content) = extract_from_jar(jar_path, &java_path) {
             let cache_dir = format!("{}/Library/Caches/lite-editor/decompiled", home);
             let _ = std::fs::create_dir_all(&cache_dir);
-            let file_name = fqn.split('.').last().unwrap_or("Unknown");
+            let file_name = fqn.split('.').next_back().unwrap_or("Unknown");
             let cache_path = format!("{}/{}.java", cache_dir, file_name);
             let _ = std::fs::write(&cache_path, &content);
             return Ok(Some(DecompiledClass {
@@ -868,7 +863,7 @@ fn find_class_in_maven_blocking(fqn: &str) -> Result<Option<DecompiledClass>, St
         if let Ok(content) = decompile_class(&jar_path, fqn) {
             let cache_dir = format!("{}/Library/Caches/lite-editor/decompiled", home);
             let _ = std::fs::create_dir_all(&cache_dir);
-            let file_name = fqn.split('.').last().unwrap_or("Unknown");
+            let file_name = fqn.split('.').next_back().unwrap_or("Unknown");
             let cache_path = format!("{}/{}.java", cache_dir, file_name);
             let _ = std::fs::write(&cache_path, &content);
             return Ok(Some(DecompiledClass {
@@ -881,7 +876,7 @@ fn find_class_in_maven_blocking(fqn: &str) -> Result<Option<DecompiledClass>, St
     if let Some(content) = find_class_in_jdk_src(fqn) {
         let cache_dir = format!("{}/Library/Caches/lite-editor/decompiled", home);
         let _ = std::fs::create_dir_all(&cache_dir);
-        let file_name = fqn.split('.').last().unwrap_or("Unknown");
+        let file_name = fqn.split('.').next_back().unwrap_or("Unknown");
         let cache_path = format!("{}/{}.java", cache_dir, file_name);
         let _ = std::fs::write(&cache_path, &content);
         return Ok(Some(DecompiledClass {

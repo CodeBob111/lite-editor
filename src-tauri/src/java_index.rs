@@ -93,7 +93,7 @@ fn collect_java_files(project_path: &str) -> Vec<PathBuf> {
             !skip_dirs.contains(&name.as_ref())
         })
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().is_file() && e.path().extension().map_or(false, |ext| ext == "java"))
+        .filter(|e| e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "java"))
         .map(|e| e.path().to_path_buf())
         .collect()
 }
@@ -269,7 +269,7 @@ pub async fn update_java_index_file(
     let fp = file_path.clone();
     let parsed = tokio::task::spawn_blocking(move || {
         let path = Path::new(&fp);
-        if !path.exists() || path.extension().map_or(true, |e| e != "java") {
+        if !path.exists() || path.extension().is_none_or(|e| e != "java") {
             return Ok(None);
         }
         let class_name = path

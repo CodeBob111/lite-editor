@@ -639,14 +639,14 @@ pub fn run_maven_command(
 
     std::thread::spawn(move || {
         let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(Result::ok) {
             let _ = app_out.emit("maven-output", &line);
         }
     });
 
     std::thread::spawn(move || {
         let reader = std::io::BufReader::new(stderr);
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(Result::ok) {
             let _ = app_err.emit("maven-output", &line);
         }
     });
