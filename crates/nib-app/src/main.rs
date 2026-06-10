@@ -4,6 +4,7 @@
 
 mod diff_view;
 mod git_panel;
+mod maven_panel;
 mod usages_view;
 mod quick_open;
 mod search_panel;
@@ -28,6 +29,7 @@ use gpui_component::{
 use futures::StreamExt as _;
 use diff_view::{DiffView, DiffViewEvent};
 use git_panel::{GitPanel, GitPanelEvent};
+use maven_panel::MavenPanel;
 use quick_open::{QuickOpen, QuickOpenEvent};
 use search_panel::{SearchEvent, SearchPanel};
 use usages_view::{UsagesEvent, UsagesView};
@@ -116,12 +118,14 @@ struct OpenTab {
 enum SidebarView {
     Files,
     Git,
+    Maven,
 }
 
 struct Workbench {
     focus_handle: FocusHandle,
     sidebar_view: SidebarView,
     git_panel: Entity<GitPanel>,
+    maven_panel: Entity<MavenPanel>,
     _git_sub: Subscription,
     window_handle: AnyWindowHandle,
     project_root: PathBuf,
@@ -173,6 +177,7 @@ impl Workbench {
         .detach();
 
         let git_panel = cx.new(|cx| GitPanel::new(root.clone(), window, cx));
+        let maven_panel = cx.new(|cx| MavenPanel::new(root.clone(), cx));
         let git_sub = cx.subscribe(
             &git_panel,
             |this: &mut Workbench, _, event: &GitPanelEvent, cx| match event {
@@ -206,6 +211,7 @@ impl Workbench {
             focus_handle,
             sidebar_view: SidebarView::Files,
             git_panel,
+            maven_panel,
             _git_sub: git_sub,
             window_handle: window.window_handle(),
             project_root: root.clone(),
@@ -304,6 +310,8 @@ impl Workbench {
         self.reload_tree(cx);
         let git_root = self.project_root.clone();
         self.git_panel
+            .update(cx, |panel, cx| panel.set_project(git_root.clone(), cx));
+        self.maven_panel
             .update(cx, |panel, cx| panel.set_project(git_root, cx));
 
         // quick-open 文件清单预载
@@ -1115,24 +1123,30 @@ impl Render for Workbench {
                                     .selected_index(match self.sidebar_view {
                                         SidebarView::Files => 0,
                                         SidebarView::Git => 1,
+                                        SidebarView::Maven => 2,
                                     })
                                     .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                                        this.sidebar_view = if *ix == 1 {
-                                            this.git_panel.update(cx, |p, cx| p.refresh(cx));
-                                            SidebarView::Git
-                                        } else {
-                                            SidebarView::Files
+                                        this.sidebar_view = match *ix {
+                                            1 => {
+                                                this.git_panel
+                                                    .update(cx, |p, cx| p.refresh(cx));
+                                                SidebarView::Git
+                                            }
+                                            2 => SidebarView::Maven,
+                                            _ => SidebarView::Files,
                                         };
                                         cx.notify();
                                     }))
                                     .child(Tab::new().label("文件"))
-                                    .child(Tab::new().label("Git")),
+                                    .child(Tab::new().label("Git"))
+                                    .child(Tab::new().label("Maven")),
                             )
                             .child(div().flex_1().min_h_0().map(|this| {
                                 match self.sidebar_view {
                                     SidebarView::Files => this
                                         .child(tree(&self.tree_state, Self::render_tree_item)),
                                     SidebarView::Git => this.child(self.git_panel.clone()),
+                                    SidebarView::Maven => this.child(self.maven_panel.clone()),
                                 }
                             })),
                     )

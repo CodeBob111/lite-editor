@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 #[derive(Serialize, Clone)]
 pub struct DepCoordRef {
-    group_id: String,
-    artifact_id: String,
+    pub group_id: String,
+    pub artifact_id: String,
 }
 
 #[derive(Serialize)]
@@ -57,22 +57,22 @@ pub struct MavenConflict {
 
 #[derive(Serialize)]
 pub struct MavenFlatDep {
-    group_id: String,
-    artifact_id: String,
-    version: String,
-    scope: String,
-    is_conflict: bool,
+    pub group_id: String,
+    pub artifact_id: String,
+    pub version: String,
+    pub scope: String,
+    pub is_conflict: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    omitted_for: Option<String>,
+    pub omitted_for: Option<String>,
 }
 
 #[derive(Serialize)]
 pub struct MavenDepTree {
-    exit_code: i32,
+    pub exit_code: i32,
     /// exit_code != 0 时为 None;成功时是 synthetic 根(空坐标,children = 各模块根)
-    root: Option<DepNode>,
-    conflicts: Vec<MavenConflict>,
-    flat: Vec<MavenFlatDep>,
+    pub root: Option<DepNode>,
+    pub conflicts: Vec<MavenConflict>,
+    pub flat: Vec<MavenFlatDep>,
 }
 
 // ---- 坐标解析 ----
@@ -738,13 +738,13 @@ mod tests {
 
 #[derive(Serialize)]
 pub struct MavenModule {
-    name: String,
-    group_id: String,
-    artifact_id: String,
-    version: String,
-    packaging: String,
-    pom_path: String,
-    modules: Vec<String>,
+    pub name: String,
+    pub group_id: String,
+    pub artifact_id: String,
+    pub version: String,
+    pub packaging: String,
+    pub pom_path: String,
+    pub modules: Vec<String>,
 }
 
 pub async fn parse_maven_modules(project_path: String) -> Result<Vec<MavenModule>, String> {
