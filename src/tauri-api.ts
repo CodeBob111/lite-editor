@@ -139,7 +139,6 @@ export interface DepCoordRef {
 export interface DepNode {
   group_id: string;
   artifact_id: string;
-  type: string;
   version: string;
   scope: string;
   omitted_for?: string;

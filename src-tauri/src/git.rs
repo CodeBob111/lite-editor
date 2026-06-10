@@ -1,4 +1,4 @@
-use crate::commands::{ci_cmp, on_worker};
+use crate::commands::on_worker;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::path::Path;
@@ -270,16 +270,23 @@ fn git_list_branches_sync(cwd: &str) -> Result<Vec<GitBranch>, String> {
         });
     }
 
-    // 返回即有序(排序自前端 git-panel.ts 迁入):local 按 current → master → main → 其余,
-    // 组内大小写不敏感字典序;remote 仅按名(rank 对 "origin/x" 恒为 10,等效名字序)。
-    branches.sort_by(|a, b| {
-        a.remote
-            .cmp(&b.remote)
-            .then_with(|| branch_rank(a).cmp(&branch_rank(b)))
-            .then_with(|| ci_cmp(&a.name, &b.name))
-    });
+    sort_branches(&mut branches);
 
     Ok(branches)
+}
+
+// 返回序即面板展示序(排序自前端 git-panel.ts 迁入):local 按 current → master → main → 其余,
+// 组内大小写不敏感字典序(近似 localeCompare,原串 tie-break);remote 排最后、
+// 仅按名(rank 对 "origin/x" 恒为 10,等效名字序)。
+fn sort_branches(branches: &mut [GitBranch]) {
+    branches.sort_by_cached_key(|b| {
+        (
+            b.remote,
+            branch_rank(b),
+            b.name.to_lowercase(),
+            b.name.clone(),
+        )
+    });
 }
 
 fn branch_rank(branch: &GitBranch) -> u8 {
@@ -830,7 +837,8 @@ pub async fn git_remote_url(cwd: String, remote: Option<String>) -> Result<Strin
 // ---- 冲突标记解析(3-way merge 编辑器用) ----
 // 自前端 merge-conflict.ts 迁入。行分割 split('\n') + 重建 join("\n"):行内 \r 与
 // 尾部空行原样保留,CRLF 文件经 merge 保存不被静默 LF 化(字节级保真)。
-// 收 path 而非内容:省去全文下行+上行两趟 IPC(lock 文件冲突动辄数 MB)。
+// 收 path:文件由 Rust 直接读盘解析,前端不再为解析上传全文;下行的是
+// ours/theirs 两份重建文本与 chunk 区间。
 
 #[derive(Serialize)]
 pub struct ConflictChunk {
@@ -859,24 +867,44 @@ pub(crate) fn parse_conflict_markers(text: &str) -> ConflictParse {
     let mut chunk_theirs_start = 0usize;
     let mut chunk_ours_lines: Vec<&str> = Vec::new();
     let mut chunk_theirs_lines: Vec<&str> = Vec::new();
+    // 自 "<<<<<<<" 起的原始行(含标记行):块未闭合时原文回灌双侧,不丢内容
+    let mut raw_chunk: Vec<&str> = Vec::new();
+
+    // 未闭合的标记块不是真冲突(正文里恰好有 "<<<<<<<" 开头的行、或文件被截断),
+    // 原始行原样保留在两侧——否则 merge 保存会静默丢掉这段内容
+    fn flush_unterminated<'a>(
+        ours: &mut Vec<&'a str>,
+        theirs: &mut Vec<&'a str>,
+        raw: &mut Vec<&'a str>,
+    ) {
+        ours.extend(raw.iter().copied());
+        theirs.extend(raw.iter().copied());
+        raw.clear();
+    }
 
     for line in text.split('\n') {
         if line.starts_with("<<<<<<<") {
+            if in_ours || in_theirs {
+                flush_unterminated(&mut ours_lines, &mut theirs_lines, &mut raw_chunk);
+            }
             in_ours = true;
             in_theirs = false;
             chunk_ours_start = ours_lines.len();
             chunk_theirs_start = theirs_lines.len();
             chunk_ours_lines = Vec::new();
             chunk_theirs_lines = Vec::new();
+            raw_chunk = vec![line];
             continue;
         }
         if line.starts_with("=======") && in_ours {
             in_ours = false;
             in_theirs = true;
+            raw_chunk.push(line);
             continue;
         }
         if line.starts_with(">>>>>>>") && in_theirs {
             in_theirs = false;
+            raw_chunk.clear();
             ours_lines.append(&mut chunk_ours_lines);
             theirs_lines.append(&mut chunk_theirs_lines);
             chunks.push(ConflictChunk {
@@ -891,12 +919,18 @@ pub(crate) fn parse_conflict_markers(text: &str) -> ConflictParse {
         }
         if in_ours {
             chunk_ours_lines.push(line);
+            raw_chunk.push(line);
         } else if in_theirs {
             chunk_theirs_lines.push(line);
+            raw_chunk.push(line);
         } else {
             ours_lines.push(line);
             theirs_lines.push(line);
         }
+    }
+
+    if in_ours || in_theirs {
+        flush_unterminated(&mut ours_lines, &mut theirs_lines, &mut raw_chunk);
     }
 
     ConflictParse {
@@ -965,6 +999,22 @@ mod tests {
     }
 
     #[test]
+    fn unterminated_marker_block_keeps_content() {
+        // 正文里出现 "<<<<<<<" 开头的行但没有闭合 → 不是冲突,内容原样保留
+        let text = "a\n<<<<<<< 教学示例\nb\nc\n";
+        let parsed = parse_conflict_markers(text);
+        assert_eq!(parsed.ours, text);
+        assert_eq!(parsed.theirs, text);
+        assert!(parsed.chunks.is_empty());
+        // 未闭合块后紧跟一个真冲突:前者回灌,后者正常解析
+        let text2 = "<<<<<<< x\norphan\n<<<<<<< HEAD\na\n=======\nb\n>>>>>>> br\ntail";
+        let parsed2 = parse_conflict_markers(text2);
+        assert_eq!(parsed2.ours, "<<<<<<< x\norphan\na\ntail");
+        assert_eq!(parsed2.theirs, "<<<<<<< x\norphan\nb\ntail");
+        assert_eq!(parsed2.chunks.len(), 1);
+    }
+
+    #[test]
     fn local_branches_sort_by_rank_then_ci_name() {
         let mk = |name: &str, current: bool, remote: bool| GitBranch {
             name: name.to_string(),
@@ -983,12 +1033,7 @@ mod tests {
             mk("origin/beta", false, true),
             mk("origin/Alpha", false, true),
         ];
-        branches.sort_by(|a, b| {
-            a.remote
-                .cmp(&b.remote)
-                .then_with(|| branch_rank(a).cmp(&branch_rank(b)))
-                .then_with(|| ci_cmp(&a.name, &b.name))
-        });
+        sort_branches(&mut branches);
         let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
         assert_eq!(
             names,

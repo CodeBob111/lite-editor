@@ -416,6 +416,10 @@ async function doFetchTree(pomPath: string) {
   const moduleDir = pomPath.replace(/\/pom\.xml$/, "");
   try {
     const result = await mavenDependencyTree(moduleDir);
+    // mvn 可能跑数十秒,期间用户可能已切到别的 pom/项目——陈旧结果直接丢弃,
+    // 否则 A 的树会渲染在 B 的面板下,右键 exclude 还会写错 pom
+    // (同 project-manager doRefreshTree 的守卫模式)
+    if (currentPomPath !== pomPath) return;
     if (result.exit_code !== 0 || !result.root) {
       isLoading = false;
       return;
@@ -426,7 +430,7 @@ async function doFetchTree(pomPath: string) {
     isLoading = false;
     if (isDepAnalyzerActive()) renderContent();
   } catch {
-    isLoading = false;
+    if (currentPomPath === pomPath) isLoading = false;
   }
 }
 

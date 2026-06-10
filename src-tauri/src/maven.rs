@@ -6,7 +6,7 @@
 // 2. direct_parent = depth-1 直接依赖——TS findDirectParent off-by-one 返回 depth-0
 //    模块自身,exclude 在 pom 里搜模块自身 GAV 永远失败。
 
-use crate::commands::{ci_cmp, on_worker};
+use crate::commands::on_worker;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
@@ -21,8 +21,6 @@ pub struct DepCoordRef {
 pub struct DepNode {
     group_id: String,
     artifact_id: String,
-    #[serde(rename = "type")]
-    dep_type: String,
     version: String,
     scope: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,10 +74,10 @@ pub struct MavenDepTree {
 
 // ---- 坐标解析 ----
 
+// 坐标里的 type/classifier 段只参与切分定位,不进 DTO——TS 渲染端从不消费
 struct RawCoord {
     group_id: String,
     artifact_id: String,
-    dep_type: String,
     version: String,
     scope: String,
     omitted_for: Option<String>,
@@ -117,19 +115,26 @@ fn parse_dep_coord(raw: &str) -> Option<RawCoord> {
     }
 
     let parts: Vec<&str> = text.split(':').collect();
-    let coord = |g: &str, a: &str, t: &str, v: &str, s: &str| RawCoord {
+    // 真实坐标段不含空白;挡住 "Finished at: 2026-06-10T12:34:56+08:00" 这类
+    // 恰好被冒号切成 4-5 段的收尾行,否则会变成树里的假节点
+    if parts
+        .iter()
+        .any(|p| p.is_empty() || p.chars().any(char::is_whitespace))
+    {
+        return None;
+    }
+    let coord = |g: &str, a: &str, v: &str, s: &str| RawCoord {
         group_id: g.to_string(),
         artifact_id: a.to_string(),
-        dep_type: t.to_string(),
         version: v.to_string(),
         scope: s.to_string(),
         omitted_for: omitted_for.clone(),
     };
     match parts.len() {
         // groupId:artifactId:type:version[:scope] / groupId:artifactId:type:classifier:version:scope
-        4 => Some(coord(parts[0], parts[1], parts[2], parts[3], "compile")),
-        5 => Some(coord(parts[0], parts[1], parts[2], parts[3], parts[4])),
-        n if n >= 6 => Some(coord(parts[0], parts[1], parts[2], parts[4], parts[5])),
+        4 => Some(coord(parts[0], parts[1], parts[3], "compile")),
+        5 => Some(coord(parts[0], parts[1], parts[3], parts[4])),
+        n if n >= 6 => Some(coord(parts[0], parts[1], parts[4], parts[5])),
         _ => None,
     }
 }
@@ -227,7 +232,6 @@ fn build_node(nodes: &[RawNode], idx: usize) -> DepNode {
     DepNode {
         group_id: n.coord.group_id.clone(),
         artifact_id: n.coord.artifact_id.clone(),
-        dep_type: n.coord.dep_type.clone(),
         version: n.coord.version.clone(),
         scope: n.coord.scope.clone(),
         omitted_for: n.coord.omitted_for.clone(),
@@ -290,7 +294,8 @@ pub(crate) fn build_dep_tree(exit_code: i32, output: &str) -> MavenDepTree {
             });
         }
     }
-    conflicts.sort_by(|a, b| ci_cmp(&a.artifact_id, &b.artifact_id));
+    // 大小写不敏感字典序(近似 TS localeCompare 的 ASCII 行为),原串 tie-break
+    conflicts.sort_by_cached_key(|c| (c.artifact_id.to_lowercase(), c.artifact_id.clone()));
 
     let conflict_keys: HashSet<String> = conflicts
         .iter()
@@ -317,7 +322,7 @@ pub(crate) fn build_dep_tree(exit_code: i32, output: &str) -> MavenDepTree {
             });
         }
     }
-    flat.sort_by(|a, b| ci_cmp(&a.artifact_id, &b.artifact_id));
+    flat.sort_by_cached_key(|f| (f.artifact_id.to_lowercase(), f.artifact_id.clone()));
 
     // synthetic 根:空坐标,children = 各 depth-0 模块根(多模块 reactor 多棵树)
     let root_children: Vec<DepNode> = nodes
@@ -329,7 +334,6 @@ pub(crate) fn build_dep_tree(exit_code: i32, output: &str) -> MavenDepTree {
     let root = DepNode {
         group_id: String::new(),
         artifact_id: String::new(),
-        dep_type: String::new(),
         version: String::new(),
         scope: "compile".to_string(),
         omitted_for: None,
@@ -387,6 +391,7 @@ pub(crate) fn add_exclusion(
     let mut dep_end: Option<usize> = None;
     let mut found_group = false;
     let mut found_artifact = false;
+    let mut in_exclusions = false;
     let group_tag = format!("<groupId>{}</groupId>", parent_group_id);
     let artifact_tag = format!("<artifactId>{}</artifactId>", parent_artifact_id);
 
@@ -396,13 +401,24 @@ pub(crate) fn add_exclusion(
             dep_start = Some(i);
             found_group = false;
             found_artifact = false;
+            in_exclusions = false;
         }
         if dep_start.is_some() {
-            if trimmed == group_tag {
-                found_group = true;
+            if trimmed == "<exclusions>" {
+                in_exclusions = true;
             }
-            if trimmed == artifact_tag {
-                found_artifact = true;
+            if trimmed == "</exclusions>" {
+                in_exclusions = false;
+            }
+            // <exclusions> 块里的 groupId/artifactId 是排除项不是依赖本身——
+            // 否则别的依赖排除过目标 GAV 时,exclusion 会被插进错误的 <dependency>
+            if !in_exclusions {
+                if trimmed == group_tag {
+                    found_group = true;
+                }
+                if trimmed == artifact_tag {
+                    found_artifact = true;
+                }
             }
             if trimmed == "</dependency>" {
                 if found_group && found_artifact {
@@ -576,6 +592,52 @@ mod tests {
         let c = parse_dep_coord("g:a:jar:1.0:compile (version managed from 2.0)").unwrap();
         assert_eq!(c.version, "1.0");
         assert!(parse_dep_coord("g:a").is_none());
+        // mvn 收尾行恰好被冒号切成 5 段,不能当坐标
+        assert!(parse_dep_coord("Finished at: 2026-06-10T12:34:56+08:00").is_none());
+    }
+
+    #[test]
+    fn build_summary_lines_do_not_become_nodes() {
+        let out = "\
+[INFO] com.example:app:jar:1.0
+[INFO] +- org.x:dep-x:jar:1.0:compile
+[INFO] BUILD SUCCESS
+[INFO] Total time:  2.5 s
+[INFO] Finished at: 2026-06-10T12:34:56+08:00
+";
+        let tree = build_dep_tree(0, out);
+        assert_eq!(tree.flat.len(), 2, "只有 app 和 dep-x,无假节点");
+    }
+
+    #[test]
+    fn exclusion_lines_in_other_dependency_do_not_match() {
+        // lib-x 的排除项里出现 org.alpha:lib-a,不能把 lib-x 误认成 lib-a 的依赖块
+        let pom = "\
+<project>
+    <dependencies>
+        <dependency>
+            <groupId>org.foo</groupId>
+            <artifactId>lib-x</artifactId>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.alpha</groupId>
+                    <artifactId>lib-a</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.alpha</groupId>
+            <artifactId>lib-a</artifactId>
+        </dependency>
+    </dependencies>
+</project>";
+        let updated = add_exclusion(pom, "org.alpha", "lib-a", "org.gamma", "lib-c").unwrap();
+        let lib_a_dep = updated.find("<artifactId>lib-a</artifactId>\n        </dependency>");
+        assert!(lib_a_dep.is_none(), "lib-a 块应已插入 exclusions 而非保持原样");
+        // 新 exclusion 落在第二个 <dependency>(lib-a 自己的块)里
+        let second_dep = updated.rfind("<dependency>").unwrap();
+        let gamma = updated.find("org.gamma").unwrap();
+        assert!(gamma > second_dep, "exclusion 必须插进 lib-a 的块,不是 lib-x 的");
     }
 
     #[test]

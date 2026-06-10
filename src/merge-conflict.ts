@@ -327,7 +327,8 @@ async function openMergeEditor(relPath: string) {
 
     const resultDoc = mergeResultView.state.doc;
     const initialChunks: ChunkPos[] = parsed.chunks.map((c, i) => {
-      const startLine = c.ours_start + 1;
+      // 末尾空 ours 块(EOF 处删除 vs 新增、无尾随换行)行号会越过文档末行,夹一下防 RangeError
+      const startLine = Math.min(c.ours_start + 1, resultDoc.lines);
       const endLine = Math.min(c.ours_end, resultDoc.lines);
       const from = resultDoc.line(startLine).from;
       const to = endLine >= startLine ? resultDoc.line(endLine).to : from;

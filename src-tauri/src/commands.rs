@@ -37,13 +37,6 @@ pub(crate) async fn on_worker<T: Send + 'static>(
         .map_err(|e| format!("Task failed: {}", e))?
 }
 
-/// 大小写不敏感字典序(近似前端 localeCompare 的 ASCII 行为),原串 tie-break
-pub(crate) fn ci_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    a.to_lowercase()
-        .cmp(&b.to_lowercase())
-        .then_with(|| a.cmp(b))
-}
-
 // ---- File tree ----
 
 #[derive(Serialize, Clone)]

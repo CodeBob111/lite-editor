@@ -50,21 +50,23 @@ export function isMdPreviewActive(): boolean {
 }
 
 export async function showMdPreview(filePath: string, content?: string) {
+  // 打开/关闭是同步的用户意图,先落状态再等异步渲染——否则 await 期间用户
+  // 切文件/点关闭会留下半截状态(currentPath 残留旧值,toggle 按钮失灵)
+  editorArea.classList.add("md-split-active");
+  applySplit();
+  currentPath = filePath;
+  active = true;
+  updatePreviewButton(true);
+
   const text = content ?? await readFile(filePath);
   const seq = ++renderSeq;
   const html = await renderMarkdown(text);
   if (seq !== renderSeq) return;
   previewEl.innerHTML = `<div class="md-body">${html}</div>`;
-
-  editorArea.classList.add("md-split-active");
-  applySplit();
-
-  currentPath = filePath;
-  active = true;
-  updatePreviewButton(true);
 }
 
 export function hideMdPreview() {
+  renderSeq++; // 立刻作废在飞的渲染,防止关闭后异步结果回写把预览重新打开
   editorArea.classList.remove("md-split-active");
   editorContainer.style.width = "";
   previewEl.style.width = "";
