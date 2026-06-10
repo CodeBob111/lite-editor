@@ -3,6 +3,7 @@
 // 自持 runtime,结果回主线程更新实体;异步回灌一律带陈旧守卫。
 
 mod quick_open;
+mod search_panel;
 mod session;
 
 use std::path::PathBuf;
@@ -21,11 +22,21 @@ use gpui_component::{
     TitleBar,
 };
 
+use futures::StreamExt as _;
 use quick_open::{QuickOpen, QuickOpenEvent};
+use search_panel::{SearchEvent, SearchPanel};
 
 actions!(
     nib,
-    [SaveFile, CloseTab, ToggleQuickOpen, PaletteUp, PaletteDown, PaletteDismiss]
+    [
+        SaveFile,
+        CloseTab,
+        ToggleQuickOpen,
+        ToggleSearch,
+        PaletteUp,
+        PaletteDown,
+        PaletteDismiss
+    ]
 );
 
 /// 双击 Shift 的判定窗口(对齐旧版 quick-open 习惯)
@@ -62,6 +73,20 @@ fn file_node_to_tree_item(node: &nib_core::fs::FileNode) -> TreeItem {
     }
 }
 
+/// notify 线程 → gpui 主线程的事件桥(EventSink 的 nib-app 实现)
+struct ChannelSink(futures::channel::mpsc::UnboundedSender<nib_core::CoreEvent>);
+
+impl nib_core::EventSink for ChannelSink {
+    fn emit(&self, event: nib_core::CoreEvent) {
+        let _ = self.0.unbounded_send(event);
+    }
+}
+
+enum Overlay {
+    QuickOpen(Entity<QuickOpen>),
+    Search(Entity<SearchPanel>),
+}
+
 struct OpenTab {
     path: PathBuf,
     title: SharedString,
@@ -81,8 +106,10 @@ struct Workbench {
     active_tab: Option<usize>,
     /// 全项目文件清单缓存(quick-open 用;core runtime 预载)
     all_files: Arc<Vec<String>>,
-    palette: Option<Entity<QuickOpen>>,
-    _palette_sub: Option<Subscription>,
+    overlay: Option<Overlay>,
+    _overlay_sub: Option<Subscription>,
+    watcher: Arc<nib_core::watch::WatcherState>,
+    events_sink: Arc<ChannelSink>,
     status: SharedString,
     /// 主线程停顿哨兵计数(>32ms 漂移即记,可举证不凭感觉)
     stall_count: usize,
@@ -123,6 +150,20 @@ impl Workbench {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle, cx);
 
+        // 文件监听:notify 线程 emit → channel → 主线程 on_core_event
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<nib_core::CoreEvent>();
+        let window_handle = window.window_handle();
+        cx.spawn(async move |weak, cx| {
+            while let Some(event) = rx.next().await {
+                let _ = cx.update_window(window_handle, |_, window, cx| {
+                    let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                        this.on_core_event(event, window, cx);
+                    });
+                });
+            }
+        })
+        .detach();
+
         let mut this = Self {
             focus_handle,
             window_handle: window.window_handle(),
@@ -132,8 +173,10 @@ impl Workbench {
             tabs: Vec::new(),
             active_tab: None,
             all_files: Arc::new(Vec::new()),
-            palette: None,
-            _palette_sub: None,
+            overlay: None,
+            _overlay_sub: None,
+            watcher: Arc::new(nib_core::watch::WatcherState::default()),
+            events_sink: Arc::new(ChannelSink(tx)),
             status: "".into(),
             stall_count: 0,
             last_shift: None,
@@ -170,6 +213,15 @@ impl Workbench {
 
     /// 切换/加载项目:重置树与文件清单(均在 core runtime 上跑,带陈旧守卫)
     fn load_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let old_root = self.project_root.to_string_lossy().to_string();
+        let _ = nib_core::watch::stop_file_watcher(&old_root, &self.watcher);
+        if let Err(err) = nib_core::watch::start_file_watcher(
+            root.to_string_lossy().to_string(),
+            self.events_sink.clone(),
+            &self.watcher,
+        ) {
+            eprintln!("[nib] 文件监听启动失败: {}", err);
+        }
         self.project_root = root.clone();
         self.project_name = root
             .file_name()
@@ -178,9 +230,30 @@ impl Workbench {
             .into();
         self.status = root.display().to_string().into();
 
+        self.reload_tree(cx);
+
+        // quick-open 文件清单预载
+        let files_root = root.to_string_lossy().to_string();
+        let guard_root = root;
+        cx.spawn(async move |weak, cx| {
+            if let Ok(mut files) = nib_core::search::list_all_files(files_root).await {
+                files.sort();
+                let _ = weak.update(cx, |this, cx| {
+                    if this.project_root == guard_root {
+                        this.all_files = Arc::new(files);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 重读目录树(项目加载/外部结构变化共用;core runtime 上跑,带陈旧守卫)
+    fn reload_tree(&mut self, cx: &mut Context<Self>) {
         let tree_for_load = self.tree_state.clone();
-        let root_str = root.to_string_lossy().to_string();
-        let guard_root = root.clone();
+        let root_str = self.project_root.to_string_lossy().to_string();
+        let guard_root = self.project_root.clone();
         cx.spawn(async move |weak, cx| {
             let result = nib_core::fs::read_dir_tree(root_str, Some(12)).await;
             if let Ok(node) = result {
@@ -199,22 +272,68 @@ impl Workbench {
             }
         })
         .detach();
+    }
 
-        // quick-open 文件清单预载
-        let files_root = root.to_string_lossy().to_string();
-        let guard_root = root;
-        cx.spawn(async move |weak, cx| {
-            if let Ok(mut files) = nib_core::search::list_all_files(files_root).await {
-                files.sort();
-                let _ = weak.update(cx, |this, cx| {
-                    if this.project_root == guard_root {
-                        this.all_files = Arc::new(files);
-                        cx.notify();
-                    }
-                });
+    /// 外部文件变更(watcher 已做 500ms 防抖 + 产物目录过滤):
+    /// 结构变化重读树;打开中的非脏标签自动跟随磁盘内容(agent 改文件编辑器要跟上)
+    fn on_core_event(
+        &mut self,
+        event: nib_core::CoreEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let nib_core::CoreEvent::FileChanged {
+            project,
+            has_structural,
+        } = event
+        else {
+            return;
+        };
+        if std::path::Path::new(&project) != self.project_root.as_path() {
+            return;
+        }
+        if has_structural {
+            self.reload_tree(cx);
+        }
+        let _ = window;
+        for tab in &self.tabs {
+            if tab.dirty {
+                continue; // 本地有未保存编辑,绝不覆盖
             }
-        })
-        .detach();
+            let path = tab.path.clone();
+            let editor = tab.editor.clone();
+            let window_handle = self.window_handle;
+            cx.spawn(async move |weak, cx| {
+                let Ok(disk) = nib_core::fs::read_file(path.to_string_lossy().to_string()).await
+                else {
+                    return;
+                };
+                let _ = cx.update_window(window_handle, |_, window, cx| {
+                    let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                        // 陈旧守卫:标签还在、仍非脏、内容确实变了才回灌
+                        let still = this
+                            .tabs
+                            .iter()
+                            .any(|t| t.path == path && !t.dirty && t.editor == editor);
+                        if !still {
+                            return;
+                        }
+                        let changed = editor.read(cx).value().as_ref() != disk.as_str();
+                        if changed {
+                            editor.update(cx, |state, cx| {
+                                state.set_value(disk.clone(), window, cx);
+                            });
+                            // set_value 会触发 Change 订阅误标脏,这里立刻洗掉
+                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.path == path) {
+                                tab.dirty = false;
+                            }
+                            cx.notify();
+                        }
+                    });
+                });
+            })
+            .detach();
+        }
     }
 
     /// 会话恢复:按保存顺序逐个读盘建标签(单任务串行,保证标签顺序确定)
@@ -438,7 +557,50 @@ impl Workbench {
         cx.notify();
     }
 
-    // ---- quick-open ----
+    /// 打开文件并定位到行列(全局搜索跳转用)
+    fn open_file_at(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::input::Position;
+        if let Some(ix) = self.tabs.iter().position(|t| t.path == path) {
+            self.activate_tab(ix, window, cx);
+            if let Some(tab) = self.tabs.get(ix) {
+                tab.editor.update(cx, |state, cx| {
+                    state.set_cursor_position(Position::new(line, column), window, cx);
+                });
+            }
+            return;
+        }
+        let window_handle = self.window_handle;
+        let status_path = path.display().to_string();
+        self.status = format!("打开 {} …", status_path).into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let content = nib_core::fs::read_file(path.to_string_lossy().to_string()).await;
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = this.update(cx, |this, cx| {
+                    if let Ok(text) = content {
+                        let ix = this.insert_tab(path.clone(), text, window, cx);
+                        this.activate_tab(ix, window, cx);
+                        if let Some(tab) = this.tabs.get(ix) {
+                            tab.editor.update(cx, |state, cx| {
+                                state.set_cursor_position(Position::new(line, column), window, cx);
+                            });
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    // ---- 浮层(quick-open / 全局搜索) ----
 
     fn on_toggle_quick_open(
         &mut self,
@@ -449,8 +611,31 @@ impl Workbench {
         self.toggle_palette(window, cx);
     }
 
+    fn on_toggle_search(&mut self, _: &ToggleSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.overlay, Some(Overlay::Search(_))) {
+            self.close_palette(window, cx);
+            return;
+        }
+        let panel = cx.new(|cx| SearchPanel::new(self.project_root.clone(), window, cx));
+        panel.update(cx, |p, cx| p.focus(window, cx));
+        let sub = cx.subscribe_in(
+            &panel,
+            window,
+            |this: &mut Self, _, event: &SearchEvent, window, cx| match event {
+                SearchEvent::Open { path, line, column } => {
+                    let (path, line, column) = (path.clone(), *line, *column);
+                    this.close_palette(window, cx);
+                    this.open_file_at(path, line, column, window, cx);
+                }
+            },
+        );
+        self.overlay = Some(Overlay::Search(panel));
+        self._overlay_sub = Some(sub);
+        cx.notify();
+    }
+
     fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.is_some() {
+        if matches!(self.overlay, Some(Overlay::QuickOpen(_))) {
             self.close_palette(window, cx);
             return;
         }
@@ -469,14 +654,14 @@ impl Workbench {
                 }
             },
         );
-        self.palette = Some(palette);
-        self._palette_sub = Some(sub);
+        self.overlay = Some(Overlay::QuickOpen(palette));
+        self._overlay_sub = Some(sub);
         cx.notify();
     }
 
     fn close_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette = None;
-        self._palette_sub = None;
+        self.overlay = None;
+        self._overlay_sub = None;
         let handle = match self.active() {
             Some(tab) => tab.editor.read(cx).focus_handle(cx),
             None => self.focus_handle.clone(),
@@ -486,14 +671,18 @@ impl Workbench {
     }
 
     fn on_palette_up(&mut self, _: &PaletteUp, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(p) = &self.palette {
-            p.update(cx, |p, cx| p.move_selection(-1, cx));
+        match &self.overlay {
+            Some(Overlay::QuickOpen(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
+            Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
+            None => {}
         }
     }
 
     fn on_palette_down(&mut self, _: &PaletteDown, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(p) = &self.palette {
-            p.update(cx, |p, cx| p.move_selection(1, cx));
+        match &self.overlay {
+            Some(Overlay::QuickOpen(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
+            Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
+            None => {}
         }
     }
 
@@ -575,6 +764,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_toggle_quick_open))
+            .on_action(cx.listener(Self::on_toggle_search))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
             .child(
@@ -665,7 +855,11 @@ impl Render for Workbench {
                         )
                     }),
             )
-            .when_some(self.palette.clone(), |this, palette| {
+            .when(self.overlay.is_some(), |this| {
+                let content: AnyElement = match self.overlay.as_ref().unwrap() {
+                    Overlay::QuickOpen(p) => p.clone().into_any_element(),
+                    Overlay::Search(p) => p.clone().into_any_element(),
+                };
                 this.child(
                     div()
                         .absolute()
@@ -677,7 +871,7 @@ impl Render for Workbench {
                         .on_action(cx.listener(Self::on_palette_up))
                         .on_action(cx.listener(Self::on_palette_down))
                         .on_action(cx.listener(Self::on_palette_dismiss))
-                        .child(div().mt(px(110.)).child(palette)),
+                        .child(div().mt(px(110.)).child(content)),
                 )
             })
     }
@@ -706,6 +900,7 @@ fn main() {
             KeyBinding::new("cmd-s", SaveFile, Some("Workbench")),
             KeyBinding::new("cmd-w", CloseTab, Some("Workbench")),
             KeyBinding::new("cmd-p", ToggleQuickOpen, Some("Workbench")),
+            KeyBinding::new("cmd-shift-f", ToggleSearch, Some("Workbench")),
             KeyBinding::new("up", PaletteUp, Some("QuickOpen")),
             KeyBinding::new("down", PaletteDown, Some("QuickOpen")),
             KeyBinding::new("escape", PaletteDismiss, Some("QuickOpen")),
