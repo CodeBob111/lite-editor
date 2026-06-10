@@ -12,7 +12,8 @@ use gpui_component::{
     list::ListItem,
     tab::{Tab, TabBar},
     tree::{tree, TreeItem, TreeState},
-    v_flex, ActiveTheme, Icon, IconName, Root, Sizable as _, Theme, ThemeMode, TitleBar,
+    v_flex, ActiveTheme, Icon, IconName, Root, Sizable as _, Theme, ThemeMode, ThemeRegistry,
+    TitleBar,
 };
 
 actions!(nib, [SaveFile, CloseTab]);
@@ -357,8 +358,9 @@ impl Render for Workbench {
                     .px_2()
                     .items_center()
                     .gap_3()
+                    .bg(cx.theme().status_bar)
                     .border_t_1()
-                    .border_color(cx.theme().border)
+                    .border_color(cx.theme().status_bar_border)
                     .text_size(px(12.))
                     .text_color(cx.theme().muted_foreground)
                     .child(div().flex_1().min_w_0().overflow_hidden().child(self.status.clone()))
@@ -378,6 +380,20 @@ fn main() {
     gpui_platform::application().run(move |cx| {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
+        // Warm Earth:旧 Nib(webview 版)的 cobalt 色板逐项移植(src/styles/main.css
+        // :root 单一真源 + editor-theme.ts 语法配色),保证重构前后外观一致
+        if let Err(err) = ThemeRegistry::global_mut(cx)
+            .load_themes_from_str(include_str!("../themes/warm-earth.json"))
+        {
+            eprintln!("[nib] 加载 Warm Earth 主题失败,退回默认暗色: {}", err);
+        }
+        let warm_earth = ThemeRegistry::global(cx)
+            .themes()
+            .get(&SharedString::from("Warm Earth"))
+            .cloned();
+        if let Some(config) = warm_earth {
+            Theme::global_mut(cx).apply_config(&config);
+        }
         cx.bind_keys([
             KeyBinding::new("cmd-s", SaveFile, Some("Workbench")),
             KeyBinding::new("cmd-w", CloseTab, Some("Workbench")),
