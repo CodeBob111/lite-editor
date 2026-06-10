@@ -41,6 +41,7 @@ actions!(
         PaletteDown,
         PaletteDismiss,
         OpenFolder,
+        GotoDefinition,
         Quit
     ]
 );
@@ -752,6 +753,46 @@ impl Workbench {
         .detach();
     }
 
+    /// F12 跳定义(旧版主路径):跨文件由宿主完成,绕开组件只支持同文件的限制
+    fn on_goto_definition(
+        &mut self,
+        _: &GotoDefinition,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.active() else { return };
+        if tab.lang != "java" {
+            return;
+        }
+        let pos = tab.editor.read(cx).cursor_position();
+        let file = tab.path.to_string_lossy().to_string();
+        let lsp = self.lsp.clone();
+        let window_handle = self.window_handle;
+        self.status = "跳转定义…".into();
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let result =
+                nib_core::lsp::lsp_goto_definition(file, pos.line, pos.character, &lsp).await;
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                    match result {
+                        Ok(Some(usage)) => {
+                            let path = PathBuf::from(
+                                usage.uri.strip_prefix("file://").unwrap_or(&usage.uri),
+                            );
+                            this.status = path.display().to_string().into();
+                            this.open_file_at(path, usage.line, usage.character, window, cx);
+                        }
+                        Ok(None) => this.status = "未找到定义".into(),
+                        Err(err) => this.status = format!("跳转失败: {}", err).into(),
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
     fn on_open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -979,6 +1020,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_toggle_quick_open))
             .on_action(cx.listener(Self::on_toggle_search))
             .on_action(cx.listener(Self::on_open_folder))
+            .on_action(cx.listener(Self::on_goto_definition))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
             .child(
@@ -1151,12 +1193,14 @@ fn main() {
             Menu::new("Go").items([
                 MenuItem::action("快速打开文件…", ToggleQuickOpen),
                 MenuItem::action("在项目中搜索…", ToggleSearch),
+                MenuItem::action("跳转到定义", GotoDefinition),
             ]),
         ]);
 
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
             KeyBinding::new("cmd-o", OpenFolder, Some("Workbench")),
+            KeyBinding::new("f12", GotoDefinition, Some("Workbench")),
             KeyBinding::new("cmd-s", SaveFile, Some("Workbench")),
             KeyBinding::new("cmd-w", CloseTab, Some("Workbench")),
             KeyBinding::new("cmd-p", ToggleQuickOpen, Some("Workbench")),

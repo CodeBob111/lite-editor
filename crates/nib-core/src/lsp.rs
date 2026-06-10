@@ -48,10 +48,10 @@ struct LspServer {
 
 #[derive(Serialize, Clone)]
 pub struct LspUsage {
-    uri: String,
-    line: u32,
-    character: u32,
-    text: String,
+    pub uri: String,
+    pub line: u32,
+    pub character: u32,
+    pub text: String,
 }
 
 // ---- Tauri commands ----
