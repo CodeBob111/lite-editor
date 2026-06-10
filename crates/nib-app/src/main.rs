@@ -47,6 +47,7 @@ actions!(
         OpenFolder,
         GotoDefinition,
         FindUsages,
+        ToggleMdPreview,
         PaletteConfirm,
         Quit
     ]
@@ -141,6 +142,7 @@ struct Workbench {
     lsp: Arc<nib_core::lsp::LspState>,
     events_sink: Arc<ChannelSink>,
     settings: session::EditorSettings,
+    md_preview: bool,
     status: SharedString,
     /// 主线程停顿哨兵计数(>32ms 漂移即记,可举证不凭感觉)
     stall_count: usize,
@@ -226,6 +228,7 @@ impl Workbench {
             lsp: Arc::new(nib_core::lsp::LspState::default()),
             events_sink: Arc::new(ChannelSink(tx)),
             settings: session::EditorSettings::default(),
+            md_preview: false,
             status: "".into(),
             stall_count: 0,
             first_frame_logged: false,
@@ -555,6 +558,9 @@ impl Workbench {
                         cx.notify();
                     }
                 }
+                if this.md_preview {
+                    cx.notify();
+                }
             }
         });
         let title: SharedString = path
@@ -872,6 +878,16 @@ impl Workbench {
         }
     }
 
+    fn on_toggle_md_preview(
+        &mut self,
+        _: &ToggleMdPreview,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.md_preview = !self.md_preview;
+        cx.notify();
+    }
+
     fn on_open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -1103,6 +1119,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_open_folder))
             .on_action(cx.listener(Self::on_goto_definition))
             .on_action(cx.listener(Self::on_find_usages))
+            .on_action(cx.listener(Self::on_toggle_md_preview))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
             .child(
@@ -1176,12 +1193,45 @@ impl Render for Workbench {
                             })
                             .child(div().flex_1().min_h_0().map(|this| {
                                 match self.active() {
-                                    Some(tab) => this.child(
-                                        Input::new(&tab.editor)
+                                    Some(tab) => {
+                                        let editor_el = Input::new(&tab.editor)
                                             .font_family(cx.theme().mono_font_family.clone())
                                             .text_size(px(self.settings.font_size))
-                                            .size_full(),
-                                    ),
+                                            .size_full();
+                                        if self.md_preview && tab.lang == "markdown" {
+                                            let text = tab.editor.read(cx).value();
+                                            this.child(
+                                                h_flex()
+                                                    .size_full()
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .h_full()
+                                                            .min_w_0()
+                                                            .child(editor_el),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .id("md-preview")
+                                                            .flex_1()
+                                                            .h_full()
+                                                            .min_w_0()
+                                                            .overflow_y_scroll()
+                                                            .border_l_1()
+                                                            .border_color(cx.theme().border)
+                                                            .p_4()
+                                                            .child(
+                                                                gpui_component::text::TextView::markdown(
+                                                                    "md-preview-view",
+                                                                    text,
+                                                                ),
+                                                            ),
+                                                    ),
+                                            )
+                                        } else {
+                                            this.child(editor_el)
+                                        }
+                                    }
                                     None => this.child(
                                         v_flex()
                                             .size_full()
@@ -1285,6 +1335,7 @@ fn main() {
                 MenuItem::action("在项目中搜索…", ToggleSearch),
                 MenuItem::action("跳转到定义", GotoDefinition),
                 MenuItem::action("查找引用", FindUsages),
+                MenuItem::action("Markdown 预览", ToggleMdPreview),
             ]),
         ]);
 
@@ -1293,6 +1344,7 @@ fn main() {
             KeyBinding::new("cmd-o", OpenFolder, Some("Workbench")),
             KeyBinding::new("f12", GotoDefinition, Some("Workbench")),
             KeyBinding::new("shift-f12", FindUsages, Some("Workbench")),
+            KeyBinding::new("cmd-shift-v", ToggleMdPreview, Some("Workbench")),
             KeyBinding::new("enter", PaletteConfirm, Some("QuickOpen")),
             KeyBinding::new("cmd-s", SaveFile, Some("Workbench")),
             KeyBinding::new("cmd-w", CloseTab, Some("Workbench")),
