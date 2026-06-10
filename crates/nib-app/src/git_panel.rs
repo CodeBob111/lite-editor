@@ -152,6 +152,37 @@ impl GitPanel {
         .detach();
     }
 
+    fn sync_remote(&mut self, push: bool, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.status = if push { "推送中…" } else { "拉取中…" }.into();
+        cx.notify();
+        let cwd = self.project_root.to_string_lossy().to_string();
+        let branch = self.branch.to_string();
+        cx.spawn(async move |weak, cx| {
+            let result = if push {
+                nib_core::git::git_push(cwd, branch).await
+            } else {
+                nib_core::git::git_pull(cwd, None, None).await
+            };
+            let _ = weak.update(cx, |this: &mut GitPanel, cx| {
+                this.busy = false;
+                this.status = match &result {
+                    Ok(out) => {
+                        let head = out.lines().next().unwrap_or("完成").to_string();
+                        format!("{} ✓", if head.is_empty() { "完成".into() } else { head }).into()
+                    }
+                    Err(err) => format!("失败: {}", err).into(),
+                };
+                this.refresh(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn checkout(&mut self, branch: String, cx: &mut Context<Self>) {
         if self.busy || branch == self.branch.as_ref() {
             return;
@@ -343,6 +374,22 @@ impl Render for GitPanel {
                     )
                     .child(div().text_size(px(12.)).child(self.branch.clone()))
                     .child(div().flex_1())
+                    .child(
+                        Button::new("pull")
+                            .ghost()
+                            .xsmall()
+                            .label("Pull")
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.sync_remote(false, cx))),
+                    )
+                    .child(
+                        Button::new("push")
+                            .ghost()
+                            .xsmall()
+                            .label("Push")
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.sync_remote(true, cx))),
+                    )
                     .child(
                         Button::new("refresh")
                             .ghost()
