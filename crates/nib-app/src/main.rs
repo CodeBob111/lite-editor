@@ -128,6 +128,7 @@ struct Workbench {
     overlay: Option<Overlay>,
     _overlay_sub: Option<Subscription>,
     watcher: Arc<nib_core::watch::WatcherState>,
+    lsp: Arc<nib_core::lsp::LspState>,
     events_sink: Arc<ChannelSink>,
     settings: session::EditorSettings,
     status: SharedString,
@@ -210,6 +211,7 @@ impl Workbench {
             overlay: None,
             _overlay_sub: None,
             watcher: Arc::new(nib_core::watch::WatcherState::default()),
+            lsp: Arc::new(nib_core::lsp::LspState::default()),
             events_sink: Arc::new(ChannelSink(tx)),
             settings: session::EditorSettings::default(),
             status: "".into(),
@@ -218,6 +220,15 @@ impl Workbench {
             last_shift: None,
             prev_modifiers: Modifiers::default(),
         };
+        let lsp_for_quit = this.lsp.clone();
+        cx.on_app_quit(move |_, _| {
+            let lsp = lsp_for_quit.clone();
+            async move {
+                lsp.kill_all();
+            }
+        })
+        .detach();
+
         this.load_project(root, cx);
 
         // 加载编辑器偏好(含旧 settings.json 一次性导入),回来后应用到已开标签
@@ -339,6 +350,10 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let nib_core::CoreEvent::LspDiagnostics(params) = &event {
+            self.apply_diagnostics(params.clone(), window, cx);
+            return;
+        }
         let nib_core::CoreEvent::FileChanged {
             project,
             has_structural,
@@ -392,6 +407,40 @@ impl Workbench {
             })
             .detach();
         }
+    }
+
+    /// LSP publishDiagnostics → 命中标签的 DiagnosticSet(行列直接用 LSP Position)
+    fn apply_diagnostics(
+        &mut self,
+        params: serde_json::Value,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Ok(params) = serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(params)
+        else {
+            return;
+        };
+        let path = PathBuf::from(params.uri.path().as_str());
+        let Some(tab) = self.tabs.iter().find(|t| t.path == path) else {
+            return;
+        };
+        tab.editor.update(cx, |state, cx| {
+            let text = state.text().clone();
+            if let Some(set) = state.diagnostics_mut() {
+                set.reset(&text);
+                for d in &params.diagnostics {
+                    let mut diag = gpui_component::highlighter::Diagnostic::new(
+                        d.range.start..d.range.end,
+                        d.message.clone(),
+                    );
+                    if let Some(sev) = d.severity {
+                        diag = diag.with_severity(sev);
+                    }
+                    set.push(diag);
+                }
+            }
+            cx.notify();
+        });
     }
 
     /// 会话恢复:按保存顺序逐个读盘建标签(单任务串行,保证标签顺序确定)
@@ -468,6 +517,7 @@ impl Workbench {
             return ix;
         }
         let lang = language_for(&path.to_string_lossy());
+        let text_for_lsp = text.clone();
         let settings = self.settings;
         let editor = cx.new(|cx| {
             InputState::new(window, cx)
@@ -498,6 +548,32 @@ impl Workbench {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string())
             .into();
+        // Java:起 jdtls(幂等)并 didOpen——diagnostics 会经 EventSink 流回
+        if lang == "java" {
+            let lsp = self.lsp.clone();
+            let sink = self.events_sink.clone();
+            let root = self.project_root.to_string_lossy().to_string();
+            let file = path.to_string_lossy().to_string();
+            let content = text_for_lsp;
+            cx.spawn(async move |_, _| {
+                let jdtls_root = session::data_dirs().jdtls_workspaces();
+                if let Err(err) = nib_core::lsp::start_lsp(
+                    "java".into(),
+                    root,
+                    sink as Arc<dyn nib_core::EventSink>,
+                    jdtls_root,
+                    &lsp,
+                )
+                .await
+                {
+                    eprintln!("[nib-lsp] jdtls 启动失败: {}", err);
+                    return;
+                }
+                let _ =
+                    nib_core::lsp::lsp_did_open(file, "java".into(), content, &lsp).await;
+            })
+            .detach();
+        }
         self.tabs.push(OpenTab {
             path,
             title,
@@ -591,8 +667,19 @@ impl Workbench {
         self.status = format!("保存 {} …", path.display()).into();
         cx.notify();
 
+        let lsp = self.lsp.clone();
+        let is_java = path.extension().is_some_and(|e| e == "java");
         cx.spawn(async move |this, cx| {
-            let result = nib_core::fs::write_file(path.to_string_lossy().to_string(), text).await;
+            let result =
+                nib_core::fs::write_file(path.to_string_lossy().to_string(), text.clone()).await;
+            if result.is_ok() && is_java {
+                let _ = nib_core::lsp::lsp_did_change(
+                    path.to_string_lossy().to_string(),
+                    text,
+                    &lsp,
+                )
+                .await;
+            }
             let _ = this.update(cx, |this, cx| {
                 this.status = match result {
                     Ok(()) => {
