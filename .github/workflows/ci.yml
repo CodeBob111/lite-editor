@@ -1,0 +1,46 @@
+# 质量门禁:本仓库的性能/内存/无阻塞保证全部以测试形式存在
+# (负载下无阻塞、并发压力、索引内存有界、重建 RSS 平台化、子进程回收等),
+# 这里让每次 push/PR 都必须通过全套断言 + 双零警告,保证不被后续改动悄悄破坏。
+# 安全说明:所有 run 命令均为静态字符串,不插值任何 github.event 不可信输入。
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  quality-gates:
+    runs-on: macos-latest # 剪贴板(NSPasteboard)与 PTY 测试需要 macOS
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Frontend type-check & build
+        run: |
+          pnpm install --frozen-lockfile
+          npx tsc --noEmit
+          pnpm build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Rust clippy (zero warnings)
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rust tests (incl. load / concurrency / memory assertions)
+        working-directory: src-tauri
+        run: cargo test
