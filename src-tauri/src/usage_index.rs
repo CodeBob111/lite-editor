@@ -471,6 +471,48 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn process_rss_kb() -> u64 {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+            .output()
+            .expect("run ps");
+        String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+    }
+
+    #[test]
+    fn repeated_full_rebuilds_do_not_grow_memory() {
+        // 长期运行/重复操作序列的内存探针:对同一批 200 个文件做 60 次全量重建,
+        // 每轮的旧索引被丢弃,RSS 在热身后应当平台化。若构建路径泄漏(旧表滞留、
+        // 容器只增不缩),增长会随轮次线性放大并触发断言。
+        let dir = std::env::temp_dir().join(format!("usage_idx_soak_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut files = Vec::new();
+        for i in 0..200 {
+            let body: String = (0..20).map(|j| format!("  soakSym{}();\n", (i + j) % 80)).collect();
+            let f = dir.join(format!("Soak{}.java", i));
+            std::fs::write(&f, format!("class Soak{} {{\n{}}}\n", i, body)).unwrap();
+            files.push(f);
+        }
+
+        for _ in 0..10 {
+            let _ = build(&files, None); // 热身:让分配器/rayon 池进入稳态
+        }
+        let base = process_rss_kb();
+        for _ in 0..50 {
+            let idx = build(&files, None);
+            assert_eq!(idx.files.len(), 200);
+        }
+        let after = process_rss_kb();
+        let growth = after.saturating_sub(base);
+        assert!(
+            growth < 60_000,
+            "50 次全量重建后 RSS 增长 {}KB(基线 {}KB),构建路径疑似泄漏",
+            growth, base
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn serde_roundtrip_works_as_incremental_base() {
         let dir = std::env::temp_dir().join(format!("usage_idx_serde_{}", std::process::id()));
