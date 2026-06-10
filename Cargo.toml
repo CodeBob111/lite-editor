@@ -3,7 +3,7 @@
 # 隔离 gpui 与 tauri 两棵依赖树,升 gpui rev 不扰动旧 app 构建(RFC v2 §3)。
 [workspace]
 resolver = "2"
-members = ["crates/nib-core"]
+members = ["crates/nib-app", "crates/nib-core"]
 exclude = ["src-tauri"]
 
 [workspace.package]

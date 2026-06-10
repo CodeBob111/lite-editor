@@ -1,0 +1,15 @@
+# Nib 原生应用(gpui)。依赖经 git 引用:gpui 来自 zed 仓库(跟随 gpui-component
+# 的兼容节奏),首次成功解析后由 Cargo.lock 钉死 rev——升级=显式 cargo update,
+# 不会被动漂移(RFC v2 §2 风险规避)。
+[package]
+name = "nib-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow = "1"
+gpui = { git = "https://github.com/zed-industries/zed" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+gpui-component = { git = "https://github.com/longbridge/gpui-component" }
+nib-core = { path = "../nib-core" }
