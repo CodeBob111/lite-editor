@@ -136,6 +136,9 @@ enum Overlay {
 /// 标签上限(LRU 淘汰,脏标签豁免)
 const MAX_TABS: usize = 30;
 
+/// 侧栏宽度单源(terminal_panel 推算可用列数也用它,不要两处各写 260)
+pub const SIDEBAR_WIDTH: f32 = 260.;
+
 struct OpenTab {
     path: PathBuf,
     title: SharedString,
@@ -678,8 +681,11 @@ impl Workbench {
                     eprintln!("[nib-lsp] jdtls 启动失败: {}", err);
                     return;
                 }
-                let _ =
-                    nib_core::lsp::lsp_did_open(file, "java".into(), content, &lsp).await;
+                if let Err(err) =
+                    nib_core::lsp::lsp_did_open(file, "java".into(), content, &lsp).await
+                {
+                    eprintln!("[nib-lsp] didOpen 失败: {}", err);
+                }
             })
             .detach();
         }
@@ -741,6 +747,17 @@ impl Workbench {
                 self.tabs[ix].last_used = Instant::now();
                 self.status = path.display().to_string().into();
                 self.persist_session(cx);
+                // 本路径无 window(树点击的 observe 进来),经窗口句柄把焦点
+                // 交还编辑器——否则切到已开标签后键入无落点
+                let editor = self.tabs[ix].editor.clone();
+                let window_handle = self.window_handle;
+                cx.spawn(async move |_, cx| {
+                    let _ = cx.update_window(window_handle, |_, window, cx| {
+                        let handle = editor.read(cx).focus_handle(cx);
+                        window.focus(&handle, cx);
+                    });
+                })
+                .detach();
                 cx.notify();
             }
             return;
@@ -805,12 +822,15 @@ impl Workbench {
             let result =
                 nib_core::fs::write_file(path.to_string_lossy().to_string(), text.clone()).await;
             if result.is_ok() && is_java {
-                let _ = nib_core::lsp::lsp_did_change(
+                if let Err(err) = nib_core::lsp::lsp_did_change(
                     path.to_string_lossy().to_string(),
                     text,
                     &lsp,
                 )
-                .await;
+                .await
+                {
+                    eprintln!("[nib-lsp] didChange 失败: {}", err);
+                }
             }
             let _ = this.update(cx, |this, cx| {
                 this.status = match result {
@@ -1006,23 +1026,44 @@ impl Workbench {
         let file = tab.path.to_string_lossy().to_string();
         let lsp = self.lsp.clone();
         cx.spawn(async move |weak, cx| {
-            // FQCN:package 声明 + 文件名类(旧版同口径);方法:LSP 符号树,失败落声明行兜底
+            // FQCN:package 声明 + 文件名类(旧版同口径)
             let pkg = nib_core::arthas::parse_package(&text);
             let class = nib_core::arthas::class_name_from_file_path(&file);
-            let fqn = if pkg.is_empty() { class } else { format!("{}.{}", pkg, class) };
-            let method = match nib_core::lsp::lsp_document_symbols(file.clone(), &lsp).await {
-                Ok(symbols) => nib_core::arthas::find_method_at_position(
-                    &symbols,
-                    pos.line as u64,
-                    pos.character as u64,
-                ),
-                Err(_) => None,
-            }
-            .or_else(|| {
-                text.lines()
-                    .nth(pos.line as usize)
-                    .and_then(nib_core::arthas::method_name_from_decl_line)
+            let self_fqn = if pkg.is_empty() { class } else { format!("{}.{}", pkg, class) };
+
+            // 旧版语义第一优先:光标停在调用点(标识符后跟'(',非声明行)→ 命令打在被调方上。
+            // LSP character 是 UTF-16 码元,先换算字节列再做文本解析。
+            let call_target = text.lines().nth(pos.line as usize).and_then(|line| {
+                let byte_col =
+                    nib_core::arthas::utf16_col_to_byte(line, pos.character as usize);
+                let (word, s, e) = nib_core::arthas::identifier_at(line, byte_col)?;
+                if !nib_core::arthas::followed_by_paren(line, e) {
+                    return None;
+                }
+                nib_core::arthas::resolve_call_fqn_by_text(&text, line, s, &word, &pkg, &self_fqn)
             });
+
+            // 兜底:所在方法(LSP 符号树,再失败落声明行)
+            let (fqn, method) = match call_target {
+                Some((fqn, method)) => (fqn, Some(method)),
+                None => {
+                    let method =
+                        match nib_core::lsp::lsp_document_symbols(file.clone(), &lsp).await {
+                            Ok(symbols) => nib_core::arthas::find_method_at_position(
+                                &symbols,
+                                pos.line as u64,
+                                pos.character as u64,
+                            ),
+                            Err(_) => None,
+                        }
+                        .or_else(|| {
+                            text.lines()
+                                .nth(pos.line as usize)
+                                .and_then(nib_core::arthas::method_name_from_decl_line)
+                        });
+                    (self_fqn, method)
+                }
+            };
             let command =
                 nib_core::arthas::generate_arthas_command(&fqn, method.as_deref(), cmd);
             let copied = nib_core::clipboard::copy_text_to_clipboard(command.clone());
@@ -1456,7 +1497,7 @@ impl Render for Workbench {
                     .min_h_0()
                     .child(
                         v_flex()
-                            .w(px(260.))
+                            .w(px(SIDEBAR_WIDTH))
                             .h_full()
                             .border_r_1()
                             .border_color(cx.theme().border)
@@ -1582,7 +1623,7 @@ impl Render for Workbench {
                                 this.when_some(self.terminal.clone(), |this, panel| {
                                     this.child(
                                         div()
-                                            .h(px(240.))
+                                            .h(px(terminal_panel::PANEL_HEIGHT))
                                             .border_t_1()
                                             .border_color(cx.theme().border)
                                             .child(panel),

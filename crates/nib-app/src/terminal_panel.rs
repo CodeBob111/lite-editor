@@ -14,6 +14,10 @@ use nib_core::terminal::{TermColor, TermSnapshot, TerminalSession};
 
 const FONT_SIZE: f32 = 13.;
 const LINE_H: f32 = 17.;
+/// 底部面板总高(main.rs 的插槽与本面板 rows 推算共用此单源)
+pub const PANEL_HEIGHT: f32 = 240.;
+const HEADER_H: f32 = 24.;
+const PAD_V: f32 = 8.;
 /// 旧版 xterm 主题的 ANSI 0-7;8-15 v1 复用同色(亮黑除外)
 const PALETTE: [u32; 16] = [
     0x1b2230, 0xff7b72, 0x3fb950, 0xd29922, 0x79c0ff, 0xc699ff, 0x39c5cf, 0xd4dde8,
@@ -113,6 +117,8 @@ pub struct TerminalPanel {
     snap: TermSnapshot,
     exited: bool,
     grid: (u16, u16),
+    /// 等宽字宽缓存(字体与字号固定,首帧实测一次即可)
+    cell_w: Option<Pixels>,
     status: SharedString,
 }
 
@@ -125,6 +131,7 @@ impl TerminalPanel {
             snap: TermSnapshot::default(),
             exited: false,
             grid: (80, 12),
+            cell_w: None,
             status: "".into(),
         };
         this.spawn_session(cx);
@@ -198,10 +205,10 @@ impl TerminalPanel {
             return;
         }
         let ks = &event.keystroke;
-        // cmd-v 粘贴进终端(其余 cmd 组合冒泡给应用)
+        // cmd-v 粘贴进终端(bracketed-paste 语义在 core 处理;其余 cmd 组合冒泡)
         if ks.modifiers.platform && ks.key == "v" {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                session.write(text.into_bytes());
+                session.paste(&text);
                 session.scroll_to_bottom();
             }
             cx.stop_propagation();
@@ -254,20 +261,22 @@ impl TerminalPanel {
 
 impl Render for TerminalPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 等宽字宽实测(决定 cols 与光标 x;估错会导致换行/光标错位)
-        let font = font(cx.theme().mono_font_family.clone());
-        let font_id = window.text_system().resolve_font(&font);
-        let cell_w = window
-            .text_system()
-            .advance(font_id, px(FONT_SIZE), 'm')
-            .map(|s| s.width)
-            .unwrap_or(px(7.8));
+        // 等宽字宽实测一次后缓存(决定 cols 与光标 x;估错会导致换行/光标错位)
+        let cell_w = *self.cell_w.get_or_insert_with(|| {
+            let font = font(cx.theme().mono_font_family.clone());
+            let font_id = window.text_system().resolve_font(&font);
+            window
+                .text_system()
+                .advance(font_id, px(FONT_SIZE), 'm')
+                .map(|s| s.width)
+                .unwrap_or(px(7.8))
+        });
 
-        // 面板宽 = 视口宽 - 侧栏 260 - 边框;高 = 240 - 顶部把手 24 - 上下留白
+        // 面板宽 = 视口宽 - 侧栏 - 边框;高 = 总高 - 顶部把手 - 上下留白
         let viewport = window.viewport_size();
-        let avail_w = f32::from(viewport.width) - 260. - 10.;
+        let avail_w = f32::from(viewport.width) - crate::SIDEBAR_WIDTH - 10.;
         let cols = ((avail_w / f32::from(cell_w)).floor() as u16).clamp(2, 500);
-        let rows = (((240. - 24. - 8.) / LINE_H).floor() as u16).clamp(2, 100);
+        let rows = (((PANEL_HEIGHT - HEADER_H - PAD_V) / LINE_H).floor() as u16).clamp(2, 100);
         self.sync_grid(cols, rows);
 
         let cursor = self.snap.cursor;

@@ -12,6 +12,9 @@ use crate::events::{CoreEvent, EventSink};
 #[derive(Default)]
 pub struct LspState {
     servers: Mutex<HashMap<(String, String), Arc<LspServer>>>,
+    /// 串行化 start_lsp 全程(检查→慢启动→插入):没有它,并发打开两个
+    /// Java 文件会双开 jdtls,第二个 insert 覆盖第一个 → 进程孤儿化
+    start_lock: tokio::sync::Mutex<()>,
 }
 
 impl LspState {
@@ -64,6 +67,7 @@ pub async fn start_lsp(
     state: &LspState,
 ) -> Result<(), String> {
     let key = (language.clone(), root_path.clone());
+    let _start_guard = state.start_lock.lock().await;
 
     {
         let mut servers = state.servers.lock().map_err(|e| e.to_string())?;
@@ -708,6 +712,10 @@ fn read_next_message(reader: &mut BufReader<ChildStdout>) -> Result<serde_json::
 
     if content_length == 0 {
         return Err("Missing Content-Length header".into());
+    }
+    // 64MB 封顶:畸形头(如 Content-Length: 999999999999)不许把进程 OOM 掉
+    if content_length > 64 * 1024 * 1024 {
+        return Err(format!("LSP message too large: {} bytes", content_length));
     }
 
     let mut body = vec![0u8; content_length];

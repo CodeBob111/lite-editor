@@ -85,12 +85,14 @@ impl GitPanel {
         let seq = self.refresh_seq;
         let cwd = self.project_root.to_string_lossy().to_string();
         cx.spawn(async move |weak, cx| {
-            let branch = nib_core::git::git_current_branch(cwd.clone())
-                .await
-                .unwrap_or_default();
-            let changes = nib_core::git::git_status(cwd.clone()).await;
-            let conflicts = nib_core::git::git_merge_conflicts(cwd.clone()).await;
-            let branches = nib_core::git::git_list_branches(cwd.clone()).await;
+            // 四个独立 git 查询并行(core runtime 各占一个 worker),刷新延迟≈最慢单项
+            let (branch, changes, conflicts, branches) = futures::join!(
+                nib_core::git::git_current_branch(cwd.clone()),
+                nib_core::git::git_status(cwd.clone()),
+                nib_core::git::git_merge_conflicts(cwd.clone()),
+                nib_core::git::git_list_branches(cwd.clone()),
+            );
+            let branch = branch.unwrap_or_default();
             let log = if branch.is_empty() {
                 Ok(Vec::new())
             } else {

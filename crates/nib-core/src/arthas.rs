@@ -377,3 +377,45 @@ mod tests {
         );
     }
 }
+
+/// LSP Position.character 是 UTF-16 码元;本模块各函数收的 col 是**字节列**。
+/// 行内有非 ASCII(中文字符串字面量/注释)时两者错位,必须先经这里换算。
+pub fn utf16_col_to_byte(line: &str, utf16_col: usize) -> usize {
+    let mut units = 0usize;
+    for (byte_ix, ch) in line.char_indices() {
+        if units >= utf16_col {
+            return byte_ix;
+        }
+        units += ch.len_utf16();
+    }
+    line.len()
+}
+
+#[cfg(test)]
+mod utf16_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_is_identity() {
+        assert_eq!(utf16_col_to_byte("abc def", 4), 4);
+        assert_eq!(utf16_col_to_byte("abc", 99), 3, "越界钉到行尾");
+    }
+
+    #[test]
+    fn chinese_before_cursor_shifts_bytes() {
+        // "中文" 占 2 个 UTF-16 码元、6 个字节;光标在 x 上(UTF-16 列 2)
+        let line = "中文x.foo()";
+        let byte_col = utf16_col_to_byte(line, 2);
+        assert_eq!(byte_col, 6);
+        let (ident, _, _) = identifier_at(line, byte_col).expect("应取到标识符");
+        assert_eq!(ident, "x");
+    }
+
+    #[test]
+    fn emoji_surrogate_pair_counts_two_units() {
+        // 😀 = 2 个 UTF-16 码元、4 字节
+        let line = "😀ab";
+        assert_eq!(utf16_col_to_byte(line, 2), 4);
+        assert_eq!(utf16_col_to_byte(line, 3), 5);
+    }
+}

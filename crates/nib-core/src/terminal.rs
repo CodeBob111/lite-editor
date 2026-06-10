@@ -179,6 +179,25 @@ impl TerminalSession {
         self.notifier.notify(bytes.into());
     }
 
+    /// 粘贴:应用开了 bracketed-paste(vim/现代 shell)时按协议包裹,
+    /// 否则裸写——对齐旧版 xterm.paste() 的语义,防止粘贴内容被当按键流执行
+    pub fn paste(&self, text: &str) {
+        let bracketed = self
+            .term
+            .lock()
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE);
+        if bracketed {
+            let mut bytes = Vec::with_capacity(text.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            self.write(bytes);
+        } else {
+            self.write(text.as_bytes().to_vec());
+        }
+    }
+
     /// UI 布局变化时调:PTY 与 Term 双侧同步改尺寸
     pub fn resize(&self, cols: u16, rows: u16) {
         let cols = cols.max(2);
