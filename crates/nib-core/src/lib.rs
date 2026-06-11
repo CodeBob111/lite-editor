@@ -5,6 +5,7 @@
 // 低频事件走 EventSink;高频源(终端)不经 EventSink(dirty-pull,M4)。
 
 pub mod arthas;
+pub mod arthas_run;
 pub mod astore;
 pub mod clipboard;
 pub mod diff;

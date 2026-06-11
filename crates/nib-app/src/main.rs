@@ -5,6 +5,7 @@
 mod astore_panel;
 mod diff_view;
 mod file_icons;
+mod arthas_panel;
 mod git_panel;
 mod maven_panel;
 mod merge_view;
@@ -33,6 +34,7 @@ use gpui_component::{
 
 use futures::StreamExt as _;
 use diff_view::{DiffView, DiffViewEvent};
+use arthas_panel::ArthasPanel;
 use astore_panel::AstorePanel;
 use git_panel::{GitPanel, GitPanelEvent, GitPanelMode};
 use maven_panel::MavenPanel;
@@ -67,6 +69,7 @@ actions!(
         ArthasStack,
         ArthasMonitor,
         ArthasTt,
+        ToggleArthas,
         PaletteConfirm,
         Quit
     ]
@@ -203,6 +206,8 @@ struct Workbench {
     md_preview: bool,
     terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
+    arthas: Option<Entity<ArthasPanel>>,
+    arthas_visible: bool,
     expanded_paths: std::collections::HashSet<String>,
     /// git 状态标记(绝对路径→状态首字母),Explorer 树着色用(对齐旧版)
     git_marks: Arc<std::collections::HashMap<String, char>>,
@@ -320,6 +325,8 @@ impl Workbench {
             md_preview: false,
             terminal: None,
             terminal_visible: false,
+            arthas: None,
+            arthas_visible: false,
             expanded_paths: std::collections::HashSet::new(),
             git_marks: Arc::new(std::collections::HashMap::new()),
             projects: Vec::new(),
@@ -1209,10 +1216,41 @@ impl Workbench {
                     Ok(()) => format!("已复制: {}", command).into(),
                     Err(err) => format!("复制失败: {}", err).into(),
                 };
+                // 同步打开底部 Arthas 诊断面板并定位目标(命令构造器与剪贴板同源)
+                this.show_arthas(fqn, method, cmd, cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// 打开/复用底部 Arthas 面板,并把光标解析出的目标方法注入(供 arthas_command 调用)。
+    fn show_arthas(
+        &mut self,
+        fqn: String,
+        method: Option<String>,
+        cmd: nib_core::arthas::ArthasCommand,
+        cx: &mut Context<Self>,
+    ) {
+        let panel = match &self.arthas {
+            Some(panel) => panel.clone(),
+            None => {
+                let panel = cx.new(|cx| ArthasPanel::new(cx));
+                self.arthas = Some(panel.clone());
+                panel
+            }
+        };
+        self.arthas_visible = true;
+        panel.update(cx, |p, cx| p.set_target(fqn, method, cmd, cx));
+    }
+
+    /// 底部 Arthas 面板开/关(菜单 Arthas → 诊断面板 / Ctrl+Shift+A)。
+    fn on_toggle_arthas(&mut self, _: &ToggleArthas, _: &mut Window, cx: &mut Context<Self>) {
+        self.arthas_visible = !self.arthas_visible;
+        if self.arthas_visible && self.arthas.is_none() {
+            self.arthas = Some(cx.new(|cx| ArthasPanel::new(cx)));
+        }
+        cx.notify();
     }
 
     /// 活动栏切视图(对齐旧版 activity-bar):Commit/Git 共用 GitPanel 按 mode 渲染
@@ -1931,6 +1969,7 @@ impl Render for Workbench {
             .on_action(cx.listener(|this: &mut Self, _: &ArthasTt, _, cx| {
                 this.arthas_command(nib_core::arthas::ArthasCommand::Tt, cx)
             }))
+            .on_action(cx.listener(Self::on_toggle_arthas))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
             .when(self.projects.len() > 1, |this| {
@@ -2155,18 +2194,72 @@ impl Render for Workbench {
                                             this.child(editor_el)
                                         }
                                     }
-                                    None => this.child(
-                                        v_flex()
-                                            .size_full()
-                                            .items_center()
-                                            .justify_center()
-                                            .gap_2()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(format!("{} — Nib (native)", self.project_name))
-                                            .child(
-                                                "双击 Shift / Cmd+P 快速打开;Cmd+S 保存;Cmd+W 关标签",
-                                            ),
-                                    ),
+                                    None => {
+                                        // 欢迎/空态:品牌字标 + 项目名 + 真实快捷键速查
+                                        // (对齐 welcome.html 设计稿;快捷键取自 cx.bind_keys)
+                                        let shortcuts: [(&str, &str); 6] = [
+                                            ("⌘O", "打开文件夹"),
+                                            ("⌘P", "快速打开文件"),
+                                            ("⌘⇧F", "全局搜索"),
+                                            ("F12", "跳转定义"),
+                                            ("⌃`", "终端"),
+                                            ("⌃⇧A", "Arthas 诊断面板"),
+                                        ];
+                                        let rows = shortcuts.iter().map(|(k, label)| {
+                                            h_flex()
+                                                .w(px(300.))
+                                                .items_center()
+                                                .gap_3()
+                                                .child(
+                                                    div()
+                                                        .w(px(60.))
+                                                        .text_size(px(12.))
+                                                        .font_family(
+                                                            cx.theme().mono_font_family.clone(),
+                                                        )
+                                                        .text_color(cx.theme().foreground)
+                                                        .child(k.to_string()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .text_size(px(12.))
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(label.to_string()),
+                                                )
+                                        });
+                                        this.child(
+                                            v_flex()
+                                                .size_full()
+                                                .items_center()
+                                                .justify_center()
+                                                .gap_6()
+                                                .child(
+                                                    v_flex()
+                                                        .items_center()
+                                                        .gap_2()
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(46.))
+                                                                .font_weight(FontWeight::BOLD)
+                                                                .text_color(cx.theme().foreground)
+                                                                .child("Nib"),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(13.))
+                                                                .text_color(
+                                                                    cx.theme().muted_foreground,
+                                                                )
+                                                                .child(format!(
+                                                                    "{} · 原生 Rust + GPUI 编辑器",
+                                                                    self.project_name
+                                                                )),
+                                                        ),
+                                                )
+                                                .child(v_flex().gap_1().children(rows)),
+                                        )
+                                    }
                                 }
                             }))
                             .when(self.terminal_visible, |this| {
@@ -2174,6 +2267,17 @@ impl Render for Workbench {
                                     this.child(
                                         div()
                                             .h(px(terminal_panel::PANEL_HEIGHT))
+                                            .border_t_1()
+                                            .border_color(cx.theme().border)
+                                            .child(panel),
+                                    )
+                                })
+                            })
+                            .when(self.arthas_visible, |this| {
+                                this.when_some(self.arthas.clone(), |this, panel| {
+                                    this.child(
+                                        div()
+                                            .h(px(arthas_panel::PANEL_HEIGHT))
                                             .border_t_1()
                                             .border_color(cx.theme().border)
                                             .child(panel),
@@ -2337,6 +2441,7 @@ fn main() {
                 MenuItem::action("Stack 光标方法", ArthasStack),
                 MenuItem::action("Monitor 光标方法", ArthasMonitor),
                 MenuItem::action("TimeTunnel 光标方法", ArthasTt),
+                MenuItem::action("诊断面板  ⌃⇧A", ToggleArthas),
             ]),
             Menu::new("Go").items([
                 MenuItem::action("快速打开文件…", ToggleQuickOpen),
@@ -2359,6 +2464,7 @@ fn main() {
             KeyBinding::new("shift-f12", FindUsages, Some("Workbench")),
             KeyBinding::new("cmd-shift-v", ToggleMdPreview, Some("Workbench")),
             KeyBinding::new("ctrl-`", ToggleTerminal, Some("Workbench")),
+            KeyBinding::new("ctrl-shift-a", ToggleArthas, Some("Workbench")),
             KeyBinding::new("cmd-,", OpenSettings, Some("Workbench")),
             KeyBinding::new("enter", PaletteConfirm, Some("QuickOpen")),
             KeyBinding::new("cmd-s", SaveFile, Some("Workbench")),
