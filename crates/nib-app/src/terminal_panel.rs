@@ -110,13 +110,22 @@ fn keystroke_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
     Some(seq)
 }
 
-pub struct TerminalPanel {
-    focus_handle: FocusHandle,
-    project_root: PathBuf,
-    session: Option<Arc<TerminalSession>>,
+/// 单个终端会话(对齐旧版 terminal-tabs:每会话一个标签,可多开)
+struct TermTab {
+    id: u64,
+    name: SharedString,
+    session: Arc<TerminalSession>,
     snap: TermSnapshot,
     exited: bool,
     grid: (u16, u16),
+}
+
+pub struct TerminalPanel {
+    focus_handle: FocusHandle,
+    project_root: PathBuf,
+    tabs: Vec<TermTab>,
+    active: usize,
+    next_id: u64,
     /// 等宽字宽缓存(字体与字号固定,首帧实测一次即可)
     cell_w: Option<Pixels>,
     /// 右侧占位宽(Astore 右侧栏开启时为其宽度),列数推算要扣掉
@@ -129,16 +138,19 @@ impl TerminalPanel {
         let mut this = Self {
             focus_handle: cx.focus_handle(),
             project_root,
-            session: None,
-            snap: TermSnapshot::default(),
-            exited: false,
-            grid: (80, 12),
+            tabs: Vec::new(),
+            active: 0,
+            next_id: 0,
             cell_w: None,
             right_inset: 0.,
             status: "".into(),
         };
         this.spawn_session(cx);
         this
+    }
+
+    fn active_tab(&self) -> Option<&TermTab> {
+        self.tabs.get(self.active)
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
@@ -154,27 +166,40 @@ impl TerminalPanel {
         self.right_inset = inset;
     }
 
+    /// 新开一个会话标签(旧版 + 按钮/首次打开)
     fn spawn_session(&mut self, cx: &mut Context<Self>) {
         let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
         let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             let _ = tx.unbounded_send(());
         });
-        let (cols, rows) = self.grid;
         match TerminalSession::spawn(
             self.project_root.to_string_lossy().to_string(),
-            cols,
-            rows,
+            80,
+            12,
             waker,
         ) {
             Ok(session) => {
-                let session = Arc::new(session);
-                self.session = Some(session.clone());
-                self.exited = false;
+                self.next_id += 1;
+                let id = self.next_id;
+                let project = self
+                    .project_root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "shell".into());
+                self.tabs.push(TermTab {
+                    id,
+                    name: format!("{} ({})", project, id).into(),
+                    session: Arc::new(session),
+                    snap: TermSnapshot::default(),
+                    exited: false,
+                    grid: (80, 12),
+                });
+                self.active = self.tabs.len() - 1;
                 self.status = "".into();
                 cx.spawn(async move |weak, cx| {
                     while rx.next().await.is_some() {
                         let Ok(()) = weak.update(cx, |this: &mut TerminalPanel, cx| {
-                            this.pull(cx);
+                            this.pull(id, cx);
                         }) else {
                             break; // 面板已销毁,任务退出
                         };
@@ -193,24 +218,41 @@ impl TerminalPanel {
         cx.notify();
     }
 
-    fn pull(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = &self.session else {
+    fn pull(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
             return;
         };
-        if session.take_dirty() {
-            self.snap = session.snapshot();
-            self.exited = session.is_exited();
+        if tab.session.take_dirty() {
+            tab.snap = tab.session.snapshot();
+            tab.exited = tab.session.is_exited();
             cx.notify();
         }
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = &self.session else {
-            return;
-        };
-        if self.exited {
+    fn close_session(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
             return;
         }
+        let tab = self.tabs.remove(ix);
+        tab.session.shutdown();
+        if self.active >= self.tabs.len() {
+            self.active = self.tabs.len().saturating_sub(1);
+        }
+        if self.tabs.is_empty() {
+            self.spawn_session(cx); // 面板常驻至少一个会话
+        }
+        cx.notify();
+    }
+
+    fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        if tab.exited {
+            return;
+        }
+        let session = tab.session.clone();
+        let session = &session;
         let ks = &event.keystroke;
         // cmd-v 粘贴进终端(bracketed-paste 语义在 core 处理;其余 cmd 组合冒泡)
         if ks.modifiers.platform && ks.key == "v" {
@@ -229,7 +271,7 @@ impl TerminalPanel {
     }
 
     fn on_scroll(&mut self, event: &ScrollWheelEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(session) = self.session.clone() else {
+        let Some(session) = self.active_tab().map(|t| t.session.clone()) else {
             return;
         };
         let lines = match event.delta {
@@ -239,29 +281,34 @@ impl TerminalPanel {
         let lines = lines.round() as i32;
         if lines != 0 {
             session.scroll(lines);
-            // scroll() 置脏但 PTY 没新输出不会唤醒,主动拉一帧
             session.take_dirty();
-            self.snap = session.snapshot();
+            let snap = session.snapshot();
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.snap = snap;
+            }
             cx.notify();
         }
     }
 
     fn restart(&mut self, cx: &mut Context<Self>) {
-        if let Some(old) = self.session.take() {
-            old.shutdown();
+        let ix = self.active;
+        if ix < self.tabs.len() {
+            let old = self.tabs.remove(ix);
+            old.session.shutdown();
+            if self.active >= self.tabs.len() {
+                self.active = self.tabs.len().saturating_sub(1);
+            }
         }
-        self.snap = TermSnapshot::default();
         self.spawn_session(cx);
     }
 
-    /// 布局变化时由 render 调:网格尺寸变了才真正 resize
+    /// 布局变化时由 render 调:active 会话网格尺寸变了才真正 resize
     fn sync_grid(&mut self, cols: u16, rows: u16) {
-        if self.grid == (cols, rows) {
-            return;
-        }
-        self.grid = (cols, rows);
-        if let Some(session) = &self.session {
-            session.resize(cols, rows);
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            if tab.grid != (cols, rows) {
+                tab.grid = (cols, rows);
+                tab.session.resize(cols, rows);
+            }
         }
     }
 }
@@ -290,49 +337,129 @@ impl Render for TerminalPanel {
         let rows = (((PANEL_HEIGHT - HEADER_H - PAD_V) / LINE_H).floor() as u16).clamp(2, 100);
         self.sync_grid(cols, rows);
 
-        let cursor = self.snap.cursor;
-        let rows_el: Vec<_> = self
-            .snap
-            .rows
+        let active_ix = self.active;
+        let session_tabs: Vec<_> = self
+            .tabs
             .iter()
-            .map(|row| {
+            .enumerate()
+            .map(|(ix, tab)| {
+                let selected = ix == active_ix;
                 h_flex()
-                    .h(px(LINE_H))
-                    .overflow_hidden()
-                    .children(row.iter().map(|run| {
-                        let fg = resolve_fg(run.fg);
-                        let bg = resolve_bg(run.bg);
-                        let (fg, bg) = if run.inverse {
-                            (bg.unwrap_or(hex(TERM_BG)), Some(fg))
-                        } else {
-                            (fg, bg)
-                        };
+                    .id(("term-tab", ix))
+                    .h(px(20.))
+                    .px_2()
+                    .gap_1()
+                    .items_center()
+                    .flex_none()
+                    .rounded(cx.theme().radius)
+                    .text_size(px(11.))
+                    .when(selected, |s| s.bg(cx.theme().accent))
+                    .when(!selected, |s| {
+                        s.text_color(cx.theme().muted_foreground)
+                            .hover(|s| s.bg(cx.theme().accent))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            this.active = ix;
+                            window.focus(&this.focus_handle, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child(tab.name.clone())
+                    .when(tab.exited, |s| {
+                        s.child(div().text_color(cx.theme().warning).child("!"))
+                    })
+                    .child(
                         div()
-                            .whitespace_nowrap()
-                            .text_color(fg)
-                            .when_some(bg, |s, b| s.bg(b))
-                            .when(run.bold, |s| s.font_weight(FontWeight::BOLD))
-                            .child(SharedString::from(run.text.clone()))
-                    }))
+                            .id(("term-tab-close", ix))
+                            .text_color(cx.theme().muted_foreground)
+                            .hover(|s| s.text_color(cx.theme().foreground))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.close_session(ix, cx);
+                                }),
+                            )
+                            .child("×"),
+                    )
             })
             .collect();
+
+        let (rows_el, cursor, display_offset, exited) = match self.active_tab() {
+            Some(tab) => {
+                let rows_el: Vec<_> = tab
+                    .snap
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        h_flex()
+                            .h(px(LINE_H))
+                            .overflow_hidden()
+                            .children(row.iter().map(|run| {
+                                let fg = resolve_fg(run.fg);
+                                let bg = resolve_bg(run.bg);
+                                let (fg, bg) = if run.inverse {
+                                    (bg.unwrap_or(hex(TERM_BG)), Some(fg))
+                                } else {
+                                    (fg, bg)
+                                };
+                                div()
+                                    .whitespace_nowrap()
+                                    .text_color(fg)
+                                    .when_some(bg, |s, b| s.bg(b))
+                                    .when(run.bold, |s| s.font_weight(FontWeight::BOLD))
+                                    .child(SharedString::from(run.text.clone()))
+                            }))
+                    })
+                    .collect();
+                (
+                    rows_el,
+                    tab.snap.cursor,
+                    tab.snap.display_offset,
+                    tab.exited,
+                )
+            }
+            None => (Vec::new(), None, 0, false),
+        };
 
         v_flex()
             .size_full()
             .bg(hex(TERM_BG))
             .child(
                 h_flex()
-                    .h(px(24.))
+                    .h(px(HEADER_H))
                     .px_2()
-                    .gap_2()
+                    .gap_1()
                     .items_center()
                     .border_b_1()
                     .border_color(cx.theme().border)
                     .text_size(px(11.))
                     .text_color(cx.theme().muted_foreground)
-                    .child("终端")
-                    .when(self.snap.display_offset > 0, |s| {
-                        s.child(format!("回看 -{} 行", self.snap.display_offset))
+                    .child(div().mr_1().child("终端"))
+                    .children(session_tabs)
+                    .child(
+                        div()
+                            .id("term-new")
+                            .w(px(18.))
+                            .h(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(cx.theme().radius)
+                            .hover(|s| s.bg(cx.theme().accent))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.spawn_session(cx);
+                                    window.focus(&this.focus_handle, cx);
+                                }),
+                            )
+                            .child("+"),
+                    )
+                    .when(display_offset > 0, |s| {
+                        s.child(format!("回看 -{} 行", display_offset))
                     })
                     .when(!self.status.is_empty(), |s| {
                         s.child(
@@ -342,7 +469,7 @@ impl Render for TerminalPanel {
                         )
                     })
                     .child(div().flex_1())
-                    .when(self.exited, |s| {
+                    .when(exited, |s| {
                         s.child(
                             div()
                                 .id("term-restart")
