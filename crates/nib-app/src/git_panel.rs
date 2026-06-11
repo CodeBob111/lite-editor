@@ -10,7 +10,6 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
-    tab::{Tab, TabBar},
     v_flex, ActiveTheme, Disableable as _, Sizable as _,
 };
 use nib_core::git::{GitBranch, GitChange, GitCommit};
@@ -20,17 +19,18 @@ pub enum GitPanelEvent {
     OpenMerge { rel_path: String },
 }
 
+/// 对齐旧版:Commit(变更+提交框)与 Git(分支+历史)是活动栏里两个独立视图,
+/// 共享同一份数据/刷新逻辑,由 Workbench 切换 mode
 #[derive(PartialEq, Clone, Copy)]
-enum GitView {
-    Changes,
+pub enum GitPanelMode {
+    Commit,
     Branches,
-    Log,
 }
 
 pub struct GitPanel {
     window_handle: AnyWindowHandle,
     project_root: PathBuf,
-    view: GitView,
+    mode: GitPanelMode,
     branch: SharedString,
     changes: Vec<GitChange>,
     conflicts: Vec<String>,
@@ -54,7 +54,7 @@ impl GitPanel {
         let mut this = Self {
             window_handle: window.window_handle(),
             project_root,
-            view: GitView::Changes,
+            mode: GitPanelMode::Commit,
             branch: "".into(),
             changes: Vec::new(),
             conflicts: Vec::new(),
@@ -67,6 +67,17 @@ impl GitPanel {
         };
         this.refresh(cx);
         this
+    }
+
+    pub fn set_mode(&mut self, mode: GitPanelMode, cx: &mut Context<Self>) {
+        if self.mode != mode {
+            self.mode = mode;
+            cx.notify();
+        }
+    }
+
+    pub fn branch(&self) -> SharedString {
+        self.branch.clone()
     }
 
     pub fn set_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
@@ -426,35 +437,14 @@ impl Render for GitPanel {
                     ),
             )
             .child(
-                TabBar::new("git-views")
-                    .w_full()
-                    .underline()
-                    .selected_index(match self.view {
-                        GitView::Changes => 0,
-                        GitView::Branches => 1,
-                        GitView::Log => 2,
-                    })
-                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                        this.view = match ix {
-                            1 => GitView::Branches,
-                            2 => GitView::Log,
-                            _ => GitView::Changes,
-                        };
-                        cx.notify();
-                    }))
-                    .child(Tab::new().label("变更"))
-                    .child(Tab::new().label("分支"))
-                    .child(Tab::new().label("历史")),
-            )
-            .child(
                 v_flex()
                     .id("git-body")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .p_1()
-                    .map(|body| match self.view {
-                        GitView::Changes => body
+                    .map(|body| match self.mode {
+                        GitPanelMode::Commit => body
                             .when(self.changes.is_empty(), |s| {
                                 s.child(
                                     div()
@@ -465,11 +455,23 @@ impl Render for GitPanel {
                                 )
                             })
                             .children(rows),
-                        GitView::Branches => body.children(self.render_branches(cx)),
-                        GitView::Log => body.children(self.render_log(cx)),
+                        GitPanelMode::Branches => body
+                            .children(self.render_branches(cx))
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .mt_1()
+                                    .border_t_1()
+                                    .border_color(cx.theme().border)
+                                    .text_size(px(11.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("历史"),
+                            )
+                            .children(self.render_log(cx)),
                     }),
             )
-            .when(self.view == GitView::Changes, |panel| panel.child(
+            .when(self.mode == GitPanelMode::Commit, |panel| panel.child(
                 v_flex()
                     .p_2()
                     .gap_2()

@@ -15,7 +15,7 @@ use nib_core::terminal::{TermColor, TermSnapshot, TerminalSession};
 const FONT_SIZE: f32 = 13.;
 const LINE_H: f32 = 17.;
 /// 底部面板总高(main.rs 的插槽与本面板 rows 推算共用此单源)
-pub const PANEL_HEIGHT: f32 = 240.;
+pub const PANEL_HEIGHT: f32 = 220.;
 const HEADER_H: f32 = 24.;
 const PAD_V: f32 = 8.;
 /// 旧版 xterm 主题的 ANSI 0-7;8-15 v1 复用同色(亮黑除外)
@@ -119,6 +119,8 @@ pub struct TerminalPanel {
     grid: (u16, u16),
     /// 等宽字宽缓存(字体与字号固定,首帧实测一次即可)
     cell_w: Option<Pixels>,
+    /// 右侧占位宽(Astore 右侧栏开启时为其宽度),列数推算要扣掉
+    right_inset: f32,
     status: SharedString,
 }
 
@@ -132,6 +134,7 @@ impl TerminalPanel {
             exited: false,
             grid: (80, 12),
             cell_w: None,
+            right_inset: 0.,
             status: "".into(),
         };
         this.spawn_session(cx);
@@ -145,6 +148,10 @@ impl TerminalPanel {
     pub fn set_project(&mut self, root: PathBuf) {
         // 当前 shell 不动(它有自己的 cwd);只影响之后的重启
         self.project_root = root;
+    }
+
+    pub fn set_right_inset(&mut self, inset: f32) {
+        self.right_inset = inset;
     }
 
     fn spawn_session(&mut self, cx: &mut Context<Self>) {
@@ -272,9 +279,13 @@ impl Render for TerminalPanel {
                 .unwrap_or(px(7.8))
         });
 
-        // 面板宽 = 视口宽 - 侧栏 - 边框;高 = 总高 - 顶部把手 - 上下留白
+        // 面板宽 = 视口宽 - 活动栏 - 侧栏 - 右侧栏占位 - 边框;高 = 总高 - 把手 - 留白
         let viewport = window.viewport_size();
-        let avail_w = f32::from(viewport.width) - crate::SIDEBAR_WIDTH - 10.;
+        let avail_w = f32::from(viewport.width)
+            - crate::ACTIVITY_WIDTH
+            - crate::SIDEBAR_WIDTH
+            - self.right_inset
+            - 10.;
         let cols = ((avail_w / f32::from(cell_w)).floor() as u16).clamp(2, 500);
         let rows = (((PANEL_HEIGHT - HEADER_H - PAD_V) / LINE_H).floor() as u16).clamp(2, 100);
         self.sync_grid(cols, rows);

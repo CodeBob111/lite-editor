@@ -4,6 +4,7 @@
 
 mod astore_panel;
 mod diff_view;
+mod file_icons;
 mod git_panel;
 mod maven_panel;
 mod merge_view;
@@ -25,7 +26,6 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, TabSize},
     list::ListItem,
-    tab::{Tab, TabBar},
     tree::{tree, TreeItem, TreeState},
     v_flex, ActiveTheme, Icon, IconName, Root, Sizable as _, Theme, ThemeMode, ThemeRegistry,
     TitleBar,
@@ -34,7 +34,7 @@ use gpui_component::{
 use futures::StreamExt as _;
 use diff_view::{DiffView, DiffViewEvent};
 use astore_panel::AstorePanel;
-use git_panel::{GitPanel, GitPanelEvent};
+use git_panel::{GitPanel, GitPanelEvent, GitPanelMode};
 use maven_panel::MavenPanel;
 use merge_view::{MergeView, MergeViewEvent};
 use quick_open::{QuickOpen, QuickOpenEvent};
@@ -59,6 +59,7 @@ actions!(
         FindUsages,
         ToggleMdPreview,
         ToggleTerminal,
+        ToggleAstore,
         ShowRecentProjects,
         OpenSettings,
         ArthasWatch,
@@ -136,8 +137,12 @@ enum Overlay {
 /// 标签上限(LRU 淘汰,脏标签豁免)
 const MAX_TABS: usize = 30;
 
-/// 侧栏宽度单源(terminal_panel 推算可用列数也用它,不要两处各写 260)
-pub const SIDEBAR_WIDTH: f32 = 260.;
+/// 侧栏宽度单源(terminal_panel 推算可用列数也用它;旧版 --sidebar-width: 256px)
+pub const SIDEBAR_WIDTH: f32 = 256.;
+/// 活动栏宽(旧版 --activity-width: 48px)
+pub const ACTIVITY_WIDTH: f32 = 48.;
+/// Astore 右侧栏宽(旧版 --astore-width: 260px)
+pub const ASTORE_WIDTH: f32 = 260.;
 
 struct OpenTab {
     path: PathBuf,
@@ -154,14 +159,26 @@ struct OpenTab {
 #[derive(PartialEq, Clone, Copy)]
 enum SidebarView {
     Files,
+    Commit,
     Git,
     Maven,
-    Astore,
+}
+
+impl SidebarView {
+    fn title(&self) -> &'static str {
+        match self {
+            SidebarView::Files => "Explorer",
+            SidebarView::Commit => "Commit",
+            SidebarView::Git => "Git",
+            SidebarView::Maven => "Maven",
+        }
+    }
 }
 
 struct Workbench {
     focus_handle: FocusHandle,
     sidebar_view: SidebarView,
+    astore_visible: bool,
     git_panel: Entity<GitPanel>,
     maven_panel: Entity<MavenPanel>,
     astore_panel: Entity<AstorePanel>,
@@ -187,6 +204,8 @@ struct Workbench {
     terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
     expanded_paths: std::collections::HashSet<String>,
+    /// git 状态标记(绝对路径→状态首字母),Explorer 树着色用(对齐旧版)
+    git_marks: Arc<std::collections::HashMap<String, char>>,
     status: SharedString,
     /// 主线程停顿哨兵计数(>32ms 漂移即记,可举证不凭感觉)
     stall_count: usize,
@@ -274,6 +293,7 @@ impl Workbench {
         let mut this = Self {
             focus_handle,
             sidebar_view: SidebarView::Files,
+            astore_visible: false,
             git_panel,
             maven_panel,
             astore_panel,
@@ -296,6 +316,7 @@ impl Workbench {
             terminal: None,
             terminal_visible: false,
             expanded_paths: std::collections::HashSet::new(),
+            git_marks: Arc::new(std::collections::HashMap::new()),
             status: "".into(),
             stall_count: 0,
             first_frame_logged: false,
@@ -383,6 +404,7 @@ impl Workbench {
         }
 
         self.reload_tree(cx);
+        self.refresh_git_marks(cx);
         let git_root = self.project_root.clone();
         self.git_panel
             .update(cx, |panel, cx| panel.set_project(git_root.clone(), cx));
@@ -477,6 +499,7 @@ impl Workbench {
             self.reload_tree(cx);
         }
         self.git_panel.update(cx, |panel, cx| panel.refresh(cx));
+        self.refresh_git_marks(cx);
         let _ = window;
         for tab in &self.tabs {
             if tab.dirty {
@@ -850,13 +873,33 @@ impl Workbench {
 
     fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.active_tab else { return };
+        self.close_tab_at(ix, window, cx);
+    }
+
+    fn close_tab_at(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
+            return;
+        }
         self.tabs.remove(ix);
         self.active_tab = if self.tabs.is_empty() {
             window.focus(&self.focus_handle, cx);
             None
         } else {
-            Some(ix.min(self.tabs.len() - 1))
+            let new_active = match self.active_tab {
+                Some(active) if active > ix => active - 1,
+                Some(active) if active == ix => ix.min(self.tabs.len() - 1),
+                other => return self.finish_close(other, cx),
+            };
+            let handle = self.tabs[new_active].editor.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+            Some(new_active)
         };
+        self.persist_session(cx);
+        cx.notify();
+    }
+
+    fn finish_close(&mut self, active: Option<usize>, cx: &mut Context<Self>) {
+        self.active_tab = active;
         self.persist_session(cx);
         cx.notify();
     }
@@ -1076,6 +1119,32 @@ impl Workbench {
             });
         })
         .detach();
+    }
+
+    /// 活动栏切视图(对齐旧版 activity-bar):Commit/Git 共用 GitPanel 按 mode 渲染
+    fn set_sidebar_view(&mut self, view: SidebarView, cx: &mut Context<Self>) {
+        self.sidebar_view = view;
+        match view {
+            SidebarView::Commit => self.git_panel.update(cx, |p, cx| {
+                p.set_mode(GitPanelMode::Commit, cx);
+                p.refresh(cx);
+            }),
+            SidebarView::Git => self.git_panel.update(cx, |p, cx| {
+                p.set_mode(GitPanelMode::Branches, cx);
+                p.refresh(cx);
+            }),
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    fn on_toggle_astore(&mut self, _: &ToggleAstore, _: &mut Window, cx: &mut Context<Self>) {
+        self.astore_visible = !self.astore_visible;
+        if let Some(panel) = &self.terminal {
+            let inset = if self.astore_visible { ASTORE_WIDTH } else { 0. };
+            panel.update(cx, |p, _| p.set_right_inset(inset));
+        }
+        cx.notify();
     }
 
     fn on_toggle_md_preview(
@@ -1416,30 +1485,235 @@ impl Workbench {
         }
     }
 
-    fn render_tree_item(
-        ix: usize,
-        entry: &gpui_component::tree::TreeEntry,
-        _: bool,
-        _: &mut Window,
-        _: &mut App,
-    ) -> ListItem {
-        let item = entry.item();
-        let icon = if !entry.is_folder() {
-            IconName::File
-        } else if entry.is_expanded() {
+}
+
+/// Explorer 树行(对齐旧版):文件夹用折叠图标,文件用类型字形图标(file-icons 同源),
+/// 文件名按 git 状态着色(M=橙 A/?=绿 D=红),lock/忽略类淡化
+fn render_tree_item(
+    ix: usize,
+    entry: &gpui_component::tree::TreeEntry,
+    _: bool,
+    _: &mut Window,
+    app: &mut App,
+    marks: &std::collections::HashMap<String, char>,
+) -> ListItem {
+    let item = entry.item();
+    let row = h_flex().gap_2().items_center();
+    let row = if entry.is_folder() {
+        let icon = if entry.is_expanded() {
             IconName::FolderOpen
         } else {
             IconName::Folder
         };
-        ListItem::new(ix)
-            .pl(px(8.) + px(14.) * entry.depth() as f32)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(Icon::new(icon).small())
-                    .child(item.label.clone()),
+        row.child(Icon::new(icon).small())
+            .child(div().child(item.label.clone()))
+    } else {
+        let meta = file_icons::file_icon_meta(&item.label);
+        let name_color = match marks.get(item.id.as_ref()) {
+            Some('M') | Some('R') => Some(app.theme().warning),
+            Some('A') | Some('U') => Some(app.theme().success),
+            Some('D') => Some(app.theme().danger),
+            _ if meta.dim => Some(app.theme().muted_foreground),
+            _ => None,
+        };
+        row.child(
+            div()
+                .w(px(14.))
+                .text_size(px(10.))
+                .font_weight(FontWeight::BOLD)
+                .text_color(meta.color)
+                .child(meta.glyph),
+        )
+        .child(
+            div()
+                .when_some(name_color, |s, c| s.text_color(c))
+                .child(item.label.clone()),
+        )
+    };
+    ListItem::new(ix).pl(px(8.) + px(14.) * entry.depth() as f32).child(row)
+}
+
+fn lang_display(lang: &str) -> &'static str {
+    match lang {
+        "rust" => "Rust",
+        "java" => "Java",
+        "typescript" => "TypeScript",
+        "javascript" => "JavaScript",
+        "python" => "Python",
+        "markdown" => "Markdown",
+        "json" => "JSON",
+        "yaml" => "YAML",
+        "toml" => "TOML",
+        "html" => "HTML",
+        "css" => "CSS",
+        "xml" => "XML",
+        "bash" => "Shell",
+        "go" => "Go",
+        "c" => "C",
+        "cpp" => "C++",
+        _ => "Plain Text",
+    }
+}
+
+impl Workbench {
+    /// 活动栏按钮(旧版 .activity-btn 40×40,激活态高亮)
+    fn activity_btn(
+        &self,
+        id: &'static str,
+        glyph: &'static str,
+        view: SidebarView,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.sidebar_view == view;
+        div()
+            .id(id)
+            .w(px(40.))
+            .h(px(40.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(cx.theme().radius)
+            .text_size(px(18.))
+            .text_color(if active {
+                cx.theme().foreground
+            } else {
+                cx.theme().muted_foreground
+            })
+            .when(active, |s| s.bg(cx.theme().list_active))
+            .hover(|s| s.bg(cx.theme().accent))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.set_sidebar_view(view, cx)),
             )
+            .child(glyph)
+    }
+
+    /// 单个编辑器标签(旧版 .tab:类型图标+文件名+关闭×;脏=●)
+    fn render_editor_tab(&self, ix: usize, tab: &OpenTab, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.active_tab == Some(ix);
+        let icon = file_icons::file_icon_meta(&tab.title);
+        let dirty = tab.dirty;
+        h_flex()
+            .id(ix)
+            .h_full()
+            .px_3()
+            .gap_2()
+            .items_center()
+            .flex_none()
+            .border_r_1()
+            .border_color(cx.theme().border)
+            .when(active, |s| {
+                s.bg(cx.theme().background)
+                    .border_t_2()
+                    .border_color(cx.theme().primary)
+            })
+            .when(!active, |s| {
+                s.bg(cx.theme().sidebar)
+                    .text_color(cx.theme().muted_foreground)
+                    .hover(|s| s.bg(cx.theme().accent))
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| this.activate_tab(ix, window, cx)),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(icon.color)
+                    .child(icon.glyph),
+            )
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .whitespace_nowrap()
+                    .when(icon.dim, |s| s.text_color(cx.theme().muted_foreground))
+                    .child(tab.title.clone()),
+            )
+            .child(
+                div()
+                    .id(("tab-close", ix))
+                    .w(px(16.))
+                    .h(px(16.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(cx.theme().radius)
+                    .text_size(px(12.))
+                    .map(|s| {
+                        if dirty {
+                            s.text_color(cx.theme().foreground).child("●")
+                        } else {
+                            s.text_color(cx.theme().muted_foreground)
+                                .hover(|s| s.bg(cx.theme().accent))
+                                .child("×")
+                        }
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_tab_at(ix, window, cx);
+                        }),
+                    ),
+            )
+    }
+
+    /// 面包屑(旧版 #breadcrumb):项目名 › 相对路径段 › 文件名
+    fn render_breadcrumb(&self, path: &std::path::Path, cx: &mut Context<Self>) -> impl IntoElement {
+        let rel = path
+            .strip_prefix(&self.project_root)
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|_| path.to_path_buf());
+        let mut segs: Vec<String> = vec![self.project_name.to_string()];
+        segs.extend(rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()));
+        let line = segs.join(" › ");
+        h_flex()
+            .h(px(24.))
+            .px_3()
+            .items_center()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .text_size(px(11.))
+            .text_color(cx.theme().muted_foreground)
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .child(line)
+    }
+
+    /// Explorer 头部的「定位当前文件」(旧版 btn-locate-file ⌖)
+    fn locate_current_file(&mut self, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active() {
+            let item = TreeItem::new(tab.path.to_string_lossy().to_string(), tab.title.clone());
+            self.tree_state
+                .update(cx, |state, cx| state.set_selected_item(Some(&item), cx));
+        }
+    }
+
+    /// 拉一次 git status 喂给树着色(项目装载 + watcher 变更时;陈旧守卫同款)
+    fn refresh_git_marks(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.project_root.to_string_lossy().to_string();
+        let guard_root = self.project_root.clone();
+        let root = self.project_root.clone();
+        cx.spawn(async move |weak, cx| {
+            let Ok(changes) = nib_core::git::git_status(cwd).await else {
+                return;
+            };
+            let mut marks = std::collections::HashMap::new();
+            for c in changes {
+                let abs = root.join(&c.path).to_string_lossy().to_string();
+                let ch = c.status.chars().next().unwrap_or(' ');
+                // 同文件 staged+unstaged 两条:改动类标记优先于已暂存覆盖
+                marks.entry(abs).or_insert(ch);
+            }
+            let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                if this.project_root == guard_root {
+                    this.git_marks = Arc::new(marks);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 }
 
@@ -1472,6 +1746,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_find_usages))
             .on_action(cx.listener(Self::on_toggle_md_preview))
             .on_action(cx.listener(Self::on_toggle_terminal))
+            .on_action(cx.listener(Self::on_toggle_astore))
             .on_action(cx.listener(Self::on_show_recents))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(|this: &mut Self, _: &ArthasWatch, _, cx| {
@@ -1497,46 +1772,91 @@ impl Render for Workbench {
                     .min_h_0()
                     .child(
                         v_flex()
+                            .w(px(ACTIVITY_WIDTH))
+                            .h_full()
+                            .items_center()
+                            .py_2()
+                            .gap_1()
+                            .border_r_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().sidebar)
+                            .child(self.activity_btn("act-files", "☰", SidebarView::Files, cx))
+                            .child(self.activity_btn("act-commit", "✓", SidebarView::Commit, cx))
+                            .child(self.activity_btn("act-git", "⎇", SidebarView::Git, cx))
+                            .child(self.activity_btn("act-maven", "◪", SidebarView::Maven, cx))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("act-settings")
+                                    .w(px(40.))
+                                    .h(px(40.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(cx.theme().radius)
+                                    .text_size(px(18.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .hover(|s| s.bg(cx.theme().accent))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.on_open_settings(&OpenSettings, window, cx)
+                                        }),
+                                    )
+                                    .child("⚙"),
+                            ),
+                    )
+                    .child(
+                        v_flex()
                             .w(px(SIDEBAR_WIDTH))
                             .h_full()
                             .border_r_1()
                             .border_color(cx.theme().border)
                             .bg(cx.theme().sidebar)
                             .child(
-                                TabBar::new("sidebar-tabs")
-                                    .w_full()
-                                    .underline()
-                                    .selected_index(match self.sidebar_view {
-                                        SidebarView::Files => 0,
-                                        SidebarView::Git => 1,
-                                        SidebarView::Maven => 2,
-                                        SidebarView::Astore => 3,
-                                    })
-                                    .on_click(cx.listener(|this, ix: &usize, _, cx| {
-                                        this.sidebar_view = match *ix {
-                                            1 => {
-                                                this.git_panel
-                                                    .update(cx, |p, cx| p.refresh(cx));
-                                                SidebarView::Git
-                                            }
-                                            2 => SidebarView::Maven,
-                                            3 => SidebarView::Astore,
-                                            _ => SidebarView::Files,
-                                        };
-                                        cx.notify();
-                                    }))
-                                    .child(Tab::new().label("文件"))
-                                    .child(Tab::new().label("Git"))
-                                    .child(Tab::new().label("Maven"))
-                                    .child(Tab::new().label("Astore")),
+                                h_flex()
+                                    .h(px(30.))
+                                    .px_3()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(self.sidebar_view.title().to_uppercase()),
+                                    )
+                                    .when(self.sidebar_view == SidebarView::Files, |s| {
+                                        s.child(
+                                            div()
+                                                .id("locate-file")
+                                                .text_size(px(14.))
+                                                .text_color(cx.theme().muted_foreground)
+                                                .hover(|s| s.text_color(cx.theme().foreground))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _, _, cx| {
+                                                        this.locate_current_file(cx)
+                                                    }),
+                                                )
+                                                .child("⌖"),
+                                        )
+                                    }),
                             )
                             .child(div().flex_1().min_h_0().map(|this| {
                                 match self.sidebar_view {
                                     SidebarView::Files => this
-                                        .child(tree(&self.tree_state, Self::render_tree_item)),
-                                    SidebarView::Git => this.child(self.git_panel.clone()),
+                                        .child(tree(&self.tree_state, {
+                                            let marks = self.git_marks.clone();
+                                            move |ix, entry, sel, window, app| {
+                                                render_tree_item(ix, entry, sel, window, app, &marks)
+                                            }
+                                        })),
+                                    SidebarView::Commit | SidebarView::Git => {
+                                        this.child(self.git_panel.clone())
+                                    }
                                     SidebarView::Maven => this.child(self.maven_panel.clone()),
-                                    SidebarView::Astore => this.child(self.astore_panel.clone()),
                                 }
                             })),
                     )
@@ -1547,22 +1867,20 @@ impl Render for Workbench {
                             .min_w_0()
                             .when(!self.tabs.is_empty(), |this| {
                                 this.child(
-                                    TabBar::new("tabs")
+                                    h_flex()
+                                        .id("editor-tabs")
+                                        .h(px(36.))
                                         .w_full()
-                                        .underline()
-                                        .selected_index(self.active_tab.unwrap_or(0))
-                                        .on_click(cx.listener(|this, ix: &usize, window, cx| {
-                                            this.activate_tab(*ix, window, cx);
-                                        }))
-                                        .children(self.tabs.iter().map(|t| {
-                                            let label: SharedString = if t.dirty {
-                                                format!("● {}", t.title).into()
-                                            } else {
-                                                t.title.clone()
-                                            };
-                                            Tab::new().label(label)
-                                        })),
+                                        .overflow_x_scroll()
+                                        .border_b_1()
+                                        .border_color(cx.theme().border)
+                                        .children(self.tabs.iter().enumerate().map(
+                                            |(ix, t)| self.render_editor_tab(ix, t, cx),
+                                        )),
                                 )
+                                .when_some(self.active(), |this, tab| {
+                                    this.child(self.render_breadcrumb(&tab.path, cx))
+                                })
                             })
                             .child(div().flex_1().min_h_0().map(|this| {
                                 match self.active() {
@@ -1630,26 +1948,68 @@ impl Render for Workbench {
                                     )
                                 })
                             }),
-                    ),
+                    )
+                    .when(self.astore_visible, |row| {
+                        row.child(
+                            v_flex()
+                                .w(px(ASTORE_WIDTH))
+                                .h_full()
+                                .border_l_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().sidebar)
+                                .child(
+                                    h_flex()
+                                        .h(px(30.))
+                                        .px_3()
+                                        .items_center()
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("ASTORE"),
+                                )
+                                .child(div().flex_1().min_h_0().child(self.astore_panel.clone())),
+                        )
+                    }),
             )
             .child(
                 h_flex()
-                    .h(px(26.))
+                    .h(px(24.))
                     .px_2()
                     .items_center()
                     .gap_3()
                     .bg(cx.theme().status_bar)
                     .border_t_1()
                     .border_color(cx.theme().status_bar_border)
-                    .text_size(px(12.))
+                    .text_size(px(11.))
                     .text_color(cx.theme().muted_foreground)
+                    .map(|bar| {
+                        let branch = self.git_panel.read(cx).branch();
+                        bar.when(!branch.is_empty(), |s| {
+                            s.child(
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .whitespace_nowrap()
+                                    .child(div().text_color(cx.theme().info).child("⎇"))
+                                    .child(branch),
+                            )
+                        })
+                    })
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
+                            .whitespace_nowrap()
                             .child(self.status.clone()),
                     )
+                    .when(self.stall_count > 0, |this| {
+                        this.child(
+                            div()
+                                .text_color(cx.theme().danger)
+                                .child(format!("卡顿 ×{}", self.stall_count)),
+                        )
+                    })
                     .when_some(
                         self.active()
                             .map(|t| t.editor.read(cx).cursor_position()),
@@ -1657,12 +2017,21 @@ impl Render for Workbench {
                             this.child(format!("Ln {}, Col {}", pos.line + 1, pos.character + 1))
                         },
                     )
-                    .when(!active_lang.is_empty(), |this| this.child(active_lang))
-                    .when(self.stall_count > 0, |this| {
+                    .when(self.active().is_some(), |this| {
+                        this.child(format!("Spaces: {}", self.settings.tab_size))
+                            .child("UTF-8")
+                            .child("LF")
+                    })
+                    .when(!active_lang.is_empty(), |this| {
+                        this.child(lang_display(active_lang))
+                    })
+                    .when(active_lang == "java", |this| {
                         this.child(
                             div()
-                                .text_color(cx.theme().danger)
-                                .child(format!("卡顿 ×{}", self.stall_count)),
+                                .w(px(7.))
+                                .h(px(7.))
+                                .rounded_full()
+                                .bg(cx.theme().success),
                         )
                     }),
             )
@@ -1745,7 +2114,10 @@ fn main() {
                 MenuItem::action("Markdown 预览", ToggleMdPreview),
             ]),
             // 对齐旧版 View 菜单(Terminal 项;Git/Astore 在侧栏页签,不重复列)
-            Menu::new("View").items([MenuItem::action("Terminal", ToggleTerminal)]),
+            Menu::new("View").items([
+                MenuItem::action("Terminal", ToggleTerminal),
+                MenuItem::action("Astore", ToggleAstore),
+            ]),
         ]);
 
         cx.bind_keys([
