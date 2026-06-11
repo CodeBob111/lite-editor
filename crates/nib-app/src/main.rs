@@ -206,6 +206,9 @@ struct Workbench {
     expanded_paths: std::collections::HashSet<String>,
     /// git 状态标记(绝对路径→状态首字母),Explorer 树着色用(对齐旧版)
     git_marks: Arc<std::collections::HashMap<String, char>>,
+    /// 工作区项目清单(对齐旧版 project-bar;会话持久化保全全部项目)
+    projects: Vec<session::ProjectSession>,
+    active_project: usize,
     status: SharedString,
     /// 主线程停顿哨兵计数(>32ms 漂移即记,可举证不凭感觉)
     stall_count: usize,
@@ -317,6 +320,8 @@ impl Workbench {
             terminal_visible: false,
             expanded_paths: std::collections::HashSet::new(),
             git_marks: Arc::new(std::collections::HashMap::new()),
+            projects: Vec::new(),
+            active_project: 0,
             status: "".into(),
             stall_count: 0,
             first_frame_logged: false,
@@ -358,10 +363,13 @@ impl Workbench {
                 let Some(sess) = session::load().await else {
                     return;
                 };
-                let Some(project) = sess.projects.get(sess.active_project_index).cloned() else {
+                let ix = sess.active_project_index.min(sess.projects.len().saturating_sub(1));
+                let Some(project) = sess.projects.get(ix).cloned() else {
                     return;
                 };
                 let _ = weak.update(cx, |this, cx| {
+                    this.projects = sess.projects.clone();
+                    this.active_project = ix;
                     let root = PathBuf::from(&project.path);
                     if root.exists() {
                         this.load_project(root, cx);
@@ -815,19 +823,37 @@ impl Workbench {
         self.active_tab.and_then(|ix| self.tabs.get(ix))
     }
 
-    fn persist_session(&self, _cx: &mut Context<Self>) {
+    /// 当前项目状态快照(open_files/active_file)
+    fn current_project_slot(&self) -> session::ProjectSession {
+        session::ProjectSession {
+            path: self.project_root.to_string_lossy().to_string(),
+            open_files: self
+                .tabs
+                .iter()
+                .map(|t| t.path.to_string_lossy().to_string())
+                .collect(),
+            active_file: self.active().map(|t| t.path.to_string_lossy().to_string()),
+        }
+    }
+
+    /// 持久化:整张项目清单保全,只覆写当前项目 slot——单项目覆写会把
+    /// 旧版会话里的其余项目全部丢掉(数据破坏,已修)
+    fn persist_session(&mut self, _cx: &mut Context<Self>) {
+        let slot = self.current_project_slot();
+        match self.projects.iter().position(|p| p.path == slot.path) {
+            Some(ix) => {
+                self.projects[ix] = slot;
+                self.active_project = ix;
+            }
+            None => {
+                self.projects.push(slot);
+                self.active_project = self.projects.len() - 1;
+            }
+        }
         let sess = session::PersistedSession {
             version: 1,
-            projects: vec![session::ProjectSession {
-                path: self.project_root.to_string_lossy().to_string(),
-                open_files: self
-                    .tabs
-                    .iter()
-                    .map(|t| t.path.to_string_lossy().to_string())
-                    .collect(),
-                active_file: self.active().map(|t| t.path.to_string_lossy().to_string()),
-            }],
-            active_project_index: 0,
+            projects: self.projects.clone(),
+            active_project_index: self.active_project,
         };
         session::save(&sess);
     }
@@ -1248,10 +1274,7 @@ impl Workbench {
                                 let root = PathBuf::from(path.clone());
                                 this.close_palette(window, cx);
                                 if root != this.project_root {
-                                    this.tabs.clear();
-                                    this.active_tab = None;
-                                    this.load_project(root, cx);
-                                    this.persist_session(cx);
+                                    this.open_project_path(root, cx);
                                 }
                                 cx.notify();
                             }
@@ -1278,11 +1301,7 @@ impl Workbench {
             if let Ok(Ok(Some(paths))) = rx.await {
                 if let Some(root) = paths.into_iter().next() {
                     let _ = weak.update(cx, |this: &mut Workbench, cx| {
-                        this.tabs.clear();
-                        this.active_tab = None;
-                        this.load_project(root, cx);
-                        this.persist_session(cx);
-                        cx.notify();
+                        this.open_project_path(root, cx);
                     });
                 }
             }
@@ -1690,6 +1709,78 @@ impl Workbench {
         }
     }
 
+    /// 项目标签切换(对齐旧版 project-bar):先存当前 slot,再装目标并恢复其标签
+    fn switch_project(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix == self.active_project || ix >= self.projects.len() {
+            return;
+        }
+        self.persist_session(cx);
+        let target = self.projects[ix].clone();
+        self.active_project = ix;
+        self.tabs.clear();
+        self.active_tab = None;
+        let root = PathBuf::from(&target.path);
+        if root.exists() {
+            self.load_project(root, cx);
+            self.restore_tabs(target.open_files.clone(), target.active_file.clone(), cx);
+        }
+        self.persist_session(cx);
+        cx.notify();
+    }
+
+    /// 关项目标签(最后一个不关);关的是当前项目则切到邻位
+    fn close_project(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.projects.len() || self.projects.len() <= 1 {
+            return;
+        }
+        let closing_active = ix == self.active_project;
+        self.projects.remove(ix);
+        if self.active_project > ix {
+            self.active_project -= 1;
+        }
+        if closing_active {
+            let next = ix.min(self.projects.len() - 1);
+            let target = self.projects[next].clone();
+            self.active_project = next;
+            self.tabs.clear();
+            self.active_tab = None;
+            let root = PathBuf::from(&target.path);
+            if root.exists() {
+                self.load_project(root, cx);
+                self.restore_tabs(target.open_files.clone(), target.active_file.clone(), cx);
+            }
+        }
+        let sess = session::PersistedSession {
+            version: 1,
+            projects: self.projects.clone(),
+            active_project_index: self.active_project,
+        };
+        session::save(&sess);
+        cx.notify();
+    }
+
+    /// 打开/聚焦一个项目路径:已在清单→切过去;新路径→追加并切换
+    fn open_project_path(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let path_str = root.to_string_lossy().to_string();
+        self.persist_session(cx);
+        if let Some(ix) = self.projects.iter().position(|p| p.path == path_str) {
+            self.switch_project(ix, cx);
+            return;
+        }
+        self.projects.push(session::ProjectSession {
+            path: path_str,
+            open_files: Vec::new(),
+            active_file: None,
+        });
+        let ix = self.projects.len() - 1;
+        self.active_project = ix;
+        self.tabs.clear();
+        self.active_tab = None;
+        self.load_project(root, cx);
+        self.persist_session(cx);
+        cx.notify();
+    }
+
     /// 拉一次 git status 喂给树着色(项目装载 + watcher 变更时;陈旧守卫同款)
     fn refresh_git_marks(&mut self, cx: &mut Context<Self>) {
         let cwd = self.project_root.to_string_lossy().to_string();
@@ -1766,6 +1857,71 @@ impl Render for Workbench {
             }))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
+            .when(self.projects.len() > 1, |this| {
+                this.child(
+                    h_flex()
+                        .id("project-bar")
+                        .h(px(38.))
+                        .px_2()
+                        .gap_1()
+                        .items_center()
+                        .overflow_x_scroll()
+                        .bg(cx.theme().sidebar)
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .children(self.projects.iter().enumerate().map(|(ix, proj)| {
+                            let name = std::path::Path::new(&proj.path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| proj.path.clone());
+                            let active = ix == self.active_project;
+                            h_flex()
+                                .id(("proj-tab", ix))
+                                .h(px(30.))
+                                .px_3()
+                                .gap_2()
+                                .items_center()
+                                .flex_none()
+                                .rounded(cx.theme().radius)
+                                .text_size(px(13.))
+                                .when(active, |s| s.bg(cx.theme().background))
+                                .when(!active, |s| {
+                                    s.text_color(cx.theme().muted_foreground)
+                                        .hover(|s| s.bg(cx.theme().accent))
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.switch_project(ix, cx)
+                                    }),
+                                )
+                                .child(name)
+                                .when(active && self.projects.len() > 1, |s| {
+                                    s.child(
+                                        div()
+                                            .id(("proj-close", ix))
+                                            .w(px(16.))
+                                            .h(px(16.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .rounded(cx.theme().radius)
+                                            .text_size(px(12.))
+                                            .text_color(cx.theme().muted_foreground)
+                                            .hover(|s| s.bg(cx.theme().accent))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.close_project(ix, cx);
+                                                }),
+                                            )
+                                            .child("×"),
+                                    )
+                                })
+                        })),
+                )
+            })
             .child(
                 h_flex()
                     .flex_1()
