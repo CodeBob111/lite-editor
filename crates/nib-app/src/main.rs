@@ -18,7 +18,7 @@ mod session;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -212,6 +212,8 @@ struct Workbench {
     status: SharedString,
     /// 主线程停顿哨兵计数(>32ms 漂移即记,可举证不凭感觉)
     stall_count: usize,
+    /// 最近一次主线程重操作的标签+起始时刻;哨兵卡顿时据此归因「卡在哪」
+    last_op: Option<(SharedString, Instant)>,
     first_frame_logged: bool,
     last_shift: Option<Instant>,
     prev_modifiers: Modifiers,
@@ -324,6 +326,7 @@ impl Workbench {
             active_project: 0,
             status: "".into(),
             stall_count: 0,
+            last_op: None,
             first_frame_logged: false,
             last_shift: None,
             prev_modifiers: Modifiers::default(),
@@ -614,13 +617,42 @@ impl Workbench {
         .detach();
     }
 
-    /// 帧时/主线程停顿哨兵(RFC v2 §5.6):每 100ms 一个心跳回主线程,
-    /// 漂移 >32ms 视为一次可感知停顿,记证据到 stderr + 状态栏计数。
+    /// 记一条主线程操作面包屑(标签+时刻),卡顿哨兵据此归因「卡在哪」
+    fn mark_op(&mut self, label: impl Into<SharedString>) {
+        self.last_op = Some((label.into(), Instant::now()));
+    }
+
+    /// 帧时/主线程停顿哨兵(RFC v2 §5.6):每 100ms 一个心跳回主线程,漂移 >32ms 视为
+    /// 一次可感知停顿。除 stderr + 状态栏计数外,把当时的操作面包屑落盘 jank.log 供事后分析:
+    /// 哨兵心跳排在被阻塞的主线程队列里,跑到时 last_op 正指向那个操作,op_age≈drift 即元凶。
+    /// 只记原始信号(drift/op/op_age/ts),归因留到分析时,省阈值调参。
     fn start_stall_sentinel(cx: &mut Context<Self>) {
+        // 日志写入口:独立线程串行 append,主线程只 send 一行(O(1)),绝不让日志器自造卡顿
+        // (gpui foreground task 的 await 续体仍在主线程,同步 fs 写会卡→写→更卡的正反馈)
+        let log_path = session::data_dirs().app_data.join("jank.log");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            if let Some(dir) = log_path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            while let Ok(line) = rx.recv() {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+        });
         cx.spawn(async move |this, cx| {
             const BEAT: Duration = Duration::from_millis(100);
             const BUDGET: Duration = Duration::from_millis(32);
+            // 连续卡顿合并:距上次落盘 <500ms 不重复写,防病态渲染循环灌爆日志
+            const LOG_GAP: Duration = Duration::from_millis(500);
             let mut last = Instant::now();
+            let mut last_log: Option<Instant> = None;
             loop {
                 cx.background_executor().timer(BEAT).await;
                 let alive = this.update(cx, |this, cx| {
@@ -633,6 +665,33 @@ impl Workbench {
                             drift.as_millis(),
                             this.stall_count
                         );
+                        // 最近操作 = 自身埋点 vs 终端埋点,起始更晚者(更贴近这次停顿)
+                        let term_op = this.terminal.as_ref().and_then(|t| t.read(cx).last_op());
+                        let op = match (this.last_op.clone(), term_op) {
+                            (Some(a), Some(b)) => Some(if a.1 >= b.1 { a } else { b }),
+                            (a, b) => a.or(b),
+                        };
+                        let emit = last_log.is_none_or(|t| now.duration_since(t) > LOG_GAP);
+                        if emit {
+                            last_log = Some(now);
+                            let ts_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0);
+                            let (op_label, op_age): (String, i64) = match op {
+                                Some((l, started)) => (
+                                    l.to_string(),
+                                    now.duration_since(started).as_millis() as i64,
+                                ),
+                                None => ("?".to_string(), -1),
+                            };
+                            let line = format!(
+                                "{{\"ts_ms\":{ts_ms},\"drift_ms\":{},\"op\":{op_label:?},\"op_age_ms\":{op_age},\"count\":{}}}\n",
+                                drift.as_millis(),
+                                this.stall_count
+                            );
+                            let _ = tx.send(line);
+                        }
                         cx.notify();
                     }
                     last = now;
@@ -656,6 +715,13 @@ impl Workbench {
         if let Some(ix) = self.tabs.iter().position(|t| t.path == path) {
             return ix;
         }
+        let label = format!(
+            "打开文件 {}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+        self.mark_op(label);
         let lang = language_for(&path.to_string_lossy());
         let text_for_lsp = text.clone();
         let settings = self.settings;
@@ -756,6 +822,8 @@ impl Workbench {
         if ix >= self.tabs.len() {
             return;
         }
+        let label = format!("切换标签 {}", self.tabs[ix].title);
+        self.mark_op(label);
         self.active_tab = Some(ix);
         self.tabs[ix].last_used = Instant::now();
         let tab = &self.tabs[ix];
@@ -1716,6 +1784,14 @@ impl Workbench {
         }
         self.persist_session(cx);
         let target = self.projects[ix].clone();
+        let label = format!(
+            "切换项目 {}",
+            std::path::Path::new(&target.path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| target.path.clone())
+        );
+        self.mark_op(label);
         self.active_project = ix;
         self.tabs.clear();
         self.active_tab = None;

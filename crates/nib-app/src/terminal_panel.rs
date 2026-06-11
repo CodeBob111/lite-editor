@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::StreamExt as _;
 use gpui::prelude::FluentBuilder as _;
@@ -131,6 +132,8 @@ pub struct TerminalPanel {
     /// 右侧占位宽(Astore 右侧栏开启时为其宽度),列数推算要扣掉
     right_inset: f32,
     status: SharedString,
+    /// 最近一次终端工作(收到 PTY 输出重建网格)的标签+时刻;卡顿哨兵据此归因
+    last_op: Option<(SharedString, Instant)>,
 }
 
 impl TerminalPanel {
@@ -144,6 +147,7 @@ impl TerminalPanel {
             cell_w: None,
             right_inset: 0.,
             status: "".into(),
+            last_op: None,
         };
         this.spawn_session(cx);
         this
@@ -164,6 +168,11 @@ impl TerminalPanel {
 
     pub fn set_right_inset(&mut self, inset: f32) {
         self.right_inset = inset;
+    }
+
+    /// 最近一次终端工作的标签+时刻(卡顿哨兵跨组件读取归因用)
+    pub fn last_op(&self) -> Option<(SharedString, Instant)> {
+        self.last_op.clone()
     }
 
     /// 新开一个会话标签(旧版 + 按钮/首次打开)
@@ -219,13 +228,18 @@ impl TerminalPanel {
     }
 
     fn pull(&mut self, id: u64, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) else {
-            return;
-        };
-        if tab.session.take_dirty() {
-            tab.snap = tab.session.snapshot();
-            tab.exited = tab.session.is_exited();
-            cx.notify();
+        let mut dirtied = None;
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            if tab.session.take_dirty() {
+                tab.snap = tab.session.snapshot();
+                tab.exited = tab.session.is_exited();
+                dirtied = Some(tab.name.clone());
+                cx.notify();
+            }
+        }
+        // 收到 PTY 输出、重建网格 = 终端在主线程的工作量入口;留面包屑供哨兵归因
+        if let Some(name) = dirtied {
+            self.last_op = Some((format!("终端输出 {name}").into(), Instant::now()));
         }
     }
 
