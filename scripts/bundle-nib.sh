@@ -8,7 +8,7 @@ cd "$(dirname "$0")/.."
 OUT="${1:-target/release/bundle}"
 APP="$OUT/Nib.app"
 BIN=target/release/nib-app
-ICNS=src-tauri/icons/icon.icns
+ICNS=crates/nib-app/assets/icon.icns
 
 [[ -f "$BIN" ]] || { echo "缺 release 二进制,先: cargo build --release -p nib-app"; exit 1; }
 [[ -f "$ICNS" ]] || { echo "缺图标 $ICNS"; exit 1; }

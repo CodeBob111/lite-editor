@@ -2,149 +2,47 @@
 
 [English](./README.md) | **简体中文**
 
-一个基于 [Tauri 2](https://tauri.app/) 和 [CodeMirror 6](https://codemirror.net/) 构建的轻量级原生桌面代码编辑器。它把一个快速的多标签编辑器、完整的 Git 客户端、Java 语言智能、Maven 工具链和集成终端打包进一个体积很小的原生二进制——没有 Electron 应用的内存开销。
+纯 Rust 编写的原生 macOS 代码编辑器，基于 [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui)（Zed 的 GPU 加速 UI 框架）与 [gpui-component](https://github.com/longbridge/gpui-component)。无 webview、无 JavaScript——整个应用是一个原生二进制。
 
-> 状态：早期开发阶段（`v0.1.0`）。主要面向 Java/Maven 工作流构建，同时一等支持 Markdown、Python 和 JavaScript。
-
----
+> 2026-06：原 Tauri 2 + CodeMirror 6 实现已全量重写为原生 Rust（绞杀者迁移，M0–M5）。切换完成后旧 `src/` + `src-tauri/` 已删除。
 
 ## 功能
 
-### 编辑器核心
-- 基于 **CodeMirror 6**，对 Java、Python、JavaScript、Markdown 提供语法高亮。
-- 多标签编辑，底层由 **LRU 视图缓存** 支撑（最多保留 30 个活跃编辑器实例，被淘汰的视图按需重建）。
-- 代码折叠、括号匹配、自动补全、自动换行、查找/替换。
-- **1 秒防抖自动保存**——无需手动保存，同时也保留 `Cmd/Ctrl+S`。
-- **磁盘外部改动自动重载**：原生文件系统监听器会检测到打开的文件被其他工具在磁盘上修改（如 `git checkout`、格式化工具、另一个编辑器），并自动重新加载。未保存的本地编辑永远不会被覆盖——这种情况下只会给出一条不破坏内容的提示。
-- **会话恢复**：下次启动时重新打开你的项目、文件和当前激活的标签。
+- 代码编辑：tree-sitter 语法高亮（Warm Earth 主题）、折叠、软换行
+- 项目文件树、模糊快速打开（双击 Shift / Cmd+P）、全项目搜索（Cmd+Shift+F）
+- Git：变更 / 提交 / 推拉 / 分支 / 历史，自绘 diff 视图，3-way merge 冲突解决
+- Java LSP（jdtls）：诊断、跳转定义（F12）、查找引用（Shift+F12）
+- Maven 依赖树 + 冲突高亮
+- 内置终端（alacritty_terminal 内核，ctrl-`）
+- Markdown 预览（Cmd+Shift+V）、Arthas 命令生成、Astore 集成
+- 会话恢复、最近项目、编辑器设置（Cmd+,）
 
-### 界面与工作台
-- **深色单强调色设计系统**——以冷蓝为唯一强调色的深色主题,由一套集中的 token 色板(背景 / 文字 / 边框 / 语法高亮)统一驱动 UI 与 CodeMirror 主题。
-- **左侧活动栏**在 **Explorer**、**Commit**(工作区改动)、**Git**(分支 + 日志)、**Maven**(模块 + 构建输出)之间切换侧栏,底部固定一个**设置**齿轮。
-- **设置 / 偏好界面**(`Cmd/Ctrl` + `,`):编辑器字体族 / 字号、Tab 宽度、自动换行、括号匹配、代码折叠——绑定到真实的 `settings.json`(持久化到 app-data 目录,并带一个原始 JSON 编辑标签),改动即时应用到编辑器。
-- **欢迎 / 起始页**:无打开文件时显示,含快捷操作(打开文件夹、克隆、新建终端)与最近项目列表。
-- **状态栏**:显示当前分支、诊断计数、光标位置、缩进、编码、行尾、语言。
-- **面包屑**:标签栏下方显示当前文件的路径。
-- **IDEA 风格查找条**(`Cmd/Ctrl` + `F`):实时命中计数 + 区分大小写 / 全词 / 正则开关。
-- **任意可选中处皆可复制**——Markdown 预览、Git 面板、文件树、状态栏等只读区域,不止编辑器内。
-
-### 语言智能
-- **LSP 集成**（Java）：跳转到定义（`F12` 或 `Cmd`+点击）、查找引用、在 lint 槽（gutter）中渲染内联诊断。
-- **Java 类索引**：在 Rust 侧对项目及其 Maven 依赖建立符号索引，用于快速的类查找与导航。
-
-### Git 客户端
-一套由原生 `git` 命令驱动、近乎完整的 Git 界面：
-- 分支管理——创建、切换、重命名、删除、清理（prune）。
-- `pull` / `fetch` / `push`、支持 patch 级（按 hunk）暂存的 `commit`、以及 `log`。
-- 编辑器槽内的**内联 blame**。
-- **带冲突解决界面的合并**——查看每一方、选择某个版本，或按文件解决；另含 `rebase`、`cherry-pick`、`revert`。
-- 从远程 `clone`，以及在打开的工作区中**自动发现多个仓库**。
-- 并排**差异查看器**和工作区**改动面板**。
-
-### 构建与工具
-- **Maven**：从 `pom.xml` 解析模块、运行 Maven 目标（goal）、把输出流式回传到界面。
-- **集成终端**：通过 [`portable-pty`](https://crates.io/crates/portable-pty) 提供真实 PTY 会话，用 [xterm.js](https://xtermjs.org/) 渲染——支持多个终端、尺寸调整、以及 Claude CLI 状态检测。
-- **Markdown 实时预览**，由 [`marked`](https://marked.js.org/) 驱动。
-- **Arthas 辅助**：根据光标所在的 Java 符号，生成 [Arthas](https://github.com/alibaba/arthas) 诊断命令（watch/trace/jad 等）。
-
-### 工作区
-- 多项目根目录、最近项目列表、带完整增删改查（创建 / 重命名 / 复制 / 删除）的文件树、模糊**快速打开**、以及**全局文件搜索**。
-- 内置**性能监视器**，报告可导出。
-
----
-
-## 技术栈
-
-| 层 | 技术 |
-| --- | --- |
-| 前端 | TypeScript、Vite 6、CodeMirror 6、xterm.js、marked |
-| 后端 | Rust、Tauri 2、tokio、`notify`（文件系统监听）、`portable-pty`（终端）、`walkdir`、`rayon`、`quick-xml`（pom 解析）、`reqwest`（HTTP） |
-| 插件 | `tauri-plugin-shell`、`tauri-plugin-dialog` |
-
----
-
-## 项目结构
+## 架构
 
 ```
-lite-editor/
-├── index.html              # 应用外壳
-├── src/                    # 前端（TypeScript）
-│   ├── main.ts             # 入口、菜单接线、文件监听重载
-│   ├── editor-setup.ts     # CodeMirror 状态、自动保存、外部重载
-│   ├── tabs.ts             # 标签管理器
-│   ├── state.ts            # 全局应用状态 + LRU 编辑器缓存
-│   ├── git-panel.ts        # Git 界面(左侧栏视图)
-│   ├── lsp-*.ts            # LSP 客户端与导航
-│   ├── maven-helper.ts     # Maven 面板(左侧栏视图)
-│   ├── terminal-panel.ts   # 集成终端
-│   ├── md-preview.ts       # Markdown 预览
-│   ├── settings.ts         # 偏好设置状态、持久化、即时应用
-│   ├── settings-ui.ts      # 设置界面(Cmd+,)
-│   ├── status-bar.ts       # 状态栏(分支/诊断/光标/语言)+ 面包屑
-│   ├── welcome-screen.ts   # 欢迎 / 起始页
-│   └── ...
-├── src-tauri/              # 后端（Rust）
-│   ├── src/
-│   │   ├── lib.rs          # Tauri 构建器、原生菜单、命令注册
-│   │   ├── commands.rs     # 文件操作、搜索、Maven、文件监听、会话、设置
-│   │   ├── git.rs          # Git 命令面
-│   │   ├── lsp.rs          # Language Server Protocol 桥接
-│   │   ├── java_index.rs   # Java 类索引器
-│   │   └── terminal.rs     # PTY 管理
-│   └── tests/              # Rust 集成测试
-└── package.json
+crates/
+├── nib-core/   # UI 无关内核:fs/搜索/git/maven/lsp/终端/diff/…
+│               # 自持 tokio runtime;主线程永不做阻塞 IO
+└── nib-app/    # gpui 应用:工作台、面板、浮层、主题
 ```
 
----
+性能纪律：所有 IO 与子进程都在 core runtime 上跑；异步回写带陈旧守卫；帧时哨兵记录主线程 >32ms 的卡顿。高频源（PTY 输出）走脏标记拉模型而非事件推送。
 
-## 快速开始
+## 构建与安装
 
-### 前置条件
-- [Node.js](https://nodejs.org/) 18+
-- [Rust](https://rustup.rs/)（stable 工具链）
-- Tauri 2 的平台前置依赖——参见 [Tauri 前置条件指南](https://tauri.app/start/prerequisites/)。
-
-### 安装
 ```bash
-npm install
+cargo build --release -p nib-app   # release 二进制
+scripts/bundle-nib.sh              # → target/release/bundle/Nib.app(ad-hoc 签名)
+cp -R target/release/bundle/Nib.app /Applications/
 ```
 
-### 开发模式运行
+测试与检查：
+
 ```bash
-npm run tauri dev
+cargo test -p nib-core
+cargo clippy --workspace --all-targets
 ```
 
-### 构建原生安装包
-```bash
-npm run tauri build
-```
+## 许可
 
-仅前端可单独类型检查并构建：`npm run build`（即 `tsc && vite build`）。Rust 测试从 `src-tauri/` 运行：
-```bash
-cd src-tauri && cargo test
-```
-
----
-
-## 快捷键
-
-| 操作 | 快捷键 |
-| --- | --- |
-| 打开文件夹 | `Cmd/Ctrl` + `O` |
-| 保存 | `Cmd/Ctrl` + `S` |
-| 关闭标签 | `Cmd/Ctrl` + `W` |
-| 当前文件内查找 | `Cmd/Ctrl` + `F` |
-| 全局文件搜索 | `Cmd/Ctrl` + `Shift` + `F` |
-| 快速打开文件 | 双击 `左 Shift` |
-| 设置 / 偏好 | `Cmd/Ctrl` + `,` |
-| 跳转到定义 | `F12` 或 `Cmd` + 点击 |
-| 后退 / 前进导航 | `Cmd/Ctrl` + `[` / `]` |
-| 导出性能报告 | `Cmd/Ctrl` + `Shift` + `P` |
-
-Explorer、Commit、Git、Maven 从左侧**活动栏**切换;集成终端从 **View（视图）** 菜单切换。
-
----
-
-## 许可证
-
-当前未指定开源许可证；项目标记为 `private`。在添加 `LICENSE` 文件之前，请视为保留所有权利（all-rights-reserved）。
+私人项目。

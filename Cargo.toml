@@ -1,10 +1,8 @@
-# Nib workspace:nib-core(UI 无关后端内核)+ nib-app(gpui 原生应用,M0b 加入)。
-# src-tauri 刻意排除在外:独立 Cargo.lock,经 path 依赖引用 nib-core——
-# 隔离 gpui 与 tauri 两棵依赖树,升 gpui rev 不扰动旧 app 构建(RFC v2 §3)。
+# Nib workspace:nib-core(UI 无关后端内核)+ nib-app(gpui 原生应用)。
+# 2026-06-11 M5 切换完成:旧 Tauri+TS 实现(src/、src-tauri/)已删除。
 [workspace]
 resolver = "2"
 members = ["crates/nib-app", "crates/nib-core"]
-exclude = ["src-tauri"]
 
 [workspace.package]
 edition = "2021"
