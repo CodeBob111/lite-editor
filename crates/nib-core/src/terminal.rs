@@ -111,6 +111,7 @@ pub struct TerminalSession {
     notifier: Notifier,
     dirty: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
+    waker: Arc<dyn Fn() + Send + Sync>,
     size: FairMutex<(u16, u16)>, // (cols, rows)
 }
 
@@ -145,6 +146,7 @@ impl TerminalSession {
         let dirty = Arc::new(AtomicBool::new(false));
         let exited = Arc::new(AtomicBool::new(false));
         let loop_tx = Arc::new(FairMutex::new(None));
+        let proxy_waker = waker.clone();
         let proxy = EventProxy {
             dirty: dirty.clone(),
             exited: exited.clone(),
@@ -170,8 +172,17 @@ impl TerminalSession {
             notifier: Notifier(sender),
             dirty,
             exited,
+            waker: proxy_waker,
             size: FairMutex::new((cols, rows)),
         })
+    }
+
+    /// 所有"非 PTY 输出"的置脏(resize/scroll)也必须走边沿唤醒——
+    /// 裸 store(true) 会吃掉后续 PTY 输出的唤醒边沿,UI 从此拉不到帧(实测事故)
+    fn mark_dirty(&self) {
+        if !self.dirty.swap(true, Ordering::AcqRel) {
+            (self.waker)();
+        }
     }
 
     /// 用户输入(已转义的字节序列)写入 PTY
@@ -218,18 +229,18 @@ impl TerminalSession {
         self.term
             .lock()
             .resize(TermSize::new(cols as usize, rows as usize));
-        self.dirty.store(true, Ordering::Release);
+        self.mark_dirty();
     }
 
     /// 滚动回看(行数,正=向上回看)
     pub fn scroll(&self, delta: i32) {
         self.term.lock().scroll_display(Scroll::Delta(delta));
-        self.dirty.store(true, Ordering::Release);
+        self.mark_dirty();
     }
 
     pub fn scroll_to_bottom(&self) {
         self.term.lock().scroll_display(Scroll::Bottom);
-        self.dirty.store(true, Ordering::Release);
+        self.mark_dirty();
     }
 
     /// UI 帧首调:有脏才值得 snapshot
@@ -383,6 +394,44 @@ mod tests {
         assert_eq!(session.snapshot().rows.len(), 24);
         session.resize(60, 10);
         assert_eq!(session.snapshot().rows.len(), 10);
+        session.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod edge_wake_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::{Duration, Instant};
+
+    /// 回归:resize 先置脏后,PTY 输出仍必须能唤醒 UI(边沿不被吃掉)
+    #[test]
+    fn resize_does_not_eat_output_wakeup() {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes2 = wakes.clone();
+        let session = TerminalSession::spawn(
+            std::env::temp_dir().to_string_lossy().to_string(),
+            80,
+            24,
+            Arc::new(move || {
+                wakes2.fetch_add(1, Ordering::AcqRel);
+            }),
+        )
+        .expect("spawn shell");
+
+        // 模拟首帧 render:输出到来前先 resize(旧实现在这里裸置脏吃边沿)
+        session.resize(100, 20);
+        assert!(wakes.load(Ordering::Acquire) >= 1, "resize 本身要发唤醒");
+
+        // 消费一次脏,再等 shell 输出的唤醒
+        session.take_dirty();
+        let before = wakes.load(Ordering::Acquire);
+        session.write(b"printf 'edge_ok\\n'\r".to_vec());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while wakes.load(Ordering::Acquire) == before {
+            assert!(Instant::now() < deadline, "PTY 输出未能唤醒(边沿被吃)");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         session.shutdown();
     }
 }
