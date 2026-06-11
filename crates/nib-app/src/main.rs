@@ -194,6 +194,8 @@ struct Workbench {
     active_tab: Option<usize>,
     /// 全项目文件清单缓存(quick-open 用;core runtime 预载)
     all_files: Arc<Vec<String>>,
+    /// 最近项目(欢迎页用;启动异步加载 + 廉价类型探测)
+    recents: Vec<RecentEntry>,
     overlay: Option<Overlay>,
     _overlay_sub: Option<Subscription>,
     /// 无输入框浮层(Usages/Merge/Recents)的焦点锚:不聚焦到浮层容器,
@@ -222,6 +224,51 @@ struct Workbench {
     first_frame_logged: bool,
     last_shift: Option<Instant>,
     prev_modifiers: Modifiers,
+}
+
+/// 欢迎页「最近项目」一行的展示数据(路径 + 派生的名称/缩写/类型标签/首字母色)。
+struct RecentEntry {
+    path: String,
+    name: String,
+    display_path: String,
+    /// 类型标签(Rust/Maven/Gradle;探测不到为空)
+    tag: &'static str,
+    fav: char,
+    /// 首字母图标色(取自 file_icons 同色系)
+    fav_color: u32,
+}
+
+/// 从项目路径派生欢迎页展示数据:名称取末段、路径做 ~ 缩写、按 marker 文件廉价探测类型。
+fn classify_recent(path: &str) -> RecentEntry {
+    let p = std::path::Path::new(path);
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    let display_path = match dirs::home_dir() {
+        Some(home) if path.starts_with(&*home.to_string_lossy()) => {
+            format!("~{}", &path[home.to_string_lossy().len()..])
+        }
+        _ => path.to_string(),
+    };
+    let (tag, fav_color): (&'static str, u32) = if p.join("Cargo.toml").exists() {
+        ("Rust", 0xd08a5c)
+    } else if p.join("pom.xml").exists() {
+        ("Maven", 0x7faedb)
+    } else if p.join("build.gradle").exists() || p.join("build.gradle.kts").exists() {
+        ("Gradle", 0x3fb950)
+    } else {
+        ("", 0x7a8699)
+    };
+    let fav = name.chars().next().unwrap_or('?').to_ascii_uppercase();
+    RecentEntry {
+        path: path.to_string(),
+        name,
+        display_path,
+        tag,
+        fav,
+        fav_color,
+    }
 }
 
 impl Workbench {
@@ -315,6 +362,7 @@ impl Workbench {
             tabs: Vec::new(),
             active_tab: None,
             all_files: Arc::new(Vec::new()),
+            recents: Vec::new(),
             overlay: None,
             _overlay_sub: None,
             overlay_focus: cx.focus_handle(),
@@ -393,6 +441,17 @@ impl Workbench {
             })
             .detach();
         }
+
+        // 欢迎页最近项目:异步读持久化列表 + 廉价类型探测,回来填字段
+        cx.spawn(async move |weak, cx| {
+            let paths = session::load_recents().await;
+            let entries: Vec<RecentEntry> = paths.iter().map(|p| classify_recent(p)).collect();
+            let _ = weak.update(cx, |this, cx| {
+                this.recents = entries;
+                cx.notify();
+            });
+        })
+        .detach();
 
         this
     }
@@ -1335,6 +1394,8 @@ impl Workbench {
             window,
             |this: &mut Workbench, _, event: &SettingsEvent, window, cx| match event {
                 SettingsEvent::Apply(settings) => {
+                    // 设置页改动实时生效:存盘(异步)+ 热应用到已开标签,**不关闭页面**
+                    // (整页设计下改动即时反馈;关闭由 Esc 负责)。
                     let settings = *settings;
                     this.settings = settings;
                     session::save_settings(settings);
@@ -1344,8 +1405,8 @@ impl Workbench {
                             state.set_folding(settings.folding, window, cx);
                         });
                     }
-                    this.status = "设置已保存 ✓".into();
-                    this.close_palette(window, cx);
+                    this.status = "设置已更新 ✓".into();
+                    cx.notify();
                 }
             },
         );
@@ -1711,6 +1772,374 @@ impl Workbench {
                 cx.listener(move |this, _, _, cx| this.set_sidebar_view(view, cx)),
             )
             .child(glyph)
+    }
+
+    /// 欢迎/空态页(对齐 welcome.html):品牌 + tagline + 开始/最近两栏 + 快捷键速查。
+    /// 「打开文件夹」「最近项目」为真功能;「克隆/新建」无后端,渲染为不可点提案项。
+    fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let primary = cx.theme().primary;
+        let primary_fg = cx.theme().primary_foreground;
+        let accent = cx.theme().accent;
+        let secondary = cx.theme().secondary;
+        let info = cx.theme().info;
+        let border = cx.theme().border;
+        let mono = cx.theme().mono_font_family.clone();
+
+        // 快捷键药丸
+        let kbd = {
+            let mono = mono.clone();
+            move |key: &str, color: Hsla| {
+                div()
+                    .font_family(mono.clone())
+                    .text_size(px(11.))
+                    .text_color(color)
+                    .border_1()
+                    .border_color(border)
+                    .rounded(px(5.))
+                    .px(px(7.))
+                    .py(px(2.))
+                    .child(key.to_string())
+            }
+        };
+
+        // 开始栏「打开文件夹」=真功能可点
+        let start_open = h_flex()
+            .id("welcome-open")
+            .w_full()
+            .items_center()
+            .gap(px(13.))
+            .px(px(12.))
+            .py(px(11.))
+            .rounded(px(9.))
+            .cursor_pointer()
+            .hover(|s| s.bg(secondary))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| this.on_open_folder(&OpenFolder, window, cx)),
+            )
+            .child(
+                div()
+                    .w(px(34.))
+                    .h(px(34.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.))
+                    .bg(accent)
+                    .text_color(primary)
+                    .text_size(px(16.))
+                    .child("▤"),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_size(px(13.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child("打开文件夹…"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(muted)
+                            .child("选择本地项目根目录"),
+                    ),
+            )
+            .child(kbd("⌘O", muted));
+
+        // 提案项(无后端,不可点;muted + 「提案」标)
+        let proposal = |glyph: &'static str, title: &'static str, sub: &'static str, hint: &'static str| {
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap(px(13.))
+                .px(px(12.))
+                .py(px(11.))
+                .rounded(px(9.))
+                .child(
+                    div()
+                        .w(px(34.))
+                        .h(px(34.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(8.))
+                        .bg(secondary)
+                        .text_color(muted)
+                        .text_size(px(16.))
+                        .child(glyph),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap(px(6.))
+                                .child(
+                                    div()
+                                        .text_size(px(13.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(muted)
+                                        .child(title),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(9.5))
+                                        .text_color(muted)
+                                        .border_1()
+                                        .border_color(border)
+                                        .rounded(px(4.))
+                                        .px(px(4.))
+                                        .child("提案"),
+                                ),
+                        )
+                        .child(div().text_size(px(11.5)).text_color(muted).child(sub)),
+                )
+                .child(
+                    div()
+                        .font_family(mono.clone())
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child(hint),
+                )
+        };
+
+        // 最近项目行(真功能,点击开项目)
+        let recents_list: Vec<AnyElement> = if self.recents.is_empty() {
+            vec![div()
+                .px(px(12.))
+                .py(px(9.))
+                .text_size(px(12.5))
+                .text_color(muted)
+                .child("暂无最近项目")
+                .into_any_element()]
+        } else {
+            self.recents
+                .iter()
+                .filter(|r| std::path::Path::new(&r.path) != self.project_root)
+                .take(8)
+                .enumerate()
+                .map(|(ix, r)| {
+                    let path = r.path.clone();
+                    h_flex()
+                        .id(ix)
+                        .w_full()
+                        .items_center()
+                        .gap(px(12.))
+                        .px(px(12.))
+                        .py(px(9.))
+                        .rounded(px(9.))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(secondary))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.open_project_path(PathBuf::from(path.clone()), cx)
+                            }),
+                        )
+                        .child(
+                            div()
+                                .w(px(30.))
+                                .h(px(30.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(7.))
+                                .bg(accent)
+                                .font_family(mono.clone())
+                                .font_weight(FontWeight::EXTRA_BOLD)
+                                .text_size(px(13.))
+                                .text_color(rgb(r.fav_color))
+                                .child(r.fav.to_string()),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .text_size(px(13.5))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(fg)
+                                        .child(r.name.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .font_family(mono.clone())
+                                        .text_color(muted)
+                                        .overflow_hidden()
+                                        .child(r.display_path.clone()),
+                                ),
+                        )
+                        .when(!r.tag.is_empty(), |row| {
+                            row.child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .font_family(mono.clone())
+                                    .text_color(info)
+                                    .border_1()
+                                    .border_color(border)
+                                    .rounded(px(5.))
+                                    .px(px(7.))
+                                    .py(px(2.))
+                                    .child(r.tag),
+                            )
+                        })
+                        .into_any_element()
+                })
+                .collect()
+        };
+
+        // 快捷键速查(3 列 × 3 行)
+        let shortcuts: [(&str, &str); 9] = [
+            ("快速打开", "⌘P"),
+            ("保存", "⌘S"),
+            ("全局搜索", "⇧⌘F"),
+            ("跳转定义", "F12"),
+            ("查找引用", "⇧F12"),
+            ("切换终端", "⌃`"),
+            ("Markdown 预览", "⇧⌘V"),
+            ("关闭标签", "⌘W"),
+            ("设置", "⌘,"),
+        ];
+        let kbd_for_grid = kbd.clone();
+        let shortcut_rows = shortcuts.chunks(3).map(move |chunk| {
+            let kbd = kbd_for_grid.clone();
+            h_flex()
+                .gap(px(32.))
+                .children(chunk.iter().map(move |(label, key)| {
+                    h_flex()
+                        .w(px(232.))
+                        .items_center()
+                        .justify_between()
+                        .gap(px(14.))
+                        .child(div().text_size(px(12.5)).text_color(muted).child(*label))
+                        .child(kbd(key, fg))
+                }))
+        });
+
+        div()
+            .id("welcome")
+            .size_full()
+            .overflow_y_scroll()
+            .flex()
+            .justify_center()
+            .child(
+                v_flex()
+                    .w(px(880.))
+                    .px(px(48.))
+                    .py(px(64.))
+                    // hero
+                    .child(
+                        h_flex()
+                            .items_end()
+                            .gap(px(20.))
+                            .mb(px(6.))
+                            .child(
+                                h_flex()
+                                    .child(
+                                        div()
+                                            .text_size(px(64.))
+                                            .font_weight(FontWeight::EXTRA_BOLD)
+                                            .text_color(primary_fg)
+                                            .child("Nib"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(64.))
+                                            .font_weight(FontWeight::EXTRA_BOLD)
+                                            .text_color(primary)
+                                            .child("."),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .mb(px(8.))
+                                    .text_size(px(12.))
+                                    .font_family(mono.clone())
+                                    .text_color(muted)
+                                    .border_1()
+                                    .border_color(border)
+                                    .rounded_full()
+                                    .px(px(10.))
+                                    .py(px(3.))
+                                    .child("v0.1.0"),
+                            ),
+                    )
+                    // tagline
+                    .child(
+                        div()
+                            .max_w(px(560.))
+                            .mt(px(14.))
+                            .mb(px(40.))
+                            .text_size(px(14.5))
+                            .text_color(muted)
+                            .child("Java-first 原生代码编辑器,Rust + GPUI 构建。内置 jdtls 语言服务、完整 Git 客户端、Maven 依赖面板、集成终端,以及 Arthas 在线诊断与 Astore 内网仓库直连。"),
+                    )
+                    // 两栏:开始 + 最近
+                    .child(
+                        h_flex()
+                            .gap(px(40.))
+                            .mb(px(44.))
+                            .items_start()
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .child(
+                                        div()
+                                            .mb(px(14.))
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(muted)
+                                            .child("开始"),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .gap(px(4.))
+                                            .child(start_open)
+                                            .child(proposal("⎘", "克隆 Astore 仓库…", "从内网 Astore 拉取代码", "建议 ⇧⌘C"))
+                                            .child(proposal("＋", "新建文件", "空白缓冲区", "建议 ⌘N")),
+                                    ),
+                            )
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .child(
+                                        div()
+                                            .mb(px(14.))
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(muted)
+                                            .child("最近"),
+                                    )
+                                    .child(v_flex().gap(px(2.)).children(recents_list)),
+                            ),
+                    )
+                    // 快捷键速查
+                    .child(
+                        v_flex()
+                            .border_t_1()
+                            .border_color(border)
+                            .pt(px(26.))
+                            .child(
+                                div()
+                                    .mb(px(16.))
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(muted)
+                                    .child("常用快捷键"),
+                            )
+                            .child(v_flex().gap(px(10.)).children(shortcut_rows)),
+                    ),
+            )
     }
 
     /// 单个编辑器标签(旧版 .tab:类型图标+文件名+关闭×;脏=●)
@@ -2194,72 +2623,7 @@ impl Render for Workbench {
                                             this.child(editor_el)
                                         }
                                     }
-                                    None => {
-                                        // 欢迎/空态:品牌字标 + 项目名 + 真实快捷键速查
-                                        // (对齐 welcome.html 设计稿;快捷键取自 cx.bind_keys)
-                                        let shortcuts: [(&str, &str); 6] = [
-                                            ("⌘O", "打开文件夹"),
-                                            ("⌘P", "快速打开文件"),
-                                            ("⌘⇧F", "全局搜索"),
-                                            ("F12", "跳转定义"),
-                                            ("⌃`", "终端"),
-                                            ("⌃⇧A", "Arthas 诊断面板"),
-                                        ];
-                                        let rows = shortcuts.iter().map(|(k, label)| {
-                                            h_flex()
-                                                .w(px(300.))
-                                                .items_center()
-                                                .gap_3()
-                                                .child(
-                                                    div()
-                                                        .w(px(60.))
-                                                        .text_size(px(12.))
-                                                        .font_family(
-                                                            cx.theme().mono_font_family.clone(),
-                                                        )
-                                                        .text_color(cx.theme().foreground)
-                                                        .child(k.to_string()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .text_size(px(12.))
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .child(label.to_string()),
-                                                )
-                                        });
-                                        this.child(
-                                            v_flex()
-                                                .size_full()
-                                                .items_center()
-                                                .justify_center()
-                                                .gap_6()
-                                                .child(
-                                                    v_flex()
-                                                        .items_center()
-                                                        .gap_2()
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(46.))
-                                                                .font_weight(FontWeight::BOLD)
-                                                                .text_color(cx.theme().foreground)
-                                                                .child("Nib"),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_size(px(13.))
-                                                                .text_color(
-                                                                    cx.theme().muted_foreground,
-                                                                )
-                                                                .child(format!(
-                                                                    "{} · 原生 Rust + GPUI 编辑器",
-                                                                    self.project_name
-                                                                )),
-                                                        ),
-                                                )
-                                                .child(v_flex().gap_1().children(rows)),
-                                        )
-                                    }
+                                    None => this.child(self.render_welcome(cx)),
                                 }
                             }))
                             .when(self.terminal_visible, |this| {
