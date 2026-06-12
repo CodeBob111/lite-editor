@@ -28,8 +28,7 @@ use gpui_component::{
     input::{Input, InputEvent, InputState, TabSize},
     list::ListItem,
     tree::{tree, TreeItem, TreeState},
-    v_flex, ActiveTheme, Icon, IconName, Root, Sizable as _, Theme, ThemeMode, ThemeRegistry,
-    TitleBar,
+    v_flex, ActiveTheme, Icon, IconName, Root, Theme, ThemeMode, ThemeRegistry, TitleBar,
 };
 
 use futures::StreamExt as _;
@@ -1707,37 +1706,93 @@ fn render_tree_item(
     marks: &std::collections::HashMap<String, char>,
 ) -> ListItem {
     let item = entry.item();
-    let row = h_flex().gap_2().items_center();
+    let muted = app.theme().muted_foreground;
+    // 树行字号 13px(对齐设计稿 .tree{font-size:13px});gap 6px
+    let row = h_flex().gap(px(6.)).items_center().text_size(px(13.));
     let row = if entry.is_folder() {
-        let icon = if entry.is_expanded() {
-            IconName::FolderOpen
-        } else {
-            IconName::Folder
-        };
-        row.child(Icon::new(icon).small())
-            .child(div().child(item.label.clone()))
-    } else {
-        let meta = file_icons::file_icon_meta(&item.label);
-        let name_color = match marks.get(item.id.as_ref()) {
-            Some('M') | Some('R') => Some(app.theme().warning),
-            Some('A') | Some('U') => Some(app.theme().success),
-            Some('D') => Some(app.theme().danger),
-            _ if meta.dim => Some(app.theme().muted_foreground),
-            _ => None,
-        };
+        // 文件夹:▶ 小三角(twist) + ▾展开/▸折叠(fico) + 名字(对齐设计稿 .row-t)
+        let fico = if entry.is_expanded() { "▾" } else { "▸" };
         row.child(
             div()
                 .w(px(14.))
-                .text_size(px(10.))
-                .font_weight(FontWeight::BOLD)
-                .text_color(meta.color)
-                .child(meta.glyph),
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(9.))
+                .text_color(muted)
+                .child("▶"),
         )
         .child(
             div()
-                .when_some(name_color, |s, c| s.text_color(c))
+                .w(px(16.))
+                .flex_none()
+                .text_center()
+                .text_size(px(11.))
+                .text_color(muted)
+                .child(fico),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .when(entry.depth() == 0, |s| s.font_weight(FontWeight::SEMIBOLD))
                 .child(item.label.clone()),
         )
+    } else {
+        let meta = file_icons::file_icon_meta(&item.label);
+        let mark = marks.get(item.id.as_ref()).copied();
+        let name_color = match mark {
+            Some('M') | Some('R') => Some(app.theme().warning),
+            Some('A') | Some('U') => Some(app.theme().success),
+            Some('D') => Some(app.theme().danger),
+            _ if meta.dim => Some(muted),
+            _ => None,
+        };
+        // 右侧 git 状态徽标(对齐设计稿 .gstat)
+        let badge: Option<(char, Hsla)> = mark.and_then(|m| {
+            let c = match m {
+                'M' | 'R' => app.theme().warning,
+                'A' | 'U' => app.theme().success,
+                'D' => app.theme().danger,
+                _ => return None,
+            };
+            Some((m, c))
+        });
+        row.child(div().w(px(14.)).flex_none())
+            .child(
+                div()
+                    .w(px(16.))
+                    .flex_none()
+                    .text_center()
+                    .text_size(px(12.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(meta.color)
+                    .child(meta.glyph),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .when_some(name_color, |s, c| s.text_color(c))
+                    .child(item.label.clone()),
+            )
+            .when_some(badge, |s, (m, c)| {
+                s.child(
+                    div()
+                        .flex_none()
+                        .w(px(14.))
+                        .text_center()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(c)
+                        .child(m.to_string()),
+                )
+            })
     };
     // 选中态:淡蓝底(ListItem 自带 list_active)+ 左侧 2px 蓝条(对齐设计稿 .row-t.sel::before)
     let primary = app.theme().primary;
