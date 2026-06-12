@@ -1609,34 +1609,55 @@ impl Workbench {
         let pos = tab.editor.read(cx).cursor_position();
         let file = tab.path.to_string_lossy().to_string();
         let lsp = self.lsp.clone();
+        let files = self.all_files.clone();
         let window_handle = self.window_handle;
         self.status = "跳转定义…".into();
         cx.notify();
         cx.spawn(async move |weak, cx| {
-            let result =
-                nib_core::lsp::lsp_goto_definition(file, pos.line, pos.character, &lsp).await;
+            // 先问 jdtls;命中 file:// 用它,jdt:// 是库代码(单独提示),
+            // 空/超时/出错 → 文本兜底(移植重构前逻辑,不依赖 jdtls 是否就绪)。
+            let lsp_res =
+                nib_core::lsp::lsp_goto_definition(file.clone(), pos.line, pos.character, &lsp)
+                    .await;
+            enum Goto {
+                File(PathBuf, u32, u32),
+                Lib(String),
+                NotFound,
+            }
+            let goto = match lsp_res {
+                Ok(Some(u)) if u.uri.starts_with("file://") => {
+                    let p = PathBuf::from(u.uri.strip_prefix("file://").unwrap_or(&u.uri));
+                    Goto::File(p, u.line, u.character)
+                }
+                Ok(Some(u)) => Goto::Lib(u.uri),
+                _ => match nib_core::lsp::text_fallback_definition(
+                    file,
+                    pos.line,
+                    pos.character,
+                    (*files).clone(),
+                )
+                .await
+                {
+                    Some(u) => {
+                        let p = PathBuf::from(u.uri.strip_prefix("file://").unwrap_or(&u.uri));
+                        Goto::File(p, u.line, u.character)
+                    }
+                    None => Goto::NotFound,
+                },
+            };
             let _ = cx.update_window(window_handle, |_, window, cx| {
                 let _ = weak.update(cx, |this: &mut Workbench, cx| {
-                    match result {
-                        Ok(Some(usage)) => {
-                            if usage.uri.starts_with("file://") {
-                                let path = PathBuf::from(
-                                    usage.uri.strip_prefix("file://").unwrap_or(&usage.uri),
-                                );
-                                this.status = path.display().to_string().into();
-                                this.open_file_at(
-                                    path, usage.line, usage.character, window, cx,
-                                );
-                            } else {
-                                // 探针:依赖 jar 里的定义,jdtls 返回非 file:// 的 URI
-                                // (预期 jdt://contents/...)。先把原始 URI 打到状态栏确认
-                                // scheme,再实现取反编译文本 + 只读虚拟标签页。
-                                this.status =
-                                    format!("库定义 URI: {}", usage.uri).into();
-                            }
+                    match goto {
+                        Goto::File(path, line, character) => {
+                            this.status = path.display().to_string().into();
+                            this.open_file_at(path, line, character, window, cx);
                         }
-                        Ok(None) => this.status = "未找到定义".into(),
-                        Err(err) => this.status = format!("跳转失败: {}", err).into(),
+                        Goto::Lib(uri) => {
+                            // 依赖 jar 定义,jdtls 返回 jdt://(需 java/classFileContents
+                            // 取反编译文本 + 只读虚拟标签页,待做),先回显 URI。
+                            this.status = format!("库定义 URI: {}", uri).into();
+                        }
+                        Goto::NotFound => this.status = "未找到定义".into(),
                     }
                     cx.notify();
                 });

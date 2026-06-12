@@ -708,6 +708,198 @@ fn snap_to_identifier(file_path: &str, line: u32, character: u32) -> u32 {
     }
 }
 
+/// 文本启发式跳转定义(不依赖 jdtls / 索引)——移植自重构前的 tryNavigateToReceiverType。
+/// jdtls 返回空 / 超时 / 未就绪时的兜底:解析光标处的 `receiver.method` 或裸标识符,
+/// 经 import / 同包解析出类型 FQN,在工程文件列表里按 FQN 找到 .java,再 grep 方法声明行。
+/// 返回 0-based 行的 LspUsage(与 LSP 一致),失败 None。文件读放 worker,不卡主线程。
+pub async fn text_fallback_definition(
+    file_path: String,
+    line: u32,
+    character: u32,
+    project_files: Vec<String>,
+) -> Option<LspUsage> {
+    crate::rt::on_worker(move || {
+        Ok(text_fallback_definition_blocking(
+            &file_path,
+            line,
+            character,
+            &project_files,
+        ))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn text_fallback_definition_blocking(
+    file_path: &str,
+    line: u32,
+    character: u32,
+    project_files: &[String],
+) -> Option<LspUsage> {
+    let content = std::fs::read_to_string(file_path).ok()?;
+    let line_text = content.lines().nth(line as usize)?.to_string();
+    let (receiver, word) = word_and_receiver(&line_text, character as usize)?;
+
+    let uppercase = |s: &str| s.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+
+    // 1) receiver.method:解析接收者类型 → FQN → 文件 → grep 方法声明
+    if let Some(recv) = &receiver {
+        let type_name = if uppercase(recv) {
+            recv.clone()
+        } else {
+            resolve_var_type(&content, recv)?
+        };
+        let fqn = resolve_fqn(&content, &type_name)?;
+        let rel = format!("/{}.java", fqn.replace('.', "/"));
+        let target = project_files.iter().find(|p| p.ends_with(&rel))?;
+        let l = find_method_line(target, &word).unwrap_or(1);
+        return Some(LspUsage {
+            uri: format!("file://{}", target),
+            line: (l.saturating_sub(1)) as u32,
+            character: 0,
+            text: String::new(),
+        });
+    }
+
+    // 2) 裸标识符:大写=类型(跳到该类文件首行),小写=同文件方法定义
+    if uppercase(&word) {
+        let fqn = resolve_fqn(&content, &word)?;
+        let rel = format!("/{}.java", fqn.replace('.', "/"));
+        let target = project_files.iter().find(|p| p.ends_with(&rel))?;
+        Some(LspUsage {
+            uri: format!("file://{}", target),
+            line: 0,
+            character: 0,
+            text: String::new(),
+        })
+    } else {
+        let l = find_method_def_in_content(&content, &word, line as usize)?;
+        Some(LspUsage {
+            uri: format!("file://{}", file_path),
+            line: l,
+            character: 0,
+            text: String::new(),
+        })
+    }
+}
+
+/// 取光标处的 (接收者, 标识符):标识符前紧跟 `.` 则其前的词为接收者。
+fn word_and_receiver(line_text: &str, col: usize) -> Option<(Option<String>, String)> {
+    let chars: Vec<char> = line_text.chars().collect();
+    let col = col.min(chars.len());
+    let mut start = col;
+    while start > 0 && is_ident_char(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = col;
+    while end < chars.len() && is_ident_char(chars[end]) {
+        end += 1;
+    }
+    if start == end {
+        return None;
+    }
+    let word: String = chars[start..end].iter().collect();
+    if start >= 1 && chars[start - 1] == '.' {
+        let mut rs = start - 1;
+        while rs > 0 && is_ident_char(chars[rs - 1]) {
+            rs -= 1;
+        }
+        let receiver: String = chars[rs..start - 1].iter().collect();
+        if !receiver.is_empty() {
+            return Some((Some(receiver), word));
+        }
+    }
+    Some((None, word))
+}
+
+/// 找局部变量声明 `Type var` 推断变量类型(大写开头的类型名)。
+fn resolve_var_type(content: &str, var: &str) -> Option<String> {
+    let re =
+        regex::Regex::new(&format!(r"\b([A-Z]\w*)(?:<[^>]*>)?\s+{}\b", regex::escape(var))).ok()?;
+    content
+        .lines()
+        .find_map(|l| re.captures(l).map(|c| c[1].to_string()))
+}
+
+/// 解析类型 FQN:扫 import 命中类名;没有则视为同包(当前文件 package + 类型名)。
+fn resolve_fqn(content: &str, type_name: &str) -> Option<String> {
+    let import_re = regex::Regex::new(r"^import\s+(?:static\s+)?([\w.]+)\s*;").ok()?;
+    let mut package: Option<String> = None;
+    for l in content.lines() {
+        let lt = l.trim();
+        if package.is_none() && lt.starts_with("package ") && lt.ends_with(';') {
+            package = Some(lt["package ".len()..lt.len() - 1].trim().to_string());
+        }
+        if let Some(c) = import_re.captures(lt) {
+            if c[1].rsplit('.').next() == Some(type_name) {
+                return Some(c[1].to_string());
+            }
+        }
+    }
+    package.map(|p| format!("{}.{}", p, type_name))
+}
+
+/// 在目标文件里 grep 方法声明行(优先带返回类型的真声明),返回 1-based 行号。
+fn find_method_line(file_path: &str, method: &str) -> Option<usize> {
+    let content = std::fs::read_to_string(file_path).ok()?;
+    let decl = regex::Regex::new(&format!(
+        r"\b\w+(?:<[^>]*>)?(?:\[\])?\s+{}\s*\(",
+        regex::escape(method)
+    ))
+    .ok()?;
+    let sig = regex::Regex::new(&format!(r"\b{}\s*\(", regex::escape(method))).ok()?;
+    let modifiers = [
+        "public",
+        "protected",
+        "private",
+        "static",
+        "abstract",
+        "default",
+        "synchronized",
+        "final",
+        "native",
+    ];
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, l) in lines.iter().enumerate() {
+        let trimmed = l.trim_start();
+        if modifiers.iter().any(|m| trimmed.starts_with(m)) && decl.is_match(l) {
+            return Some(i + 1);
+        }
+    }
+    lines.iter().position(|l| sig.is_match(l)).map(|i| i + 1)
+}
+
+/// 同文件内找方法定义(0-based 行),排除调用行。
+fn find_method_def_in_content(content: &str, method: &str, exclude_line: usize) -> Option<u32> {
+    let decl = regex::Regex::new(&format!(
+        r"\b\w+(?:<[^>]*>)?(?:\[\])?\s+{}\s*\(",
+        regex::escape(method)
+    ))
+    .ok()?;
+    let modifiers = [
+        "public",
+        "protected",
+        "private",
+        "static",
+        "abstract",
+        "default",
+        "synchronized",
+        "final",
+        "native",
+    ];
+    content.lines().enumerate().find_map(|(i, l)| {
+        if i != exclude_line
+            && modifiers.iter().any(|m| l.trim_start().starts_with(m))
+            && decl.is_match(l)
+        {
+            Some(i as u32)
+        } else {
+            None
+        }
+    })
+}
+
 fn detect_language(path: &str) -> String {
     if path.ends_with(".py") {
         "python".into()
