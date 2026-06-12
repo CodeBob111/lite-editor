@@ -235,6 +235,22 @@ enum Resizing {
     Terminal,
 }
 
+/// 当前项目 java LSP(jdtls)的真实状态——状态栏据此显示,取代旧的硬编码"jdtls 就绪"。
+/// 由 insert_tab(起 jdtls)、start_lsp 结果、LspProgress 事件、切项目共同驱动。
+#[derive(Clone, PartialEq)]
+enum LspPhase {
+    /// 非 java 项目 / 未启动
+    Off,
+    /// 文件已打开,jdtls 启动中(spawn + initialize)
+    Starting,
+    /// 已连上,正在索引/导入(带进度消息);此阶段跳转可能返回空
+    Indexing(String),
+    /// 索引完成,可正常跳转/查引用
+    Ready,
+    /// jdtls 启动失败(如未安装/spawn 失败)
+    Failed,
+}
+
 struct Workbench {
     focus_handle: FocusHandle,
     sidebar_view: SidebarView,
@@ -258,6 +274,8 @@ struct Workbench {
     /// 资源管理器多选集(cmd+click 切换)。非空时 复制/剪切/删除 作用于整集;
     /// 空时回落到 tree 控件的单选项。普通点击(无修饰键)清空回到单选。
     selected_paths: std::collections::HashSet<String>,
+    /// 当前项目 java LSP(jdtls)的真实状态(状态栏据此显示,取代硬编码"就绪")
+    lsp_phase: LspPhase,
     tabs: Vec<OpenTab>,
     active_tab: Option<usize>,
     /// 全项目文件清单缓存(quick-open 用;core runtime 预载)
@@ -437,6 +455,7 @@ impl Workbench {
             tree_state,
             file_clipboard: None,
             selected_paths: std::collections::HashSet::new(),
+            lsp_phase: LspPhase::Off,
             tabs: Vec::new(),
             active_tab: None,
             all_files: Arc::new(Vec::new()),
@@ -547,6 +566,19 @@ impl Workbench {
     fn load_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         let old_root = self.project_root.to_string_lossy().to_string();
         let _ = nib_core::watch::stop_file_watcher(&old_root, &self.watcher);
+        // 切项目时停掉旧项目的 jdtls。不停的话每切一次就多一个 jdtls 实例(每个
+        // 1.5GB / 250% CPU),互相抢 CPU → 新项目的 initialize 30s 超时 → start_lsp
+        // 返回 Err → server 不入 servers map → 跳转报 "No LSP server"(尽管 jdtls
+        // 在跑);累积的实例也是卡顿的来源。LSP 状态归零,等新项目重新起。
+        let new_root_str = root.to_string_lossy().to_string();
+        if old_root != new_root_str && !old_root.is_empty() && old_root != "/" {
+            let lsp = self.lsp.clone();
+            cx.spawn(async move |_, _| {
+                let _ = nib_core::lsp::stop_lsp("java".into(), old_root, &lsp).await;
+            })
+            .detach();
+        }
+        self.lsp_phase = LspPhase::Off;
         if let Err(err) = nib_core::watch::start_file_watcher(
             root.to_string_lossy().to_string(),
             self.events_sink.clone(),
@@ -647,6 +679,35 @@ impl Workbench {
     ) {
         if let nib_core::CoreEvent::LspDiagnostics(params) = &event {
             self.apply_diagnostics(params.clone(), window, cx);
+            return;
+        }
+        // jdtls 索引进度:驱动状态栏真实状态(替代硬编码"就绪")。
+        // jdtls 分多段 $/progress,首个 end 即视为可用并保持 Ready,
+        // 不被后续后台 progress 拉回"索引中"(那会让状态栏抖动且误导成不可用)。
+        if let nib_core::CoreEvent::LspProgress {
+            language,
+            kind,
+            message,
+            percentage,
+        } = &event
+        {
+            if language == "java" {
+                if kind == "end" {
+                    self.lsp_phase = LspPhase::Ready;
+                } else if self.lsp_phase != LspPhase::Ready {
+                    let label = match percentage {
+                        Some(p) => format!("{} {}%", message, p),
+                        None => message.clone(),
+                    };
+                    let label = if label.trim().is_empty() {
+                        "索引中".to_string()
+                    } else {
+                        label
+                    };
+                    self.lsp_phase = LspPhase::Indexing(label);
+                }
+                cx.notify();
+            }
             return;
         }
         let nib_core::CoreEvent::FileChanged {
@@ -1242,12 +1303,16 @@ impl Workbench {
             .into();
         // Java:起 jdtls(幂等)并 didOpen——diagnostics 会经 EventSink 流回
         if lang == "java" {
+            // 还没起(或上次失败)→ 进入"启动中",让状态栏如实显示
+            if self.lsp_phase == LspPhase::Off || self.lsp_phase == LspPhase::Failed {
+                self.lsp_phase = LspPhase::Starting;
+            }
             let lsp = self.lsp.clone();
             let sink = self.events_sink.clone();
             let root = self.project_root.to_string_lossy().to_string();
             let file = path.to_string_lossy().to_string();
             let content = text_for_lsp;
-            cx.spawn(async move |_, _| {
+            cx.spawn(async move |weak, cx| {
                 let jdtls_root = session::data_dirs().jdtls_workspaces();
                 if let Err(err) = nib_core::lsp::start_lsp(
                     "java".into(),
@@ -1259,6 +1324,10 @@ impl Workbench {
                 .await
                 {
                     eprintln!("[nib-lsp] jdtls 启动失败: {}", err);
+                    let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                        this.lsp_phase = LspPhase::Failed;
+                        cx.notify();
+                    });
                     return;
                 }
                 if let Err(err) =
@@ -3546,23 +3615,29 @@ impl Render for Workbench {
                         this.child(lang_display(active_lang))
                     })
                     .when(active_lang == "java", |this| {
-                        // jdtls 状态(对齐设计稿:绿点 + 「jdtls 就绪」)
+                        // jdtls 真实状态(取代硬编码"就绪"):点颜色 + 文案随 lsp_phase。
+                        // 索引中点黄,让用户知道此时跳转可能为空、需等待而非"坏了"。
+                        let (dot, label) = match &self.lsp_phase {
+                            LspPhase::Ready => (cx.theme().success, "jdtls 就绪".to_string()),
+                            LspPhase::Starting => {
+                                (cx.theme().warning, "jdtls 启动中".to_string())
+                            }
+                            LspPhase::Indexing(_) => {
+                                (cx.theme().warning, "jdtls 索引中".to_string())
+                            }
+                            LspPhase::Failed => {
+                                (cx.theme().danger, "jdtls 未启动".to_string())
+                            }
+                            LspPhase::Off => {
+                                (cx.theme().muted_foreground, "jdtls 未连接".to_string())
+                            }
+                        };
                         this.child(
                             h_flex()
                                 .items_center()
                                 .gap_1()
-                                .child(
-                                    div()
-                                        .w(px(7.))
-                                        .h(px(7.))
-                                        .rounded_full()
-                                        .bg(cx.theme().success),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("jdtls 就绪"),
-                                ),
+                                .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(dot))
+                                .child(div().text_color(cx.theme().muted_foreground).child(label)),
                         )
                     }),
             )

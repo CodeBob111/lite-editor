@@ -386,14 +386,33 @@ fn start_lsp_blocking(
         "workspaceFolders": build_workspace_folders(&root_path, &root_uri)
     });
 
-    let _init_result = request_and_wait(
+    // initialize 超时放宽到 90s:大型多模块工程 + 机器繁忙时 jdtls 应答可能慢,
+    // 超时会让 start_lsp 返回 Err→server 不入 map→"No LSP server"(进程却在跑)。
+    // 配合切项目时 stop_lsp(避免多实例抢 CPU),正常情况下应答其实很快。
+    //
+    // 关键:initialize/initialized 失败时必须先杀掉已 spawn 的 jdtls 再返回 Err。
+    // 否则 server 随错误被 drop,而 Rust 的 Child::drop 不杀进程 → jdtls 变孤儿
+    // (空转吃 CPU、还不在 map 里没法 stop_lsp 回收),正是孤儿累积的来源之一。
+    let kill_on_err = |server: &LspServer| {
+        if let Ok(mut proc) = server.process.lock() {
+            let _ = proc.kill();
+            let _ = proc.wait();
+        }
+    };
+    if let Err(e) = request_and_wait(
         &server,
         1,
         "initialize",
         init_params,
-        Duration::from_secs(30),
-    )?;
-    send_notification(&server, "initialized", serde_json::json!({}))?;
+        Duration::from_secs(90),
+    ) {
+        kill_on_err(&server);
+        return Err(e);
+    }
+    if let Err(e) = send_notification(&server, "initialized", serde_json::json!({})) {
+        kill_on_err(&server);
+        return Err(e);
+    }
 
     if language != "java" {
         server.ready.store(true, Ordering::Relaxed);
