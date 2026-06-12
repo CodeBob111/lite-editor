@@ -71,6 +71,15 @@ actions!(
         ArthasMonitor,
         ArthasTt,
         ToggleArthas,
+        // 文件树操作
+        NewFile,
+        NewFolder,
+        RenameItem,
+        DeleteItem,
+        CopyItem,
+        CutItem,
+        PasteItem,
+        CopyPath,
         PaletteConfirm,
         Quit
     ]
@@ -147,6 +156,23 @@ enum Overlay {
     Merge(Entity<MergeView>),
     Recents(Entity<RecentsView>),
     Settings(Entity<SettingsView>),
+    /// 文件树命名输入(新建文件/文件夹/重命名):输入框 + 标题 + 待执行操作
+    NameInput {
+        input: Entity<InputState>,
+        title: SharedString,
+        op: NameOp,
+    },
+}
+
+/// 命名输入浮层确认后要执行的文件操作
+#[derive(Clone)]
+enum NameOp {
+    /// 在该目录下新建文件
+    NewFile(String),
+    /// 在该目录下新建文件夹
+    NewFolder(String),
+    /// 重命名(旧绝对路径)
+    Rename(String),
 }
 
 /// 标签上限(LRU 淘汰,脏标签豁免)
@@ -760,6 +786,149 @@ impl Workbench {
         }
     }
 
+    // ===== 文件树操作(右键菜单 / 快捷键) =====
+
+    /// 当前选中的树项绝对路径(TreeItem.id 即路径)。
+    fn selected_tree_path(&self, cx: &App) -> Option<String> {
+        self.tree_state
+            .read(cx)
+            .selected_item()
+            .map(|i| i.id.to_string())
+    }
+
+    /// 新建的目标目录:选中是目录→该目录;是文件→其父目录;无选中→项目根。
+    fn selected_dir(&self, cx: &App) -> String {
+        let root = self.project_root.to_string_lossy().to_string();
+        match self.selected_tree_path(cx) {
+            Some(p) => {
+                let path = std::path::Path::new(&p);
+                if path.is_dir() {
+                    p
+                } else {
+                    path.parent()
+                        .map(|d| d.to_string_lossy().to_string())
+                        .unwrap_or(root)
+                }
+            }
+            None => root,
+        }
+    }
+
+    /// 弹出命名输入浮层(新建/重命名共用)。
+    fn open_name_input(
+        &mut self,
+        title: impl Into<SharedString>,
+        default: &str,
+        op: NameOp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(default.to_string()));
+        // 单行输入回车即确认(订阅 PressEnter)
+        let sub = cx.subscribe(&input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.confirm_name_input(cx);
+            }
+        });
+        let fh = input.read(cx).focus_handle(cx);
+        self.overlay = Some(Overlay::NameInput {
+            input,
+            title: title.into(),
+            op,
+        });
+        self._overlay_sub = Some(sub);
+        window.focus(&fh, cx);
+        cx.notify();
+    }
+
+    fn on_new_file(&mut self, _: &NewFile, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = self.selected_dir(cx);
+        self.open_name_input("新建文件", "", NameOp::NewFile(dir), window, cx);
+    }
+
+    fn on_new_folder(&mut self, _: &NewFolder, window: &mut Window, cx: &mut Context<Self>) {
+        let dir = self.selected_dir(cx);
+        self.open_name_input("新建文件夹", "", NameOp::NewFolder(dir), window, cx);
+    }
+
+    fn on_rename_item(&mut self, _: &RenameItem, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected_tree_path(cx) else {
+            return;
+        };
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.open_name_input("重命名", &name, NameOp::Rename(path), window, cx);
+    }
+
+    fn on_delete_item(&mut self, _: &DeleteItem, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self.selected_tree_path(cx) else {
+            return;
+        };
+        self.status = format!("已删除 {}", path).into();
+        cx.spawn(async move |weak, cx| {
+            let _ = nib_core::fs::delete_path(path).await;
+            let _ = weak.update(cx, |this, cx| this.reload_tree(cx));
+        })
+        .detach();
+    }
+
+    fn on_copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.selected_tree_path(cx) {
+            let _ = nib_core::clipboard::copy_text_to_clipboard(path);
+            self.status = "已复制路径".into();
+            cx.notify();
+        }
+    }
+
+    fn on_copy_item(&mut self, _: &CopyItem, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.selected_tree_path(cx) {
+            let _ = nib_core::clipboard::copy_files_to_clipboard(vec![path]);
+            self.status = "已复制文件到剪贴板".into();
+            cx.notify();
+        }
+    }
+
+    /// 命名输入浮层确认(Enter):按 op 执行新建/重命名,刷新树。
+    fn confirm_name_input(&mut self, cx: &mut Context<Self>) {
+        let Some(Overlay::NameInput { input, op, .. }) = &self.overlay else {
+            return;
+        };
+        let name = input.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let op = op.clone();
+        self.overlay = None;
+        self._overlay_sub = None;
+        let task = async move {
+            match op {
+                NameOp::NewFile(dir) => {
+                    let p = std::path::Path::new(&dir).join(&name);
+                    let _ = nib_core::fs::create_file(p.to_string_lossy().to_string()).await;
+                }
+                NameOp::NewFolder(dir) => {
+                    let p = std::path::Path::new(&dir).join(&name);
+                    let _ = nib_core::fs::create_dir(p.to_string_lossy().to_string()).await;
+                }
+                NameOp::Rename(old) => {
+                    let new = std::path::Path::new(&old)
+                        .parent()
+                        .map(|d| d.join(&name))
+                        .unwrap_or_else(|| std::path::PathBuf::from(&name));
+                    let _ = nib_core::fs::rename_path(old, new.to_string_lossy().to_string()).await;
+                }
+            }
+        };
+        cx.spawn(async move |weak, cx| {
+            task.await;
+            let _ = weak.update(cx, |this, cx| this.reload_tree(cx));
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// 面板边缘的拖动把手(absolute 贴边;按下记下拖动目标,根元素的 mouse_move 接管)。
     /// 侧栏=右边、Astore=左边(竖条 col-resize);终端=顶边(横条 row-resize)。
     fn resize_handle(
@@ -1325,6 +1494,10 @@ impl Workbench {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(self.overlay, Some(Overlay::NameInput { .. })) {
+            self.confirm_name_input(cx);
+            return;
+        }
         match &self.overlay {
             Some(Overlay::Usages(view)) => view.update(cx, |view, cx| view.confirm(cx)),
             Some(Overlay::Recents(view)) => view.update(cx, |view, cx| view.confirm(cx)),
@@ -1737,7 +1910,10 @@ impl Workbench {
             Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
             Some(Overlay::Usages(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
             Some(Overlay::Recents(p)) => p.update(cx, |p, cx| p.move_selection(-1, cx)),
-            Some(Overlay::Diff(_)) | Some(Overlay::Merge(_)) | Some(Overlay::Settings(_))
+            Some(Overlay::Diff(_))
+            | Some(Overlay::Merge(_))
+            | Some(Overlay::Settings(_))
+            | Some(Overlay::NameInput { .. })
             | None => {}
         }
     }
@@ -1748,7 +1924,10 @@ impl Workbench {
             Some(Overlay::Search(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
             Some(Overlay::Usages(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
             Some(Overlay::Recents(p)) => p.update(cx, |p, cx| p.move_selection(1, cx)),
-            Some(Overlay::Diff(_)) | Some(Overlay::Merge(_)) | Some(Overlay::Settings(_))
+            Some(Overlay::Diff(_))
+            | Some(Overlay::Merge(_))
+            | Some(Overlay::Settings(_))
+            | Some(Overlay::NameInput { .. })
             | None => {}
         }
     }
@@ -2735,6 +2914,12 @@ impl Render for Workbench {
                 this.arthas_command(nib_core::arthas::ArthasCommand::Tt, cx)
             }))
             .on_action(cx.listener(Self::on_toggle_arthas))
+            .on_action(cx.listener(Self::on_new_file))
+            .on_action(cx.listener(Self::on_new_folder))
+            .on_action(cx.listener(Self::on_rename_item))
+            .on_action(cx.listener(Self::on_delete_item))
+            .on_action(cx.listener(Self::on_copy_item))
+            .on_action(cx.listener(Self::on_copy_path))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
             .when(self.projects.len() > 1, |this| {
@@ -2895,13 +3080,30 @@ impl Render for Workbench {
                             )
                             .child(div().flex_1().min_h_0().map(|this| {
                                 match self.sidebar_view {
-                                    SidebarView::Files => this
-                                        .child(tree(&self.tree_state, {
-                                            let marks = self.git_marks.clone();
-                                            move |ix, entry, sel, window, app| {
-                                                render_tree_item(ix, entry, sel, window, app, &marks)
-                                            }
-                                        })),
+                                    SidebarView::Files => this.child(
+                                        div()
+                                            .id("tree-area")
+                                            .size_full()
+                                            // 右键菜单(作用于当前选中项;先左键选中再右键)
+                                            .context_menu(|menu, _w, _c| {
+                                                menu.menu("新建文件", Box::new(NewFile))
+                                                    .menu("新建文件夹", Box::new(NewFolder))
+                                                    .separator()
+                                                    .menu("重命名", Box::new(RenameItem))
+                                                    .menu("删除", Box::new(DeleteItem))
+                                                    .separator()
+                                                    .menu("复制", Box::new(CopyItem))
+                                                    .menu("复制路径", Box::new(CopyPath))
+                                            })
+                                            .child(tree(&self.tree_state, {
+                                                let marks = self.git_marks.clone();
+                                                move |ix, entry, sel, window, app| {
+                                                    render_tree_item(
+                                                        ix, entry, sel, window, app, &marks,
+                                                    )
+                                                }
+                                            })),
+                                    ),
                                     SidebarView::Commit | SidebarView::Git => {
                                         this.child(self.git_panel.clone())
                                     }
@@ -3186,6 +3388,30 @@ impl Render for Workbench {
                     Overlay::Merge(p) => p.clone().into_any_element(),
                     Overlay::Recents(p) => p.clone().into_any_element(),
                     Overlay::Settings(p) => p.clone().into_any_element(),
+                    Overlay::NameInput { input, title, .. } => v_flex()
+                        .w(px(380.))
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(cx.theme().radius_lg)
+                        .shadow_lg()
+                        .p_3()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(cx.theme().foreground)
+                                .child(title.clone()),
+                        )
+                        .child(Input::new(input))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child("回车确认 · Esc 取消"),
+                        )
+                        .into_any_element(),
                 };
                 this.child(
                     div()
