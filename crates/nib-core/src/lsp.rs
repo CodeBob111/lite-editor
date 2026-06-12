@@ -95,6 +95,27 @@ pub async fn start_lsp(
     Ok(())
 }
 
+/// Finder/Dock 启动的 macOS app 拿到的是 launchd 的最小 PATH(实测为空,仅回落
+/// `/usr/bin:/bin:/usr/sbin:/sbin`),**不含 `/opt/homebrew/bin`** —— jdtls /
+/// pyright-langserver / typescript-language-server(及后两者依赖的 node)都装在那里,
+/// 于是裸 `Command::new("jdtls")` 在装机后从 Dock 启动时 spawn 失败 NotFound,
+/// server 永不入 map,跳转/查引用全报 "No LSP server"。dev 时 `cargo run` 从带
+/// homebrew PATH 的 shell 跑所以一直没暴露。这里把常见包管理器 bin 目录补进子进程 PATH。
+fn augmented_path() -> String {
+    let mut dirs: Vec<String> = vec![
+        "/opt/homebrew/bin".into(),
+        "/opt/homebrew/sbin".into(),
+        "/usr/local/bin".into(),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        dirs.push(format!("{home}/.local/bin"));
+    }
+    dirs.push(
+        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into()),
+    );
+    dirs.join(":")
+}
+
 fn start_lsp_blocking(
     language: String,
     root_path: String,
@@ -121,6 +142,7 @@ fn start_lsp_blocking(
     let mut command = Command::new(cmd);
     command
         .args(&args)
+        .env("PATH", augmented_path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
