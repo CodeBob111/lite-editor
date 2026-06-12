@@ -475,7 +475,14 @@ impl Workbench {
         })
         .detach();
 
-        this.load_project(root, cx);
+        // 只有显式传了路径(命令行/`open <dir>`)才初始加载该项目。
+        // Dock/Finder 启动的 macOS app 其 cwd = `/`,绝不能把 `/` 当项目 load_project——
+        // 那会 read_dir_tree("/") + list_all_files("/") 遍历整个文件系统,撞上 ~/Desktop /
+        // ~/Documents / ~/Downloads,每次启动弹一堆 TCC 授权框(还把 "/" 污染进最近项目)。
+        // 无路径参数时交给下面的会话恢复加载上次项目;无会话则停在欢迎页。
+        if arg_root.is_some() {
+            this.load_project(root, cx);
+        }
 
         // 加载编辑器偏好(含旧 settings.json 一次性导入),回来后应用到已开标签
         cx.spawn(async move |weak, cx| {
