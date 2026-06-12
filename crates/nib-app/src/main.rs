@@ -197,10 +197,23 @@ enum PanelTab {
     Output,
 }
 
+/// 正在拖动调整哪个面板的尺寸(侧栏/Astore 宽,终端高)
+#[derive(Clone, Copy, PartialEq)]
+enum Resizing {
+    Sidebar,
+    Astore,
+    Terminal,
+}
+
 struct Workbench {
     focus_handle: FocusHandle,
     sidebar_view: SidebarView,
     astore_visible: bool,
+    /// 可拖动面板尺寸(侧栏/Astore 宽、终端高)+ 当前拖动目标
+    sidebar_width: f32,
+    astore_width: f32,
+    terminal_height: f32,
+    resizing: Option<Resizing>,
     git_panel: Entity<GitPanel>,
     maven_panel: Entity<MavenPanel>,
     astore_panel: Entity<AstorePanel>,
@@ -374,6 +387,10 @@ impl Workbench {
             focus_handle,
             sidebar_view: SidebarView::Files,
             astore_visible: false,
+            sidebar_width: SIDEBAR_WIDTH,
+            astore_width: ASTORE_WIDTH,
+            terminal_height: terminal_panel::PANEL_HEIGHT,
+            resizing: None,
             git_panel,
             maven_panel,
             astore_panel,
@@ -711,6 +728,76 @@ impl Workbench {
     /// 记一条主线程操作面包屑(标签+时刻),卡顿哨兵据此归因「卡在哪」
     fn mark_op(&mut self, label: impl Into<SharedString>) {
         self.last_op = Some((label.into(), Instant::now()));
+    }
+
+    /// 拖动面板把手时(光标移动)实时更新对应面板尺寸(根元素挂全局 mouse_move)。
+    fn on_resize_drag(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(kind) = self.resizing else { return };
+        let vp = window.viewport_size();
+        let x = f32::from(event.position.x);
+        let y = f32::from(event.position.y);
+        match kind {
+            Resizing::Sidebar => self.sidebar_width = (x - ACTIVITY_WIDTH).clamp(160., 520.),
+            Resizing::Astore => self.astore_width = (f32::from(vp.width) - x).clamp(180., 560.),
+            // 终端高 = 视口高 - 状态栏(24) - 光标 y
+            Resizing::Terminal => {
+                self.terminal_height = (f32::from(vp.height) - 24. - y).clamp(120., 640.)
+            }
+        }
+        cx.notify();
+    }
+
+    /// 松开鼠标结束拖动。
+    fn on_resize_end(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.resizing.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 面板边缘的拖动把手(absolute 贴边;按下记下拖动目标,根元素的 mouse_move 接管)。
+    /// 侧栏=右边、Astore=左边(竖条 col-resize);终端=顶边(横条 row-resize)。
+    fn resize_handle(
+        &self,
+        id: &'static str,
+        kind: Resizing,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let base = div()
+            .id(id)
+            .absolute()
+            .hover(|s| s.bg(cx.theme().primary.opacity(0.4)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.resizing = Some(kind);
+                    cx.notify();
+                }),
+            );
+        match kind {
+            Resizing::Sidebar => base
+                .top_0()
+                .bottom_0()
+                .right(px(-2.5))
+                .w(px(5.))
+                .cursor_col_resize(),
+            Resizing::Astore => base
+                .top_0()
+                .bottom_0()
+                .left(px(-2.5))
+                .w(px(5.))
+                .cursor_col_resize(),
+            Resizing::Terminal => base
+                .left_0()
+                .right_0()
+                .top(px(-2.5))
+                .h(px(5.))
+                .cursor_row_resize(),
+        }
     }
 
     /// 帧时/主线程停顿哨兵(RFC v2 §5.6):每 100ms 一个心跳回主线程,漂移 >32ms 视为
@@ -2275,9 +2362,11 @@ impl Workbench {
         };
 
         v_flex()
-            .h(px(terminal_panel::PANEL_HEIGHT))
+            .h(px(self.terminal_height))
+            .relative()
             .border_t_1()
             .border_color(border)
+            .child(self.resize_handle("rz-terminal", Resizing::Terminal, cx))
             .child(
                 h_flex()
                     .h(px(30.))
@@ -2612,6 +2701,9 @@ impl Render for Workbench {
             .track_focus(&self.focus_handle)
             .bg(cx.theme().background)
             .key_context("Workbench")
+            // 面板拖动:把手按下后,根元素的 mouse_move/up 实时改尺寸(仅 resizing 时生效)
+            .on_mouse_move(cx.listener(Self::on_resize_drag))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_resize_end))
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_toggle_quick_open))
@@ -2650,7 +2742,6 @@ impl Render for Workbench {
                         .px_2()
                         .gap_1()
                         .items_center()
-                        .overflow_x_scroll()
                         .bg(cx.theme().sidebar)
                         .border_b_1()
                         .border_color(cx.theme().border)
@@ -2666,7 +2757,9 @@ impl Render for Workbench {
                                 .px_3()
                                 .gap_2()
                                 .items_center()
-                                .flex_none()
+                                // 平分铺满整条项目栏(对齐 IDEA 项目/编辑器标签的拉伸行为)
+                                .flex_1()
+                                .min_w_0()
                                 .rounded(cx.theme().radius)
                                 .text_size(px(13.))
                                 .when(active, |s| s.bg(cx.theme().background))
@@ -2680,7 +2773,15 @@ impl Render for Workbench {
                                         this.switch_project(ix, cx)
                                     }),
                                 )
-                                .child(name)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_center()
+                                        .child(name),
+                                )
                                 .when(active && self.projects.len() > 1, |s| {
                                     s.child(
                                         div()
@@ -2751,11 +2852,13 @@ impl Render for Workbench {
                     )
                     .child(
                         v_flex()
-                            .w(px(SIDEBAR_WIDTH))
+                            .w(px(self.sidebar_width))
+                            .relative()
                             .h_full()
                             .border_r_1()
                             .border_color(cx.theme().border)
                             .bg(cx.theme().sidebar)
+                            .child(self.resize_handle("rz-sidebar", Resizing::Sidebar, cx))
                             .child(
                                 h_flex()
                                     .h(px(30.))
@@ -2915,11 +3018,13 @@ impl Render for Workbench {
                     .when(self.astore_visible, |row| {
                         row.child(
                             v_flex()
-                                .w(px(ASTORE_WIDTH))
+                                .w(px(self.astore_width))
+                                .relative()
                                 .h_full()
                                 .border_l_1()
                                 .border_color(cx.theme().border)
                                 .bg(cx.theme().sidebar)
+                                .child(self.resize_handle("rz-astore", Resizing::Astore, cx))
                                 .child(
                                     h_flex()
                                         .h(px(30.))
