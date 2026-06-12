@@ -1701,7 +1701,7 @@ impl Workbench {
 fn render_tree_item(
     ix: usize,
     entry: &gpui_component::tree::TreeEntry,
-    _: bool,
+    selected: bool,
     _: &mut Window,
     app: &mut App,
     marks: &std::collections::HashMap<String, char>,
@@ -1739,7 +1739,23 @@ fn render_tree_item(
                 .child(item.label.clone()),
         )
     };
-    ListItem::new(ix).pl(px(8.) + px(12.) * entry.depth() as f32).child(row)
+    // 选中态:淡蓝底(ListItem 自带 list_active)+ 左侧 2px 蓝条(对齐设计稿 .row-t.sel::before)
+    let primary = app.theme().primary;
+    ListItem::new(ix)
+        .relative()
+        .pl(px(8.) + px(12.) * entry.depth() as f32)
+        .when(selected, |li| {
+            li.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(2.))
+                    .bg(primary),
+            )
+        })
+        .child(row)
 }
 
 fn lang_display(lang: &str) -> &'static str {
