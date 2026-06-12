@@ -532,6 +532,7 @@ pub async fn lsp_find_references(
         find_server_for_file(&servers, &file_path, &lang)?
     };
 
+    let character = snap_to_identifier(&file_path, line, character);
     let id = server.next_id.fetch_add(1, Ordering::Relaxed);
     let params = serde_json::json!({
         "textDocument": { "uri": format!("file://{}", file_path) },
@@ -562,6 +563,7 @@ pub async fn lsp_goto_definition(
         find_server_for_file(&servers, &file_path, &lang)?
     };
 
+    let character = snap_to_identifier(&file_path, line, character);
     let id = server.next_id.fetch_add(1, Ordering::Relaxed);
     let params = serde_json::json!({
         "textDocument": { "uri": format!("file://{}", file_path) },
@@ -675,6 +677,35 @@ fn find_server_for_file(
         "No LSP server running for '{}' in project containing '{}'",
         key_lang, file_path
     ))
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
+}
+
+/// cmd+click 的落点常被取整到标识符的**右边界外一格**(紧跟的 `(`、`.`、空格等),
+/// jdtls 严格按位置取符号,在非标识符字符上返回空(IDEA 则会取相邻 token)。
+/// 这里把光标"吸附"回标识符内:当前列不是标识符字符、而左邻是,就退一列。
+/// character 是字符列(0-based,组件实证为字符非 UTF-16),与按行字符遍历一致。
+fn snap_to_identifier(file_path: &str, line: u32, character: u32) -> u32 {
+    if character == 0 {
+        return character;
+    }
+    let Ok(content) = std::fs::read_to_string(file_path) else {
+        return character;
+    };
+    let Some(line_text) = content.lines().nth(line as usize) else {
+        return character;
+    };
+    let chars: Vec<char> = line_text.chars().collect();
+    let at = character as usize;
+    let cur_is_ident = chars.get(at).copied().map(is_ident_char).unwrap_or(false);
+    let prev_is_ident = chars.get(at - 1).copied().map(is_ident_char).unwrap_or(false);
+    if !cur_is_ident && prev_is_ident {
+        character - 1
+    } else {
+        character
+    }
 }
 
 fn detect_language(path: &str) -> String {
