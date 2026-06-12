@@ -3092,7 +3092,8 @@ fn main() {
             ]),
             // 对齐旧版 View 菜单(Terminal 项;Git/Astore 在侧栏页签,不重复列)
             Menu::new("View").items([
-                MenuItem::action("Terminal", ToggleTerminal),
+                MenuItem::action("Markdown 预览  ⇧⌘V", ToggleMdPreview),
+                MenuItem::action("终端  ⌃`", ToggleTerminal),
                 MenuItem::action("Astore", ToggleAstore),
             ]),
         ]);
