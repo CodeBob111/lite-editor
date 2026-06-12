@@ -252,6 +252,9 @@ struct Workbench {
     /// 资源管理器内部文件剪贴板:(路径列表, is_cut)。复制/剪切→存,粘贴→读。
     /// 与系统剪贴板分开:cmd+C 同时写系统剪贴板(跨应用),内部这份供 cmd+V 在树内粘贴。
     file_clipboard: Option<(Vec<PathBuf>, bool)>,
+    /// 资源管理器多选集(cmd+click 切换)。非空时 复制/剪切/删除 作用于整集;
+    /// 空时回落到 tree 控件的单选项。普通点击(无修饰键)清空回到单选。
+    selected_paths: std::collections::HashSet<String>,
     tabs: Vec<OpenTab>,
     active_tab: Option<usize>,
     /// 全项目文件清单缓存(quick-open 用;core runtime 预载)
@@ -430,6 +433,7 @@ impl Workbench {
             project_name: "".into(),
             tree_state,
             file_clipboard: None,
+            selected_paths: std::collections::HashSet::new(),
             tabs: Vec::new(),
             active_tab: None,
             all_files: Arc::new(Vec::new()),
@@ -800,6 +804,31 @@ impl Workbench {
             .map(|i| i.id.to_string())
     }
 
+    /// 文件操作的目标集:多选非空→整集(去重),否则→tree 单选项(0/1 个)。
+    fn target_paths(&self, cx: &App) -> Vec<String> {
+        if !self.selected_paths.is_empty() {
+            self.selected_paths.iter().cloned().collect()
+        } else {
+            self.selected_tree_path(cx).into_iter().collect()
+        }
+    }
+
+    /// 树行 cmd+click:切换该路径在多选集中的去留(不打开文件)。
+    fn toggle_multi_select(&mut self, path: String, cx: &mut Context<Self>) {
+        if !self.selected_paths.remove(&path) {
+            self.selected_paths.insert(path);
+        }
+        cx.notify();
+    }
+
+    /// 普通点击(无修饰键):清空多选集,回到 tree 单选。
+    fn clear_multi_select(&mut self, cx: &mut Context<Self>) {
+        if !self.selected_paths.is_empty() {
+            self.selected_paths.clear();
+            cx.notify();
+        }
+    }
+
     /// 新建的目标目录:选中是目录→该目录;是文件→其父目录;无选中→项目根。
     fn selected_dir(&self, cx: &App) -> String {
         let root = self.project_root.to_string_lossy().to_string();
@@ -867,12 +896,16 @@ impl Workbench {
     }
 
     fn on_delete_item(&mut self, _: &DeleteItem, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.selected_tree_path(cx) else {
+        let paths = self.target_paths(cx);
+        if paths.is_empty() {
             return;
-        };
-        self.status = format!("已删除 {}", path).into();
+        }
+        self.status = format!("已删除 {} 项", paths.len()).into();
+        self.selected_paths.clear();
         cx.spawn(async move |weak, cx| {
-            let _ = nib_core::fs::delete_path(path).await;
+            for p in paths {
+                let _ = nib_core::fs::delete_path(p).await;
+            }
             let _ = weak.update(cx, |this, cx| this.reload_tree(cx));
         })
         .detach();
@@ -887,21 +920,25 @@ impl Workbench {
     }
 
     fn on_copy_item(&mut self, _: &CopyItem, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = self.selected_tree_path(cx) {
-            // 系统剪贴板(跨应用粘贴) + 内部剪贴板(cmd+V 树内粘贴)
-            let _ = nib_core::clipboard::copy_files_to_clipboard(vec![path.clone()]);
-            self.file_clipboard = Some((vec![PathBuf::from(path)], false));
-            self.status = "已复制文件".into();
-            cx.notify();
+        let paths = self.target_paths(cx);
+        if paths.is_empty() {
+            return;
         }
+        // 系统剪贴板(跨应用粘贴) + 内部剪贴板(cmd+V 树内粘贴)
+        let _ = nib_core::clipboard::copy_files_to_clipboard(paths.clone());
+        self.file_clipboard = Some((paths.iter().map(PathBuf::from).collect(), false));
+        self.status = format!("已复制 {} 项", paths.len()).into();
+        cx.notify();
     }
 
     fn on_cut_item(&mut self, _: &CutItem, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(path) = self.selected_tree_path(cx) {
-            self.file_clipboard = Some((vec![PathBuf::from(path)], true));
-            self.status = "已剪切文件".into();
-            cx.notify();
+        let paths = self.target_paths(cx);
+        if paths.is_empty() {
+            return;
         }
+        self.file_clipboard = Some((paths.iter().map(PathBuf::from).collect(), true));
+        self.status = format!("已剪切 {} 项", paths.len()).into();
+        cx.notify();
     }
 
     fn on_paste_item(&mut self, _: &PasteItem, _: &mut Window, cx: &mut Context<Self>) {
@@ -931,6 +968,10 @@ impl Workbench {
             }
             let _ = weak.update(cx, |this, cx| {
                 this.status = "".into();
+                if is_cut {
+                    // 剪切的源已移走,清掉残留的多选高亮
+                    this.selected_paths.clear();
+                }
                 this.reload_tree(cx);
             });
         })
@@ -2018,6 +2059,7 @@ impl Workbench {
 
 /// Explorer 树行(对齐旧版):文件夹用折叠图标,文件用类型字形图标(file-icons 同源),
 /// 文件名按 git 状态着色(M=橙 A/?=绿 D=红),lock/忽略类淡化
+#[allow(clippy::too_many_arguments)]
 fn render_tree_item(
     ix: usize,
     entry: &gpui_component::tree::TreeEntry,
@@ -2025,8 +2067,11 @@ fn render_tree_item(
     _: &mut Window,
     app: &mut App,
     marks: &std::collections::HashMap<String, char>,
+    multi: &std::collections::HashSet<String>,
+    weak: &WeakEntity<Workbench>,
 ) -> ListItem {
     let item = entry.item();
+    let in_multi = multi.contains(item.id.as_ref());
     let muted = app.theme().muted_foreground;
     // 树行字号 13px(对齐设计稿 .tree{font-size:13px});gap 6px
     let row = h_flex().gap(px(6.)).items_center().text_size(px(13.));
@@ -2116,11 +2161,15 @@ fn render_tree_item(
             })
     };
     // 选中态:淡蓝底(ListItem 自带 list_active)+ 左侧 2px 蓝条(对齐设计稿 .row-t.sel::before)
+    // 多选态(cmd+click):tree 不知道,自己补底+左条
     let primary = app.theme().primary;
+    let list_active = app.theme().list_active;
+    let id = item.id.to_string();
     ListItem::new(ix)
         .relative()
         .pl(px(8.) + px(12.) * entry.depth() as f32)
-        .when(selected, |li| {
+        .when(in_multi, |li| li.bg(list_active))
+        .when(selected || in_multi, |li| {
             li.child(
                 div()
                     .absolute()
@@ -2130,6 +2179,25 @@ fn render_tree_item(
                     .w(px(2.))
                     .bg(primary),
             )
+        })
+        // cmd+click 切换多选(stop_propagation 压住 tree 的 on_entry_click,不打开文件);
+        // 普通点击清空多选回到单选(tree 自己处理打开)
+        .on_mouse_down(MouseButton::Left, {
+            let weak = weak.clone();
+            move |ev, win, cx| {
+                if ev.modifiers.platform {
+                    cx.stop_propagation();
+                    let id = id.clone();
+                    let _ = weak.update(cx, |this, cx| {
+                        this.toggle_multi_select(id, cx);
+                        // stop_propagation 会阻断外层 tree-area 的聚焦 handler,
+                        // 这里补聚焦,保证首次就 cmd+click 时 cmd-c/x/v 仍在分发路径上
+                        this.tree_state.update(cx, |s, cx| s.focus(win, cx));
+                    });
+                } else if !ev.modifiers.shift {
+                    let _ = weak.update(cx, |this, cx| this.clear_multi_select(cx));
+                }
+            }
         })
         .child(row)
 }
@@ -3158,9 +3226,12 @@ impl Render for Workbench {
                                             })
                                             .child(tree(&self.tree_state, {
                                                 let marks = self.git_marks.clone();
+                                                let multi = self.selected_paths.clone();
+                                                let weak = cx.entity().downgrade();
                                                 move |ix, entry, sel, window, app| {
                                                     render_tree_item(
                                                         ix, entry, sel, window, app, &marks,
+                                                        &multi, &weak,
                                                     )
                                                 }
                                             })),
