@@ -178,6 +178,14 @@ impl SidebarView {
     }
 }
 
+/// 底部面板的三个 tab(对齐设计稿 nib-editor.html:问题 / 终端 / 输出)
+#[derive(Clone, Copy, PartialEq)]
+enum PanelTab {
+    Problems,
+    Terminal,
+    Output,
+}
+
 struct Workbench {
     focus_handle: FocusHandle,
     sidebar_view: SidebarView,
@@ -208,6 +216,8 @@ struct Workbench {
     md_preview: bool,
     terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
+    /// 底部面板当前 tab(问题/终端/输出)
+    panel_tab: PanelTab,
     arthas: Option<Entity<ArthasPanel>>,
     arthas_visible: bool,
     expanded_paths: std::collections::HashSet<String>,
@@ -373,6 +383,7 @@ impl Workbench {
             md_preview: false,
             terminal: None,
             terminal_visible: false,
+            panel_tab: PanelTab::Terminal,
             arthas: None,
             arthas_visible: false,
             expanded_paths: std::collections::HashSet::new(),
@@ -893,7 +904,8 @@ impl Workbench {
         self.active_tab = Some(ix);
         self.tabs[ix].last_used = Instant::now();
         let tab = &self.tabs[ix];
-        self.status = tab.path.display().to_string().into();
+        // 路径在面包屑显示;状态栏左侧留给 git/诊断(对齐设计稿),切标签清空消息
+        self.status = "".into();
         let handle = tab.editor.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
         // 树高亮跟随当前标签(按 id 匹配,自动展开祖先;观察者对已激活文件是 no-op)
@@ -910,7 +922,7 @@ impl Workbench {
             if self.active_tab != Some(ix) {
                 self.active_tab = Some(ix);
                 self.tabs[ix].last_used = Instant::now();
-                self.status = path.display().to_string().into();
+                self.status = "".into();
                 self.persist_session(cx);
                 // 本路径无 window(树点击的 observe 进来),经窗口句柄把焦点
                 // 交还编辑器——否则切到已开标签后键入无落点
@@ -1746,11 +1758,16 @@ impl Workbench {
     fn activity_btn(
         &self,
         id: &'static str,
-        glyph: &'static str,
+        icon: IconName,
         view: SidebarView,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active = self.sidebar_view == view;
+        let color = if active {
+            cx.theme().foreground
+        } else {
+            cx.theme().muted_foreground
+        };
         div()
             .id(id)
             .w(px(40.))
@@ -1759,19 +1776,13 @@ impl Workbench {
             .items_center()
             .justify_center()
             .rounded(cx.theme().radius)
-            .text_size(px(18.))
-            .text_color(if active {
-                cx.theme().foreground
-            } else {
-                cx.theme().muted_foreground
-            })
             .when(active, |s| s.bg(cx.theme().list_active))
             .hover(|s| s.bg(cx.theme().accent))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| this.set_sidebar_view(view, cx)),
             )
-            .child(glyph)
+            .child(Icon::new(icon).size(px(20.)).text_color(color))
     }
 
     /// 欢迎/空态页(对齐 welcome.html):品牌 + tagline + 开始/最近两栏 + 快捷键速查。
@@ -2142,6 +2153,150 @@ impl Workbench {
             )
     }
 
+    /// 底部面板(对齐设计稿):问题/终端/输出 tab 栏 + 按 tab 切换内容。
+    /// 问题=按文件的诊断计数(可点开;gpui-component 未开放逐条诊断 API,故只到文件级);
+    /// 终端=既有终端面板;输出=占位(暂无构建/LSP 日志源)。
+    fn render_bottom_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let border = cx.theme().border;
+        let problems: usize = self
+            .tabs
+            .iter()
+            .map(|t| t.editor.read(cx).diagnostics().map(|d| d.len()).unwrap_or(0))
+            .sum();
+
+        let tab_btn = |id: &'static str, label: String, tab: PanelTab, cx: &mut Context<Self>| {
+            let active = self.panel_tab == tab;
+            div()
+                .id(id)
+                .px_2()
+                .py_0p5()
+                .rounded(cx.theme().radius)
+                .text_size(px(12.))
+                .cursor_pointer()
+                .when(active, |s| s.text_color(fg).bg(cx.theme().list_active))
+                .when(!active, |s| s.text_color(muted))
+                .hover(|s| s.bg(cx.theme().accent))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        this.panel_tab = tab;
+                        cx.notify();
+                    }),
+                )
+                .child(label)
+        };
+
+        v_flex()
+            .h(px(terminal_panel::PANEL_HEIGHT))
+            .border_t_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .h(px(30.))
+                    .flex_none()
+                    .items_center()
+                    .px_2()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(border)
+                    .child(tab_btn(
+                        "pt-problems",
+                        if problems > 0 {
+                            format!("问题 {problems}")
+                        } else {
+                            "问题".into()
+                        },
+                        PanelTab::Problems,
+                        cx,
+                    ))
+                    .child(tab_btn("pt-terminal", "终端".into(), PanelTab::Terminal, cx))
+                    .child(tab_btn("pt-output", "输出".into(), PanelTab::Output, cx))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("pt-collapse")
+                            .px_2()
+                            .text_size(px(13.))
+                            .text_color(muted)
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(fg))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.on_toggle_terminal(&ToggleTerminal, window, cx)
+                                }),
+                            )
+                            .child("⌄"),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().map(|c| match self.panel_tab {
+                PanelTab::Terminal => {
+                    if let Some(panel) = self.terminal.clone() {
+                        c.child(panel)
+                    } else {
+                        c.child(div().p_3().text_color(muted).child("终端未启动"))
+                    }
+                }
+                PanelTab::Problems => {
+                    let rows: Vec<_> = self
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(ix, t)| {
+                            let n =
+                                t.editor.read(cx).diagnostics().map(|d| d.len()).unwrap_or(0);
+                            (n > 0).then(|| (ix, t.title.clone(), n))
+                        })
+                        .collect();
+                    if rows.is_empty() {
+                        c.child(
+                            div()
+                                .p_3()
+                                .text_size(px(12.))
+                                .text_color(cx.theme().success)
+                                .child("✓ 没有问题"),
+                        )
+                    } else {
+                        c.child(v_flex().p_1().children(rows.into_iter().map(
+                            |(ix, title, n)| {
+                                h_flex()
+                                    .id(ix)
+                                    .px_2()
+                                    .py_0p5()
+                                    .gap_2()
+                                    .items_center()
+                                    .rounded(cx.theme().radius)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(cx.theme().accent))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.activate_tab(ix, window, cx)
+                                        }),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(cx.theme().warning)
+                                            .text_size(px(12.))
+                                            .child(format!("⚠ {n}")),
+                                    )
+                                    .child(div().text_size(px(12.)).text_color(fg).child(title))
+                            },
+                        )))
+                    }
+                }
+                PanelTab::Output => c.child(
+                    div()
+                        .p_3()
+                        .text_size(px(12.))
+                        .text_color(muted)
+                        .child("输出 — 暂未接入构建/LSP 日志源"),
+                ),
+            }))
+    }
+
     /// 单个编辑器标签(旧版 .tab:类型图标+文件名+关闭×;脏=●)
     fn render_editor_tab(&self, ix: usize, tab: &OpenTab, cx: &mut Context<Self>) -> impl IntoElement {
         let active = self.active_tab == Some(ix);
@@ -2480,10 +2635,10 @@ impl Render for Workbench {
                             .border_r_1()
                             .border_color(cx.theme().border)
                             .bg(cx.theme().sidebar)
-                            .child(self.activity_btn("act-files", "☰", SidebarView::Files, cx))
-                            .child(self.activity_btn("act-commit", "✓", SidebarView::Commit, cx))
-                            .child(self.activity_btn("act-git", "⎇", SidebarView::Git, cx))
-                            .child(self.activity_btn("act-maven", "◪", SidebarView::Maven, cx))
+                            .child(self.activity_btn("act-files", IconName::Folder, SidebarView::Files, cx))
+                            .child(self.activity_btn("act-commit", IconName::Inbox, SidebarView::Commit, cx))
+                            .child(self.activity_btn("act-git", IconName::Github, SidebarView::Git, cx))
+                            .child(self.activity_btn("act-maven", IconName::GalleryVerticalEnd, SidebarView::Maven, cx))
                             .child(div().flex_1())
                             .child(
                                 div()
@@ -2494,8 +2649,6 @@ impl Render for Workbench {
                                     .items_center()
                                     .justify_center()
                                     .rounded(cx.theme().radius)
-                                    .text_size(px(18.))
-                                    .text_color(cx.theme().muted_foreground)
                                     .hover(|s| s.bg(cx.theme().accent))
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -2503,7 +2656,11 @@ impl Render for Workbench {
                                             this.on_open_settings(&OpenSettings, window, cx)
                                         }),
                                     )
-                                    .child("⚙"),
+                                    .child(
+                                        Icon::new(IconName::Settings)
+                                            .size(px(19.))
+                                            .text_color(cx.theme().muted_foreground),
+                                    ),
                             ),
                     )
                     .child(
@@ -2627,15 +2784,7 @@ impl Render for Workbench {
                                 }
                             }))
                             .when(self.terminal_visible, |this| {
-                                this.when_some(self.terminal.clone(), |this, panel| {
-                                    this.child(
-                                        div()
-                                            .h(px(terminal_panel::PANEL_HEIGHT))
-                                            .border_t_1()
-                                            .border_color(cx.theme().border)
-                                            .child(panel),
-                                    )
-                                })
+                                this.child(self.render_bottom_panel(cx))
                             })
                             .when(self.arthas_visible, |this| {
                                 this.when_some(self.arthas.clone(), |this, panel| {
@@ -2683,7 +2832,18 @@ impl Render for Workbench {
                     .text_size(px(11.))
                     .text_color(cx.theme().muted_foreground)
                     .map(|bar| {
-                        let branch = self.git_panel.read(cx).branch();
+                        // 左侧对齐设计稿:分支 · git 领先/落后 · 改动数 · 诊断数
+                        let (branch, ahead, behind, changes) = {
+                            let gp = self.git_panel.read(cx);
+                            let (a, b) = gp.ahead_behind();
+                            (gp.branch(), a, b, gp.change_count())
+                        };
+                        // 诊断只能取总数(gpui-component 的 DiagnosticSet::iter 是 pub(crate))
+                        let problems: usize = self
+                            .tabs
+                            .iter()
+                            .map(|t| t.editor.read(cx).diagnostics().map(|d| d.len()).unwrap_or(0))
+                            .sum();
                         bar.when(!branch.is_empty(), |s| {
                             s.child(
                                 h_flex()
@@ -2692,6 +2852,29 @@ impl Render for Workbench {
                                     .whitespace_nowrap()
                                     .child(div().text_color(cx.theme().info).child("⎇"))
                                     .child(branch),
+                            )
+                        })
+                        .when(ahead > 0 || behind > 0, |s| {
+                            s.child(
+                                div()
+                                    .whitespace_nowrap()
+                                    .child(format!("↑{ahead} ↓{behind}")),
+                            )
+                        })
+                        .when(changes > 0, |s| {
+                            s.child(
+                                div()
+                                    .text_color(cx.theme().warning)
+                                    .whitespace_nowrap()
+                                    .child(format!("● {changes}")),
+                            )
+                        })
+                        .when(problems > 0, |s| {
+                            s.child(
+                                div()
+                                    .text_color(cx.theme().warning)
+                                    .whitespace_nowrap()
+                                    .child(format!("⚠ {problems}")),
                             )
                         })
                     })

@@ -80,6 +80,20 @@ impl GitPanel {
         self.branch.clone()
     }
 
+    /// 当前分支相对上游的领先/落后(状态栏 ↑↓ 用);无上游或未刷新为 (0,0)。
+    pub fn ahead_behind(&self) -> (i32, i32) {
+        self.branches
+            .iter()
+            .find(|b| b.current)
+            .map(|b| (b.ahead, b.behind))
+            .unwrap_or((0, 0))
+    }
+
+    /// 工作区改动文件数(状态栏 ● 用)。
+    pub fn change_count(&self) -> usize {
+        self.changes.len()
+    }
+
     pub fn set_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         self.project_root = root;
         self.changes.clear();
