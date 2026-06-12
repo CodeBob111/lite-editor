@@ -557,10 +557,17 @@ pub async fn lsp_goto_definition(
     character: u32,
     state: &LspState,
 ) -> Result<Option<LspUsage>, String> {
+    dbg_log(&format!("[jdtls-def] 请求 file={file_path} line={line} char={character}"));
     let lang = detect_language(&file_path);
     let server = {
         let servers = state.servers.lock().map_err(|e| e.to_string())?;
-        find_server_for_file(&servers, &file_path, &lang)?
+        match find_server_for_file(&servers, &file_path, &lang) {
+            Ok(s) => s,
+            Err(e) => {
+                dbg_log(&format!("[jdtls-def] 没有可用 server: {e}"));
+                return Err(e);
+            }
+        }
     };
 
     let character = snap_to_identifier(&file_path, line, character);
@@ -578,6 +585,9 @@ pub async fn lsp_goto_definition(
         Duration::from_secs(4),
     )
     .await?;
+    dbg_log(&format!(
+        "[jdtls-def] line={line} char={character} 原始响应: {response}"
+    ));
     let locations = parse_locations(response)?;
     Ok(locations.into_iter().next())
 }
@@ -731,15 +741,39 @@ pub async fn text_fallback_definition(
     .flatten()
 }
 
+fn dbg_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/nib-goto.log")
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+}
+
 fn text_fallback_definition_blocking(
     file_path: &str,
     line: u32,
     character: u32,
     project_files: &[String],
 ) -> Option<LspUsage> {
-    let content = std::fs::read_to_string(file_path).ok()?;
-    let line_text = content.lines().nth(line as usize)?.to_string();
-    let (receiver, word) = word_and_receiver(&line_text, character as usize)?;
+    let Ok(content) = std::fs::read_to_string(file_path) else {
+        dbg_log(&format!("[fallback] 读不了文件 {file_path}"));
+        return None;
+    };
+    let Some(line_text) = content.lines().nth(line as usize).map(|s| s.to_string()) else {
+        dbg_log(&format!("[fallback] 没有第 {line} 行"));
+        return None;
+    };
+    let Some((receiver, word)) = word_and_receiver(&line_text, character as usize) else {
+        dbg_log(&format!("[fallback] 光标处取不出标识符 line={line} char={character} 文本=[{line_text}]"));
+        return None;
+    };
+    dbg_log(&format!(
+        "[fallback] line={line} char={character} project_files={} receiver={receiver:?} word={word}",
+        project_files.len()
+    ));
 
     let uppercase = |s: &str| s.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
 
@@ -748,12 +782,25 @@ fn text_fallback_definition_blocking(
         let type_name = if uppercase(recv) {
             recv.clone()
         } else {
-            resolve_var_type(&content, recv)?
+            match resolve_var_type(&content, recv) {
+                Some(t) => t,
+                None => {
+                    dbg_log(&format!("[fallback] 推不出变量 {recv} 的类型"));
+                    return None;
+                }
+            }
         };
-        let fqn = resolve_fqn(&content, &type_name)?;
+        let Some(fqn) = resolve_fqn(&content, &type_name) else {
+            dbg_log(&format!("[fallback] 解析不出 {type_name} 的 FQN(无 import 且无 package)"));
+            return None;
+        };
         let rel = format!("/{}.java", fqn.replace('.', "/"));
-        let target = project_files.iter().find(|p| p.ends_with(&rel))?;
+        let Some(target) = project_files.iter().find(|p| p.ends_with(&rel)) else {
+            dbg_log(&format!("[fallback] 工程文件列表里找不到后缀 {rel}(type={type_name} fqn={fqn})"));
+            return None;
+        };
         let l = find_method_line(target, &word).unwrap_or(1);
+        dbg_log(&format!("[fallback] ✓ {type_name}.{word} → {target}:{l}"));
         return Some(LspUsage {
             uri: format!("file://{}", target),
             line: (l.saturating_sub(1)) as u32,
@@ -764,9 +811,16 @@ fn text_fallback_definition_blocking(
 
     // 2) 裸标识符:大写=类型(跳到该类文件首行),小写=同文件方法定义
     if uppercase(&word) {
-        let fqn = resolve_fqn(&content, &word)?;
+        let Some(fqn) = resolve_fqn(&content, &word) else {
+            dbg_log(&format!("[fallback] 裸类型 {word} 解析不出 FQN"));
+            return None;
+        };
         let rel = format!("/{}.java", fqn.replace('.', "/"));
-        let target = project_files.iter().find(|p| p.ends_with(&rel))?;
+        let Some(target) = project_files.iter().find(|p| p.ends_with(&rel)) else {
+            dbg_log(&format!("[fallback] 裸类型找不到文件后缀 {rel}"));
+            return None;
+        };
+        dbg_log(&format!("[fallback] ✓ 类型 {word} → {target}"));
         Some(LspUsage {
             uri: format!("file://{}", target),
             line: 0,
@@ -774,7 +828,11 @@ fn text_fallback_definition_blocking(
             text: String::new(),
         })
     } else {
-        let l = find_method_def_in_content(&content, &word, line as usize)?;
+        let Some(l) = find_method_def_in_content(&content, &word, line as usize) else {
+            dbg_log(&format!("[fallback] 同文件找不到方法 {word} 的定义"));
+            return None;
+        };
+        dbg_log(&format!("[fallback] ✓ 同文件方法 {word} → 行 {l}"));
         Some(LspUsage {
             uri: format!("file://{}", file_path),
             line: l,
