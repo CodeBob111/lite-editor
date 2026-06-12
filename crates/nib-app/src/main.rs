@@ -249,6 +249,9 @@ struct Workbench {
     project_root: PathBuf,
     project_name: SharedString,
     tree_state: Entity<TreeState>,
+    /// 资源管理器内部文件剪贴板:(路径列表, is_cut)。复制/剪切→存,粘贴→读。
+    /// 与系统剪贴板分开:cmd+C 同时写系统剪贴板(跨应用),内部这份供 cmd+V 在树内粘贴。
+    file_clipboard: Option<(Vec<PathBuf>, bool)>,
     tabs: Vec<OpenTab>,
     active_tab: Option<usize>,
     /// 全项目文件清单缓存(quick-open 用;core runtime 预载)
@@ -426,6 +429,7 @@ impl Workbench {
             project_root: root.clone(),
             project_name: "".into(),
             tree_state,
+            file_clipboard: None,
             tabs: Vec::new(),
             active_tab: None,
             all_files: Arc::new(Vec::new()),
@@ -884,10 +888,54 @@ impl Workbench {
 
     fn on_copy_item(&mut self, _: &CopyItem, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = self.selected_tree_path(cx) {
-            let _ = nib_core::clipboard::copy_files_to_clipboard(vec![path]);
-            self.status = "已复制文件到剪贴板".into();
+            // 系统剪贴板(跨应用粘贴) + 内部剪贴板(cmd+V 树内粘贴)
+            let _ = nib_core::clipboard::copy_files_to_clipboard(vec![path.clone()]);
+            self.file_clipboard = Some((vec![PathBuf::from(path)], false));
+            self.status = "已复制文件".into();
             cx.notify();
         }
+    }
+
+    fn on_cut_item(&mut self, _: &CutItem, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.selected_tree_path(cx) {
+            self.file_clipboard = Some((vec![PathBuf::from(path)], true));
+            self.status = "已剪切文件".into();
+            cx.notify();
+        }
+    }
+
+    fn on_paste_item(&mut self, _: &PasteItem, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((srcs, is_cut)) = self.file_clipboard.clone() else {
+            return;
+        };
+        let dir = self.selected_dir(cx);
+        self.status = if is_cut { "正在移动…" } else { "正在粘贴…" }.into();
+        if is_cut {
+            self.file_clipboard = None;
+        }
+        cx.spawn(async move |weak, cx| {
+            for src in srcs {
+                let Some(name) = src.file_name() else { continue };
+                let dest = std::path::Path::new(&dir).join(name);
+                // 防自我覆盖:目标与源同路径时跳过
+                if dest == src {
+                    continue;
+                }
+                let dest = dest.to_string_lossy().to_string();
+                let src = src.to_string_lossy().to_string();
+                if is_cut {
+                    let _ = nib_core::fs::rename_path(src, dest).await;
+                } else {
+                    let _ = nib_core::fs::copy_path(src, dest).await;
+                }
+            }
+            let _ = weak.update(cx, |this, cx| {
+                this.status = "".into();
+                this.reload_tree(cx);
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     /// 命名输入浮层确认(Enter):按 op 执行新建/重命名,刷新树。
@@ -2919,6 +2967,8 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_rename_item))
             .on_action(cx.listener(Self::on_delete_item))
             .on_action(cx.listener(Self::on_copy_item))
+            .on_action(cx.listener(Self::on_cut_item))
+            .on_action(cx.listener(Self::on_paste_item))
             .on_action(cx.listener(Self::on_copy_path))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
@@ -3084,6 +3134,15 @@ impl Render for Workbench {
                                         div()
                                             .id("tree-area")
                                             .size_full()
+                                            // 左键点击树区聚焦 tree("Tree" 上下文),cmd-c/x/v 才在按键分发路径上
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.tree_state.update(cx, |s, cx| {
+                                                        s.focus(window, cx)
+                                                    });
+                                                }),
+                                            )
                                             // 右键菜单(作用于当前选中项;先左键选中再右键)
                                             .context_menu(|menu, _w, _c| {
                                                 menu.menu("新建文件", Box::new(NewFile))
@@ -3093,6 +3152,8 @@ impl Render for Workbench {
                                                     .menu("删除", Box::new(DeleteItem))
                                                     .separator()
                                                     .menu("复制", Box::new(CopyItem))
+                                                    .menu("剪切", Box::new(CutItem))
+                                                    .menu("粘贴", Box::new(PasteItem))
                                                     .menu("复制路径", Box::new(CopyPath))
                                             })
                                             .child(tree(&self.tree_state, {
@@ -3496,6 +3557,11 @@ fn main() {
             KeyBinding::new("cmd-w", CloseTab, Some("Workbench")),
             KeyBinding::new("cmd-p", ToggleQuickOpen, Some("Workbench")),
             KeyBinding::new("cmd-shift-f", ToggleSearch, Some("Workbench")),
+            // 资源管理器文件操作:绑到 tree 控件的 "Tree" 上下文,只有焦点在树上才触发,
+            // 不影响编辑器("Input" 上下文)自带的文本 cmd-c/x/v
+            KeyBinding::new("cmd-c", CopyItem, Some("Tree")),
+            KeyBinding::new("cmd-x", CutItem, Some("Tree")),
+            KeyBinding::new("cmd-v", PasteItem, Some("Tree")),
             KeyBinding::new("up", PaletteUp, Some("QuickOpen")),
             KeyBinding::new("down", PaletteDown, Some("QuickOpen")),
             KeyBinding::new("escape", PaletteDismiss, Some("QuickOpen")),
