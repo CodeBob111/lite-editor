@@ -1779,10 +1779,8 @@ impl Workbench {
         } else {
             cx.theme().muted_foreground
         };
-        let primary = cx.theme().primary;
         div()
             .id(id)
-            .relative()
             .w(px(40.))
             .h(px(40.))
             .flex()
@@ -1794,19 +1792,7 @@ impl Workbench {
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| this.set_sidebar_view(view, cx)),
             )
-            // 选中态:左侧 2px 蓝条 + 高亮图标(对齐设计稿 .act-btn.active::before,不用整块底色)
-            .when(active, |s| {
-                s.child(
-                    div()
-                        .absolute()
-                        .left(px(-4.))
-                        .top(px(8.))
-                        .bottom(px(8.))
-                        .w(px(2.))
-                        .rounded_full()
-                        .bg(primary),
-                )
-            })
+            // 选中态:仅图标变亮(对齐设计稿,无蓝条/底色块)
             .child(Icon::new(icon).size(px(20.)).text_color(color))
     }
 

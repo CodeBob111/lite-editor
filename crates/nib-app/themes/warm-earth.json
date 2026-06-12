@@ -51,7 +51,7 @@
         "list.even.background": "#0f151f",
         "list.head.background": "#131a26",
         "list.active.background": "#3b82f629",
-        "list.active.border": "#3b82f6",
+        "list.active.border": "#00000000",
 
         "popover.background": "#1a2230",
         "popover.foreground": "#c9d3e0",
