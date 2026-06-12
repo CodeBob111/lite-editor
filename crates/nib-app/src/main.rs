@@ -195,6 +195,9 @@ struct OpenTab {
     _change_sub: Subscription,
     /// 编辑器任何重绘(含光标移动)都触发本体重渲染,状态栏 Ln/Col 才跟手
     _observe_sub: Subscription,
+    /// 上次应用的 LSP 诊断签名:jdtls 对同一文件常重复推送相同诊断,
+    /// 签名不变就跳过 set.reset+重渲染,避免空闲期每秒重复整屏重绘
+    diag_sig: u64,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -649,6 +652,11 @@ impl Workbench {
         if std::path::Path::new(&project) != self.project_root.as_path() {
             return;
         }
+        self.mark_op(if has_structural {
+            "文件变更·重建树+git"
+        } else {
+            "文件变更·git刷新"
+        });
         if has_structural {
             self.reload_tree(cx);
         }
@@ -702,15 +710,44 @@ impl Workbench {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 廉价先读 uri:jdtls 对整个工作区的文件发诊断,大多不是当前打开的标签。
+        // 先判断文件是否打开,避免为非打开文件反序列化整个(可能很大的)诊断负载。
+        let Some(uri) = params.get("uri").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let path = match uri.strip_prefix("file://") {
+            Some(p) => PathBuf::from(p),
+            None => return,
+        };
+        let Some(tab_ix) = self.tabs.iter().position(|t| t.path == path) else {
+            return;
+        };
         let Ok(params) = serde_json::from_value::<lsp_types::PublishDiagnosticsParams>(params)
         else {
             return;
         };
-        let path = PathBuf::from(params.uri.path().as_str());
-        let Some(tab) = self.tabs.iter().find(|t| t.path == path) else {
-            return;
+        // 诊断签名:jdtls 空闲时常重复推送一模一样的诊断,签名不变就整条跳过,
+        // 不 reset、不重渲染——这是空闲期每秒卡顿的主因之一
+        let sig = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for d in &params.diagnostics {
+                d.range.start.line.hash(&mut h);
+                d.range.start.character.hash(&mut h);
+                d.range.end.line.hash(&mut h);
+                d.range.end.character.hash(&mut h);
+                d.severity.map(|s| format!("{s:?}")).hash(&mut h);
+                d.message.hash(&mut h);
+            }
+            params.diagnostics.len().hash(&mut h);
+            h.finish()
         };
-        tab.editor.update(cx, |state, cx| {
+        if self.tabs[tab_ix].diag_sig == sig {
+            return;
+        }
+        self.tabs[tab_ix].diag_sig = sig;
+        self.mark_op(format!("LSP诊断 {}", self.tabs[tab_ix].title));
+        self.tabs[tab_ix].editor.update(cx, |state, cx| {
             let text = state.text().clone();
             if let Some(set) = state.diagnostics_mut() {
                 set.reset(&text);
@@ -1253,6 +1290,7 @@ impl Workbench {
             editor,
             _change_sub: change_sub,
             _observe_sub: observe_sub,
+            diag_sig: 0,
         });
         self.tabs.len() - 1
     }
