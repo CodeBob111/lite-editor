@@ -27,6 +27,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, TabSize},
     list::ListItem,
+    resizable::{h_resizable, resizable_panel, ResizableState},
     tree::{tree, TreeItem, TreeState},
     v_flex, ActiveTheme, Icon, IconName, Root, Theme, ThemeMode, ThemeRegistry, TitleBar,
 };
@@ -224,6 +225,8 @@ struct Workbench {
     events_sink: Arc<ChannelSink>,
     settings: session::EditorSettings,
     md_preview: bool,
+    /// md 预览左右分栏的可拖动状态(记住拖动后的比例)
+    md_split_state: Entity<ResizableState>,
     terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
     /// 底部面板当前 tab(问题/终端/输出)
@@ -391,6 +394,7 @@ impl Workbench {
             events_sink: Arc::new(ChannelSink(tx)),
             settings: session::EditorSettings::default(),
             md_preview: false,
+            md_split_state: cx.new(|_| ResizableState::default()),
             terminal: None,
             terminal_visible: false,
             panel_tab: PanelTab::Terminal,
@@ -2824,38 +2828,66 @@ impl Render for Workbench {
                             .child(div().flex_1().min_h_0().map(|this| {
                                 match self.active() {
                                     Some(tab) => {
-                                        let editor_el = Input::new(&tab.editor)
-                                            .font_family(cx.theme().mono_font_family.clone())
-                                            .text_size(px(self.settings.font_size))
-                                            .size_full();
+                                        // 外层包一层捕获 cmd+click:编辑器点击会把光标移到点击处,
+                                        // 我们在 mouse_up 时(光标已定)复用 F12 的跳转定义链路(支持跨文件开标签)。
+                                        let editor_el = div()
+                                            .id("editor-area")
+                                            .size_full()
+                                            .on_mouse_up(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |this, event: &MouseUpEvent, window, cx| {
+                                                        if event.modifiers.platform {
+                                                            this.on_goto_definition(
+                                                                &GotoDefinition,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }
+                                                    },
+                                                ),
+                                            )
+                                            .child(
+                                                Input::new(&tab.editor)
+                                                    .font_family(
+                                                        cx.theme().mono_font_family.clone(),
+                                                    )
+                                                    .text_size(px(self.settings.font_size))
+                                                    .size_full(),
+                                            );
                                         if self.md_preview && tab.lang == "markdown" {
                                             let text = tab.editor.read(cx).value();
+                                            // 左右两栏可拖动分隔(h_resizable + 持久状态)
                                             this.child(
-                                                h_flex()
-                                                    .size_full()
+                                                h_resizable("md-split")
+                                                    .with_state(&self.md_split_state)
                                                     .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .h_full()
-                                                            .min_w_0()
-                                                            .child(editor_el),
+                                                        resizable_panel()
+                                                            .size(px(560.))
+                                                            .child(
+                                                                div()
+                                                                    .size_full()
+                                                                    .min_w_0()
+                                                                    .child(editor_el),
+                                                            ),
                                                     )
                                                     .child(
-                                                        div()
-                                                            .id("md-preview")
-                                                            .flex_1()
-                                                            .h_full()
-                                                            .min_w_0()
-                                                            .overflow_y_scroll()
-                                                            .border_l_1()
-                                                            .border_color(cx.theme().border)
-                                                            .p_4()
-                                                            .child(
-                                                                gpui_component::text::TextView::markdown(
-                                                                    "md-preview-view",
-                                                                    text,
+                                                        resizable_panel().size(px(560.)).child(
+                                                            div()
+                                                                .id("md-preview")
+                                                                .size_full()
+                                                                .min_w_0()
+                                                                .overflow_y_scroll()
+                                                                .border_l_1()
+                                                                .border_color(cx.theme().border)
+                                                                .p_4()
+                                                                .child(
+                                                                    gpui_component::text::TextView::markdown(
+                                                                        "md-preview-view",
+                                                                        text,
+                                                                    ),
                                                                 ),
-                                                            ),
+                                                        ),
                                                     ),
                                             )
                                         } else {
