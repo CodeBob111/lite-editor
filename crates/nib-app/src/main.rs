@@ -27,6 +27,7 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, TabSize},
     list::ListItem,
+    menu::ContextMenuExt,
     resizable::{h_resizable, resizable_panel, ResizableState},
     tree::{tree, TreeItem, TreeState},
     v_flex, ActiveTheme, Icon, IconName, Root, Theme, ThemeMode, ThemeRegistry, TitleBar,
@@ -906,6 +907,8 @@ impl Workbench {
         let editor = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor(lang)
+                // 禁用编辑器内置右键菜单,改由外层提供(含 Arthas 命令)
+                .context_menu(false)
                 .multi_line(true)
                 .tab_size(TabSize {
                     tab_size: settings.tab_size as usize,
@@ -2950,6 +2953,32 @@ impl Render for Workbench {
                                                     },
                                                 ),
                                             )
+                                            // 右键菜单:Arthas 命令(对光标方法)+ 跳转/复制粘贴
+                                            .context_menu(|menu, _window, _cx| {
+                                                menu.menu("Watch 光标方法", Box::new(ArthasWatch))
+                                                    .menu("Trace 光标方法", Box::new(ArthasTrace))
+                                                    .menu("Stack 光标方法", Box::new(ArthasStack))
+                                                    .menu(
+                                                        "Monitor 光标方法",
+                                                        Box::new(ArthasMonitor),
+                                                    )
+                                                    .menu(
+                                                        "TimeTunnel 光标方法",
+                                                        Box::new(ArthasTt),
+                                                    )
+                                                    .separator()
+                                                    .menu("诊断面板", Box::new(ToggleArthas))
+                                                    .separator()
+                                                    .menu("跳转定义", Box::new(GotoDefinition))
+                                                    .menu(
+                                                        "复制",
+                                                        Box::new(gpui_component::input::Copy),
+                                                    )
+                                                    .menu(
+                                                        "粘贴",
+                                                        Box::new(gpui_component::input::Paste),
+                                                    )
+                                            })
                                             .child(
                                                 Input::new(&tab.editor)
                                                     .font_family(
@@ -3211,14 +3240,6 @@ fn main() {
                 MenuItem::separator(),
                 MenuItem::action("保存", SaveFile),
                 MenuItem::action("关闭标签", CloseTab),
-            ]),
-            Menu::new("Arthas").items([
-                MenuItem::action("Watch 光标方法", ArthasWatch),
-                MenuItem::action("Trace 光标方法", ArthasTrace),
-                MenuItem::action("Stack 光标方法", ArthasStack),
-                MenuItem::action("Monitor 光标方法", ArthasMonitor),
-                MenuItem::action("TimeTunnel 光标方法", ArthasTt),
-                MenuItem::action("诊断面板  ⌃⇧A", ToggleArthas),
             ]),
             Menu::new("Go").items([
                 MenuItem::action("快速打开文件…", ToggleQuickOpen),
