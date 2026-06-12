@@ -372,6 +372,12 @@ fn start_lsp_blocking(
                             "downloadSources": true
                         }
                     }
+                },
+                // 跳转定义落在依赖 jar 的 .class 时,jdtls 只有在客户端声明此能力才会
+                // 返回 jdt://contents/... 位置(否则直接返回空 → "未找到定义")。
+                // 拿到该 URI 后需用 java/classFileContents 自定义请求取(反编译)文本。
+                "extendedClientCapabilities": {
+                    "classFileContentsSupport": true
                 }
             })
         } else {

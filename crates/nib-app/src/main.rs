@@ -1550,11 +1550,21 @@ impl Workbench {
                 let _ = weak.update(cx, |this: &mut Workbench, cx| {
                     match result {
                         Ok(Some(usage)) => {
-                            let path = PathBuf::from(
-                                usage.uri.strip_prefix("file://").unwrap_or(&usage.uri),
-                            );
-                            this.status = path.display().to_string().into();
-                            this.open_file_at(path, usage.line, usage.character, window, cx);
+                            if usage.uri.starts_with("file://") {
+                                let path = PathBuf::from(
+                                    usage.uri.strip_prefix("file://").unwrap_or(&usage.uri),
+                                );
+                                this.status = path.display().to_string().into();
+                                this.open_file_at(
+                                    path, usage.line, usage.character, window, cx,
+                                );
+                            } else {
+                                // 探针:依赖 jar 里的定义,jdtls 返回非 file:// 的 URI
+                                // (预期 jdt://contents/...)。先把原始 URI 打到状态栏确认
+                                // scheme,再实现取反编译文本 + 只读虚拟标签页。
+                                this.status =
+                                    format!("库定义 URI: {}", usage.uri).into();
+                            }
                         }
                         Ok(None) => this.status = "未找到定义".into(),
                         Err(err) => this.status = format!("跳转失败: {}", err).into(),
