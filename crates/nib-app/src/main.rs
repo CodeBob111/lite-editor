@@ -170,9 +170,9 @@ enum SidebarView {
 impl SidebarView {
     fn title(&self) -> &'static str {
         match self {
-            SidebarView::Files => "Explorer",
-            SidebarView::Commit => "Commit",
-            SidebarView::Git => "Git",
+            SidebarView::Files => "资源管理器",
+            SidebarView::Commit => "源代码管理",
+            SidebarView::Git => "Git 图",
             SidebarView::Maven => "Maven",
         }
     }
@@ -2718,7 +2718,7 @@ impl Render for Workbench {
                         },
                     )
                     .when(self.active().is_some(), |this| {
-                        this.child(format!("Spaces: {}", self.settings.tab_size))
+                        this.child(format!("空格:{}", self.settings.tab_size))
                             .child("UTF-8")
                             .child("LF")
                     })
@@ -2726,12 +2726,23 @@ impl Render for Workbench {
                         this.child(lang_display(active_lang))
                     })
                     .when(active_lang == "java", |this| {
+                        // jdtls 状态(对齐设计稿:绿点 + 「jdtls 就绪」)
                         this.child(
-                            div()
-                                .w(px(7.))
-                                .h(px(7.))
-                                .rounded_full()
-                                .bg(cx.theme().success),
+                            h_flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .w(px(7.))
+                                        .h(px(7.))
+                                        .rounded_full()
+                                        .bg(cx.theme().success),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("jdtls 就绪"),
+                                ),
                         )
                     }),
             )
