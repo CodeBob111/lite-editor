@@ -108,9 +108,20 @@ fn file_node_to_tree_item(
     node: &nib_core::fs::FileNode,
     expanded: &std::collections::HashSet<String>,
 ) -> TreeItem {
-    let item = TreeItem::new(node.path.clone(), node.name.clone())
-        .expanded(expanded.contains(&node.path));
-    match &node.children {
+    // 压缩单子目录链(对齐设计稿 / VS Code):文件夹仅含一个子文件夹时合并成 a/b 一行,
+    // 否则 src→main→java→com→… 每层一行,缩进会把文件名挤到截断。
+    let mut cur = node;
+    let mut label = node.name.clone();
+    while let Some(children) = &cur.children {
+        if children.len() == 1 && children[0].children.is_some() {
+            cur = &children[0];
+            label = format!("{}/{}", label, cur.name);
+        } else {
+            break;
+        }
+    }
+    let item = TreeItem::new(cur.path.clone(), label).expanded(expanded.contains(&cur.path));
+    match &cur.children {
         Some(children) => {
             item.children(children.iter().map(|c| file_node_to_tree_item(c, expanded)))
         }
@@ -1728,7 +1739,7 @@ fn render_tree_item(
                 .child(item.label.clone()),
         )
     };
-    ListItem::new(ix).pl(px(8.) + px(14.) * entry.depth() as f32).child(row)
+    ListItem::new(ix).pl(px(8.) + px(12.) * entry.depth() as f32).child(row)
 }
 
 fn lang_display(lang: &str) -> &'static str {
@@ -1768,20 +1779,34 @@ impl Workbench {
         } else {
             cx.theme().muted_foreground
         };
+        let primary = cx.theme().primary;
         div()
             .id(id)
+            .relative()
             .w(px(40.))
             .h(px(40.))
             .flex()
             .items_center()
             .justify_center()
             .rounded(cx.theme().radius)
-            .when(active, |s| s.bg(cx.theme().list_active))
             .hover(|s| s.bg(cx.theme().accent))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| this.set_sidebar_view(view, cx)),
             )
+            // 选中态:左侧 2px 蓝条 + 高亮图标(对齐设计稿 .act-btn.active::before,不用整块底色)
+            .when(active, |s| {
+                s.child(
+                    div()
+                        .absolute()
+                        .left(px(-4.))
+                        .top(px(8.))
+                        .bottom(px(8.))
+                        .w(px(2.))
+                        .rounded_full()
+                        .bg(primary),
+                )
+            })
             .child(Icon::new(icon).size(px(20.)).text_color(color))
     }
 
