@@ -361,6 +361,10 @@ struct Workbench {
     arthas: Option<Entity<ArthasPanel>>,
     arthas_visible: bool,
     expanded_paths: std::collections::HashSet<String>,
+    /// 库源码临时文件(nib-jdt-sources)→ (真实 jdt:// URI, 来源项目根)。
+    /// goto-def 进库时记下;之后在库源码里继续 goto-def / find-usages 时,用真实 jdt:// URI
+    /// 经来源项目的 jdtls 解析(临时路径不被 jdtls 跟踪,但内容 = classFileContents,位置 1:1)。
+    jdt_sources: std::collections::HashMap<PathBuf, (String, String)>,
     /// git 状态标记(绝对路径→状态首字母),Explorer 树着色用(对齐旧版)
     git_marks: Arc<std::collections::HashMap<String, char>>,
     /// 工作区项目清单(对齐旧版 project-bar;会话持久化保全全部项目)
@@ -539,6 +543,7 @@ impl Workbench {
             arthas: None,
             arthas_visible: false,
             expanded_paths: std::collections::HashSet::new(),
+            jdt_sources: std::collections::HashMap::new(),
             git_marks: Arc::new(std::collections::HashMap::new()),
             projects: Vec::new(),
             active_project: 0,
@@ -1884,22 +1889,32 @@ impl Workbench {
         }
         let pos = tab.editor.read(cx).cursor_position();
         let file = tab.path.to_string_lossy().to_string();
+        let title = tab.title.to_string();
         let lsp = self.lsp.clone();
         let files = self.all_files.clone();
         let window_handle = self.window_handle;
         let project_root = self.project_root.to_string_lossy().to_string();
+        // 当前文件若是已记录映射的库源码临时文件 → 它的真实 jdt:// URI + 来源项目根
+        let jdt_src = self.jdt_sources.get(tab.path.as_path()).cloned();
         self.status = "跳转定义…".into();
         cx.notify();
         cx.spawn(async move |weak, cx| {
-            // 先问 jdtls;命中 file:// 用它,jdt:// 是库代码(单独提示),
-            // 空/超时/出错 → 文本兜底(移植重构前逻辑,不依赖 jdtls 是否就绪)。
             let in_project = file.starts_with(&project_root);
+            // 1) 求定义:项目文件问其 jdtls;库源码临时文件优先用真实 jdt:// URI 经来源项目
+            //    jdtls(方法/类型/字段都行);无映射再退 workspace/symbol(只大写类型名)。
             let lsp_res = if in_project {
                 nib_core::lsp::lsp_goto_definition(file.clone(), pos.line, pos.character, &lsp).await
+            } else if let Some((jdt_uri, proj)) = &jdt_src {
+                nib_core::lsp::lsp_definition_via_jdt(
+                    jdt_uri.clone(),
+                    file.clone(),
+                    pos.line,
+                    pos.character,
+                    proj.clone(),
+                    &lsp,
+                )
+                .await
             } else {
-                // 当前是库源码临时文件(nib-jdt-sources,不属任何项目根)→ 按文件找不到
-                // jdtls server。改用活动项目的 jdtls 做 workspace/symbol 按类名跳,
-                // 像 IDEA 在反编译类里点类型能继续跳进去。
                 nib_core::lsp::lsp_workspace_symbol_definition(
                     file.clone(),
                     pos.line,
@@ -1910,67 +1925,121 @@ impl Workbench {
                 .await
             };
             enum Goto {
-                File(PathBuf, u32, u32),
+                File(PathBuf, u32, u32, Option<(String, String)>),
+                Usages(Vec<nib_core::lsp::LspUsage>),
                 Status(String),
                 NotFound,
             }
-            // jdt:// 取源码要按"项目"定位 jdtls server。当前文件若是库源码临时文件,
-            // 拿它去找 server 会再次落空(同 server 查找漏洞下沉一层)→ 用活动项目根当上下文。
+            // 2) 声明检测:definition 落回光标所在文档的同一行 = 你正站在声明上 →
+            //    改成 find-usages(IDEA 语义:在定义处"跳转" = 看谁调用了它)。
+            let on_decl = match &lsp_res {
+                Ok(Some(u)) if u.line == pos.line => {
+                    if in_project {
+                        nib_core::lsp::path_from_file_uri(&u.uri) == file
+                    } else {
+                        // 库类身份在 jdt:// URI 的 '?' 前(后面是 jar/项目元数据,格式可能有出入)
+                        let key = |s: &str| s.split('?').next().unwrap_or(s).to_string();
+                        jdt_src.as_ref().is_some_and(|(ju, _)| key(&u.uri) == key(ju))
+                    }
+                }
+                _ => false,
+            };
+            // jdt:// 取源码 / find-references 都要按"项目"定位 server(库临时文件拿自身会落空)。
             let lsp_ctx = if in_project {
                 file.clone()
             } else {
                 project_root.clone()
             };
-            let goto = match lsp_res {
-                Ok(Some(u)) if u.uri.starts_with("file://") => {
-                    let p = PathBuf::from(u.uri.strip_prefix("file://").unwrap_or(&u.uri));
-                    Goto::File(p, u.line, u.character)
-                }
-                // 依赖 jar 里的定义:jdtls 返回 jdt://。取反编译源码 → 写临时 .java →
-                // 当普通文件打开并跳到定义行(像 IDEA 跳进反编译的 .class)。
-                Ok(Some(u)) if u.uri.starts_with("jdt://") => {
-                    match nib_core::lsp::lsp_class_file_contents(u.uri.clone(), lsp_ctx.clone(), &lsp)
+            let goto = if on_decl {
+                let refs = if in_project {
+                    nib_core::lsp::lsp_find_references(file.clone(), pos.line, pos.character, &lsp)
                         .await
-                    {
-                        Ok(text) => match jdt_temp_path(&u.uri) {
-                            Some(path) => {
-                                let w = std::fs::create_dir_all(
-                                    path.parent().unwrap_or(path.as_path()),
-                                )
-                                .and_then(|_| std::fs::write(&path, text));
-                                match w {
-                                    Ok(_) => Goto::File(path, u.line, u.character),
-                                    Err(e) => Goto::Status(format!("写库源码临时文件失败: {e}")),
-                                }
-                            }
-                            None => Goto::Status(format!("无法解析库类 URI: {}", u.uri)),
-                        },
-                        Err(e) => Goto::Status(format!("取库源码失败: {e}")),
-                    }
+                } else if let Some((jdt_uri, proj)) = &jdt_src {
+                    nib_core::lsp::lsp_references_via_jdt(
+                        jdt_uri.clone(),
+                        file.clone(),
+                        pos.line,
+                        pos.character,
+                        proj.clone(),
+                        &lsp,
+                    )
+                    .await
+                } else {
+                    Ok(Vec::new())
+                };
+                match refs {
+                    Ok(u) if !u.is_empty() => Goto::Usages(u),
+                    _ => Goto::NotFound,
                 }
-                Ok(Some(_)) => Goto::NotFound,
-                _ => match nib_core::lsp::text_fallback_definition(
-                    file,
-                    pos.line,
-                    pos.character,
-                    (*files).clone(),
-                )
-                .await
-                {
-                    Some(u) => {
+            } else {
+                match lsp_res {
+                    Ok(Some(u)) if u.uri.starts_with("file://") => {
                         let p = PathBuf::from(nib_core::lsp::path_from_file_uri(&u.uri));
-                        Goto::File(p, u.line, u.character)
+                        Goto::File(p, u.line, u.character, None)
                     }
-                    None => Goto::NotFound,
-                },
+                    // 依赖 jar 里的定义:jdtls 返回 jdt://。取反编译源码 → 写临时 .java →
+                    // 当普通文件打开并跳到定义行(像 IDEA 跳进反编译的 .class);记下
+                    // 临时文件 → (jdt:// URI, 来源项目)映射,供之后在库源码里继续跳/查引用。
+                    Ok(Some(u)) if u.uri.starts_with("jdt://") => {
+                        match nib_core::lsp::lsp_class_file_contents(
+                            u.uri.clone(),
+                            lsp_ctx.clone(),
+                            &lsp,
+                        )
+                        .await
+                        {
+                            Ok(text) => match jdt_temp_path(&u.uri) {
+                                Some(path) => {
+                                    let w = std::fs::create_dir_all(
+                                        path.parent().unwrap_or(path.as_path()),
+                                    )
+                                    .and_then(|_| std::fs::write(&path, text));
+                                    match w {
+                                        Ok(_) => Goto::File(
+                                            path,
+                                            u.line,
+                                            u.character,
+                                            Some((u.uri.clone(), lsp_ctx.clone())),
+                                        ),
+                                        Err(e) => {
+                                            Goto::Status(format!("写库源码临时文件失败: {e}"))
+                                        }
+                                    }
+                                }
+                                None => Goto::Status(format!("无法解析库类 URI: {}", u.uri)),
+                            },
+                            Err(e) => Goto::Status(format!("取库源码失败: {e}")),
+                        }
+                    }
+                    Ok(Some(_)) => Goto::NotFound,
+                    _ => match nib_core::lsp::text_fallback_definition(
+                        file,
+                        pos.line,
+                        pos.character,
+                        (*files).clone(),
+                    )
+                    .await
+                    {
+                        Some(u) => {
+                            let p = PathBuf::from(nib_core::lsp::path_from_file_uri(&u.uri));
+                            Goto::File(p, u.line, u.character, None)
+                        }
+                        None => Goto::NotFound,
+                    },
+                }
             };
             let _ = cx.update_window(window_handle, |_, window, cx| {
                 let _ = weak.update(cx, |this: &mut Workbench, cx| {
                     match goto {
-                        Goto::File(path, line, character) => {
+                        Goto::File(path, line, character, jdt) => {
+                            // 来自 jdt:// 的库源码 → 记下映射,之后在其中继续跳/查引用走 jdt://
+                            if let Some(m) = jdt {
+                                this.jdt_sources.insert(path.clone(), m);
+                            }
                             this.status = path.display().to_string().into();
                             this.open_file_at(path, line, character, window, cx);
                         }
+                        Goto::Usages(usages) => this.show_usages(title, usages, window, cx),
                         Goto::Status(msg) => this.status = msg.into(),
                         Goto::NotFound => this.status = "未找到定义".into(),
                     }
@@ -1979,6 +2048,36 @@ impl Workbench {
             });
         })
         .detach();
+    }
+
+    /// 弹"引用列表"浮层(find-usages 与"在声明处跳转→看用法"共用)。
+    fn show_usages(
+        &mut self,
+        title: String,
+        usages: Vec<nib_core::lsp::LspUsage>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.status = format!("{} 处引用", usages.len()).into();
+        let view = cx.new(|_| UsagesView::new(title, usages));
+        let sub = cx.subscribe_in(
+            &view,
+            window,
+            |this: &mut Workbench, _, event: &UsagesEvent, window, cx| match event {
+                UsagesEvent::Open {
+                    path,
+                    line,
+                    character,
+                } => {
+                    let (path, line, character) = (path.clone(), *line, *character);
+                    this.close_palette(window, cx);
+                    this.open_file_at(path, line, character, window, cx);
+                }
+            },
+        );
+        self.overlay = Some(Overlay::Usages(view));
+        self._overlay_sub = Some(sub);
+        window.focus(&self.overlay_focus, cx);
     }
 
     /// Shift+F12 查引用:core lsp_find_references → 浮层列表
@@ -2001,31 +2100,7 @@ impl Workbench {
                 let _ = weak.update(cx, |this: &mut Workbench, cx| {
                     match result {
                         Ok(usages) if !usages.is_empty() => {
-                            this.status = format!("{} 处引用", usages.len()).into();
-                            let view = cx.new(|_| UsagesView::new(title.clone(), usages));
-                            let sub = cx.subscribe_in(
-                                &view,
-                                window,
-                                |this: &mut Workbench,
-                                 _,
-                                 event: &UsagesEvent,
-                                 window,
-                                 cx| match event {
-                                    UsagesEvent::Open {
-                                        path,
-                                        line,
-                                        character,
-                                    } => {
-                                        let (path, line, character) =
-                                            (path.clone(), *line, *character);
-                                        this.close_palette(window, cx);
-                                        this.open_file_at(path, line, character, window, cx);
-                                    }
-                                },
-                            );
-                            this.overlay = Some(Overlay::Usages(view));
-                            this._overlay_sub = Some(sub);
-                            window.focus(&this.overlay_focus, cx);
+                            this.show_usages(title.clone(), usages, window, cx);
                         }
                         Ok(_) => this.status = "未找到引用".into(),
                         Err(err) => this.status = format!("查找失败: {}", err).into(),

@@ -847,6 +847,85 @@ pub async fn lsp_workspace_symbol_definition(
     Ok(first)
 }
 
+/// 在"库源码临时文件"上做按位置的 LSP 请求:用真实 jdt:// URI(jdtls 认得,实测冷调用
+/// 即可答 definition/references,无需 didOpen)发给**活动项目**的 jdtls。临时文件不被 jdtls
+/// 跟踪(临时路径),但其内容 = classFileContents 原文,位置与 jdt:// 文档 1:1。
+/// local_file 仅用于 snap 列。
+async fn lsp_request_at_jdt_uri(
+    method: &'static str,
+    with_decl: bool,
+    jdt_uri: String,
+    local_file: String,
+    line: u32,
+    character: u32,
+    project_root: String,
+    state: &LspState,
+) -> Result<Vec<LspUsage>, String> {
+    let server = {
+        let servers = state.servers.lock().map_err(|e| e.to_string())?;
+        find_server_for_file(&servers, &project_root, "java")?
+    };
+    let character = snap_to_identifier(&local_file, line, character);
+    let id = server.next_id.fetch_add(1, Ordering::Relaxed);
+    let mut params = serde_json::json!({
+        "textDocument": { "uri": jdt_uri },
+        "position": { "line": line, "character": character }
+    });
+    if with_decl {
+        params["context"] = serde_json::json!({ "includeDeclaration": true });
+    }
+    let response =
+        request_and_wait_on_worker(server, id, method, params, Duration::from_secs(5)).await?;
+    parse_locations(response)
+}
+
+/// 库源码临时文件里 goto-def:经 jdt:// + 活动项目 jdtls 解析(方法/类型/字段都支持,
+/// 不像 workspace/symbol 只能查大写类型名)。
+pub async fn lsp_definition_via_jdt(
+    jdt_uri: String,
+    local_file: String,
+    line: u32,
+    character: u32,
+    project_root: String,
+    state: &LspState,
+) -> Result<Option<LspUsage>, String> {
+    Ok(lsp_request_at_jdt_uri(
+        "textDocument/definition",
+        false,
+        jdt_uri,
+        local_file,
+        line,
+        character,
+        project_root,
+        state,
+    )
+    .await?
+    .into_iter()
+    .next())
+}
+
+/// 库源码临时文件里 find-references(谁调用了这个库方法/类)。
+pub async fn lsp_references_via_jdt(
+    jdt_uri: String,
+    local_file: String,
+    line: u32,
+    character: u32,
+    project_root: String,
+    state: &LspState,
+) -> Result<Vec<LspUsage>, String> {
+    lsp_request_at_jdt_uri(
+        "textDocument/references",
+        true,
+        jdt_uri,
+        local_file,
+        line,
+        character,
+        project_root,
+        state,
+    )
+    .await
+}
+
 /// 取 jdt:// 类文件的(反编译/源码)文本。jdtls 自定义请求 java/classFileContents,
 /// 参数 { uri }, 返回一个 JSON 字符串(整份 .class 反编译出的 Java 源码)。
 /// context_file = 用户当前所在的 .java(用来定位对应项目的 java server)。
