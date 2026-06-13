@@ -3722,8 +3722,10 @@ impl Render for Workbench {
             let vp = window.viewport_size();
             let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
             let (mx, my) = (f32::from(self.last_mouse.x), f32::from(self.last_mouse.y));
+            // 按弹窗实际最大高度(~520)夹紧 y,保证整个弹窗(含底部预览/命中行)在屏内;
+            // 鼠标偏低时弹窗整体上移而非被屏幕下沿截断。
             let ax = mx.min(vw - 772.).max(8.);
-            let ay = (my + 16.).min(vh - 220.).max(8.);
+            let ay = (my + 16.).min(vh - 528.).max(8.);
             point(px(ax), px(ay))
         };
 

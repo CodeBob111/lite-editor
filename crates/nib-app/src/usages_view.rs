@@ -62,8 +62,9 @@ impl UsagesView {
         };
         let lines: Vec<&str> = content.lines().collect();
         let center = u.line as usize;
-        let start = center.saturating_sub(4);
-        let end = (center + 6).min(lines.len());
+        // 命中行附近:上 3 下 18(命中行靠预览顶部、初始即可见,下方留足内容可向下滚)
+        let start = center.saturating_sub(3);
+        let end = (center + 19).min(lines.len());
         for (i, line) in lines.iter().enumerate().take(end).skip(start) {
             self.preview.push((i as u32, line.to_string(), i == center));
         }
@@ -181,7 +182,7 @@ impl Render for UsagesView {
 
         v_flex()
             .w(px(760.))
-            .max_h(px(560.))
+            .max_h(px(520.))
             .bg(cx.theme().popover)
             .border_1()
             .border_color(cx.theme().border)
@@ -205,17 +206,20 @@ impl Render for UsagesView {
             .child(
                 v_flex()
                     .id("usages-rows")
-                    .max_h(px(260.))
+                    .flex_none()
+                    .max_h(px(220.))
                     .overflow_y_scroll()
                     .p_1()
                     .children(rows),
             )
             .when(!preview_rows.is_empty(), |c| {
+                // 预览区:自身固定上限高度 + 滚动(不依赖 flex_1,否则 max_h 父容器里
+                // 拿不到确定高度,overflow_y_scroll 不生效)。内容超过即可向下滚。
                 c.child(
                     v_flex()
                         .id("usages-preview")
-                        .flex_1()
-                        .min_h(px(120.))
+                        .flex_none()
+                        .max_h(px(260.))
                         .overflow_y_scroll()
                         .py_1()
                         .border_t_1()
