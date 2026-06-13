@@ -378,6 +378,8 @@ struct Workbench {
     first_frame_logged: bool,
     last_shift: Option<Instant>,
     prev_modifiers: Modifiers,
+    /// 最近一次鼠标按下的位置(窗口坐标),供引用列表浮层锚到鼠标附近弹出。
+    last_mouse: Point<Pixels>,
 }
 
 /// 欢迎页「最近项目」一行的展示数据(路径 + 派生的名称/缩写/类型标签/首字母色)。
@@ -553,6 +555,7 @@ impl Workbench {
             first_frame_logged: false,
             last_shift: None,
             prev_modifiers: Modifiers::default(),
+            last_mouse: Point::default(),
         };
         let lsp_for_quit = this.lsp.clone();
         cx.on_app_quit(move |_, _| {
@@ -2050,6 +2053,37 @@ impl Workbench {
         .detach();
     }
 
+    /// 抽取 jdt:// 库类源码到临时文件并打开到指定行(供 goto-def / 引用列表里点库类内引用复用)。
+    /// 记下临时文件 →(jdt:// URI, 来源项目)映射,之后在其中还能继续跳/查引用。
+    fn open_jdt_source(&mut self, jdt_uri: String, line: u32, character: u32, cx: &mut Context<Self>) {
+        let lsp = self.lsp.clone();
+        let ctx = self.project_root.to_string_lossy().to_string();
+        let window_handle = self.window_handle;
+        cx.spawn(async move |weak, cx| {
+            let Ok(text) =
+                nib_core::lsp::lsp_class_file_contents(jdt_uri.clone(), ctx.clone(), &lsp).await
+            else {
+                return;
+            };
+            let Some(path) = jdt_temp_path(&jdt_uri) else {
+                return;
+            };
+            if std::fs::create_dir_all(path.parent().unwrap_or(path.as_path()))
+                .and_then(|_| std::fs::write(&path, &text))
+                .is_err()
+            {
+                return;
+            }
+            let _ = cx.update_window(window_handle, |_, window, cx| {
+                let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                    this.jdt_sources.insert(path.clone(), (jdt_uri.clone(), ctx.clone()));
+                    this.open_file_at(path, line, character, window, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
     /// 弹"引用列表"浮层(find-usages 与"在声明处跳转→看用法"共用)。
     fn show_usages(
         &mut self,
@@ -2065,13 +2099,19 @@ impl Workbench {
             window,
             |this: &mut Workbench, _, event: &UsagesEvent, window, cx| match event {
                 UsagesEvent::Open {
-                    path,
+                    uri,
                     line,
                     character,
                 } => {
-                    let (path, line, character) = (path.clone(), *line, *character);
+                    let (uri, line, character) = (uri.clone(), *line, *character);
                     this.close_palette(window, cx);
-                    this.open_file_at(path, line, character, window, cx);
+                    if uri.starts_with("jdt://") {
+                        // 库类内的引用 → 抽取库源码再打开(同 goto-def 的 jdt:// 处理)
+                        this.open_jdt_source(uri, line, character, cx);
+                    } else {
+                        let p = PathBuf::from(nib_core::lsp::path_from_file_uri(&uri));
+                        this.open_file_at(p, line, character, window, cx);
+                    }
                 }
             },
         );
@@ -3676,6 +3716,17 @@ impl Render for Workbench {
         // 只把通知入队、永远不显示——Maven 未配置提醒看不到的真因就在这。
         let notification_layer = Root::render_notification_layer(window, cx);
 
+        // 引用列表浮层锚到鼠标附近弹出(其余浮层仍顶部居中);clamp 进视口避免出屏。
+        let is_usages_overlay = matches!(self.overlay, Some(Overlay::Usages(_)));
+        let usages_anchor = {
+            let vp = window.viewport_size();
+            let (vw, vh) = (f32::from(vp.width), f32::from(vp.height));
+            let (mx, my) = (f32::from(self.last_mouse.x), f32::from(self.last_mouse.y));
+            let ax = mx.min(vw - 772.).max(8.);
+            let ay = (my + 16.).min(vh - 220.).max(8.);
+            point(px(ax), px(ay))
+        };
+
         v_flex()
             .size_full()
             .relative()
@@ -3685,6 +3736,11 @@ impl Render for Workbench {
             // 面板拖动:把手按下后,根元素的 mouse_move/up 实时改尺寸(仅 resizing 时生效)
             .on_mouse_move(cx.listener(Self::on_resize_drag))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_resize_end))
+            // 记最近鼠标按下位置,引用列表浮层据此弹在鼠标附近(被动记录,不拦事件)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, ev: &MouseDownEvent, _, _| this.last_mouse = ev.position),
+            )
             .on_action(cx.listener(Self::on_save))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_toggle_quick_open))
@@ -4306,12 +4362,20 @@ impl Render for Workbench {
                                 this.close_palette(window, cx);
                             }),
                         )
-                        .child(
+                        .child(if is_usages_overlay {
+                            // 引用列表:绝对定位到鼠标附近(忽略父级 items_center 居中)
+                            div()
+                                .absolute()
+                                .left(usages_anchor.x)
+                                .top(usages_anchor.y)
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(content)
+                        } else {
                             div()
                                 .mt(px(110.))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(content),
-                        ),
+                                .child(content)
+                        }),
                 )
             })
             // 通知层挂在最上层(浮层之上),右上角弹出

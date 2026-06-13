@@ -32,6 +32,8 @@ pub struct SearchPanel {
     searching: bool,
     /// 查询序号守卫:只接受最新一次查询的结果
     query_seq: u64,
+    /// 选中结果的附近代码块:(行号 0-based, 文本, 是否命中行),随选中变化重载。
+    preview: Vec<(u32, String, bool)>,
     _subscription: Subscription,
 }
 
@@ -56,7 +58,26 @@ impl SearchPanel {
             selected: 0,
             searching: false,
             query_seq: 0,
+            preview: Vec::new(),
             _subscription: subscription,
+        }
+    }
+
+    /// 读选中结果所在文件命中行上下文(各 ~5 行),命中行高亮。
+    fn load_preview(&mut self) {
+        self.preview.clear();
+        let Some(hit) = self.results.get(self.selected) else {
+            return;
+        };
+        let Ok(content) = std::fs::read_to_string(&hit.path) else {
+            return;
+        };
+        let lines: Vec<&str> = content.lines().collect();
+        let center = hit.line as usize;
+        let start = center.saturating_sub(4);
+        let end = (center + 6).min(lines.len());
+        for (i, line) in lines.iter().enumerate().take(end).skip(start) {
+            self.preview.push((i as u32, line.to_string(), i == center));
         }
     }
 
@@ -92,6 +113,7 @@ impl SearchPanel {
                 }
                 this.results = Arc::new(result.unwrap_or_default());
                 this.selected = 0;
+                this.load_preview();
                 this.searching = false;
                 cx.notify();
             });
@@ -106,6 +128,7 @@ impl SearchPanel {
         }
         let next = (self.selected as i32 + delta).rem_euclid(len);
         self.selected = next as usize;
+        self.load_preview();
         cx.notify();
     }
 
@@ -135,6 +158,8 @@ impl SearchPanel {
 impl Render for SearchPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let total = self.results.len();
+        let mono = cx.theme().mono_font_family.clone();
+        // 列表行:代码片段(左,主)+ 相对路径:行(右,次)—— 对齐 IDEA Find in Files
         let rows: Vec<_> = self
             .results
             .iter()
@@ -145,9 +170,10 @@ impl Render for SearchPanel {
                 let selected = row == self.selected;
                 h_flex()
                     .id(row)
+                    .w_full()
                     .px_3()
                     .py_1()
-                    .gap_2()
+                    .gap_3()
                     .items_center()
                     .rounded(cx.theme().radius)
                     .when(selected, |s| s.bg(cx.theme().list_active))
@@ -158,10 +184,45 @@ impl Render for SearchPanel {
                     )
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .font_family(mono.clone())
+                            .text_size(px(12.5))
+                            .child(hit.text.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
                             .text_size(px(11.))
                             .text_color(cx.theme().muted_foreground)
                             .whitespace_nowrap()
-                            .child(format!("{}:{}", rel, hit.line + 1)),
+                            .child(format!("{} {}", rel, hit.line + 1)),
+                    )
+            })
+            .collect();
+
+        // 下半:选中结果的附近代码块(可滑动),命中行高亮
+        let hit_bg = cx.theme().info.opacity(0.14);
+        let preview_rows: Vec<_> = self
+            .preview
+            .iter()
+            .map(|(ln, text, hit)| {
+                h_flex()
+                    .px_2()
+                    .gap_3()
+                    .items_start()
+                    .when(*hit, |s| s.bg(hit_bg))
+                    .font_family(mono.clone())
+                    .text_size(px(12.))
+                    .child(
+                        div()
+                            .w(px(48.))
+                            .flex_none()
+                            .text_right()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(format!("{}", ln + 1)),
                     )
                     .child(
                         div()
@@ -169,23 +230,25 @@ impl Render for SearchPanel {
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(hit.text.clone()),
+                            .child(SharedString::from(text.clone())),
                     )
             })
             .collect();
 
         v_flex()
-            .w(px(640.))
-            .max_h(px(460.))
+            .w(px(760.))
+            .h(px(580.))
             .bg(cx.theme().popover)
             .border_1()
             .border_color(cx.theme().border)
             .rounded(cx.theme().radius_lg)
             .shadow_lg()
+            .overflow_hidden()
             .child(
                 h_flex()
                     .p_2()
                     .gap_2()
+                    .flex_none()
                     .items_center()
                     .child(Icon::new(IconName::Search).small())
                     .child(div().flex_1().child(Input::new(&self.input))),
@@ -194,6 +257,7 @@ impl Render for SearchPanel {
                 h_flex()
                     .px_3()
                     .pb_1()
+                    .flex_none()
                     .text_size(px(11.))
                     .text_color(cx.theme().muted_foreground)
                     .child(if self.searching {
@@ -206,12 +270,26 @@ impl Render for SearchPanel {
             )
             .child(
                 v_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
+                    .id("search-rows")
+                    .max_h(px(260.))
+                    .overflow_y_scroll()
                     .px_1()
                     .pb_1()
                     .children(rows),
             )
+            .when(!preview_rows.is_empty(), |c| {
+                c.child(
+                    v_flex()
+                        .id("search-preview")
+                        .flex_1()
+                        .min_h(px(120.))
+                        .overflow_y_scroll()
+                        .py_1()
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().background)
+                        .children(preview_rows),
+                )
+            })
     }
 }
