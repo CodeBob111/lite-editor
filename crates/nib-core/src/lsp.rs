@@ -64,6 +64,7 @@ pub async fn start_lsp(
     root_path: String,
     events: Arc<dyn EventSink>,
     jdtls_root: PathBuf,
+    maven_user_settings: String,
     state: &LspState,
 ) -> Result<(), String> {
     let key = (language.clone(), root_path.clone());
@@ -85,7 +86,7 @@ pub async fn start_lsp(
     let lang = language.clone();
     let rp = root_path.clone();
     let server = crate::rt::spawn_blocking(move || {
-        start_lsp_blocking(lang, rp, events, jdtls_root)
+        start_lsp_blocking(lang, rp, events, jdtls_root, maven_user_settings)
     })
     .await
     .map_err(|e| format!("Task failed: {}", e))??;
@@ -198,6 +199,9 @@ fn start_lsp_blocking(
     root_path: String,
     events: Arc<dyn EventSink>,
     jdtls_root: PathBuf,
+    // 用户在设置里配的 settings.xml 路径(空=回退默认 ~/.m2/settings.xml)。
+    // 喂给 jdtls 的 maven.userSettings,让 Java 索引/跳转也走内网私服,与依赖树面板一致。
+    maven_user_settings: String,
 ) -> Result<LspServer, String> {
     let jdtls_data_dir;
     let (cmd, args): (&str, Vec<String>) = match language.as_str() {
@@ -287,6 +291,9 @@ fn start_lsp_blocking(
     let events_for_reader = events;
     let stdin_for_reader = Arc::new(Mutex::new(std::io::BufWriter::new(stdin)));
     let stdin_for_server = stdin_for_reader.clone();
+    // reader 线程响应 jdtls 的 workspace/configuration 拉取时要回 userSettings,把用户配的
+    // settings.xml 搬进线程(move 闭包,克隆一份;原值留给下面 initializationOptions 用)。
+    let maven_cfg_for_reader = maven_user_settings.clone();
 
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -306,7 +313,11 @@ fn start_lsp_blocking(
                                         .and_then(|i| i.as_array());
                                     let home =
                                         std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                                    let maven_settings = format!("{}/.m2/settings.xml", home);
+                                    let maven_settings = if maven_cfg_for_reader.trim().is_empty() {
+                                        format!("{}/.m2/settings.xml", home)
+                                    } else {
+                                        maven_cfg_for_reader.clone()
+                                    };
                                     let java_settings = serde_json::json!({
                                         "import": {
                                             "maven": { "enabled": true },
@@ -475,7 +486,11 @@ fn start_lsp_blocking(
         },
         "initializationOptions": if language == "java" {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            let maven_settings = format!("{}/.m2/settings.xml", home);
+            let maven_settings = if maven_user_settings.trim().is_empty() {
+                format!("{}/.m2/settings.xml", home)
+            } else {
+                maven_user_settings.clone()
+            };
             serde_json::json!({
                 "settings": {
                     "java": {

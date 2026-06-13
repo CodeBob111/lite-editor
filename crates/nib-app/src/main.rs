@@ -1494,6 +1494,9 @@ impl Workbench {
             let root = self.project_root.to_string_lossy().to_string();
             let file = path.to_string_lossy().to_string();
             let content = text_for_lsp;
+            // 把用户配的 settings.xml 喂给 jdtls(空=jdtls 回退默认 ~/.m2/settings.xml),
+            // 让 Java 索引/跳转与依赖树面板走同一套 Maven 私服配置。
+            let maven_settings = settings.maven_settings.clone();
             cx.spawn(async move |weak, cx| {
                 let jdtls_root = session::data_dirs().jdtls_workspaces();
                 // 临时诊断:把 start_lsp 的 root 与结果落盘(/tmp/nib-goto.log),
@@ -1514,6 +1517,7 @@ impl Workbench {
                     root,
                     sink as Arc<dyn nib_core::EventSink>,
                     jdtls_root,
+                    maven_settings,
                     &lsp,
                 )
                 .await
@@ -2283,6 +2287,14 @@ impl Workbench {
                     this.settings = settings.clone();
                     session::save_settings(settings);
                     this.apply_maven_config(cx);
+                    // 配置已填任意一项 → 移除「检测到 Maven 工程·未配置」提醒(它带「去设置」
+                    // 按钮、不自动隐藏,否则配完仍挂在右上角不走)。
+                    if !this.settings.maven_home.trim().is_empty()
+                        || !this.settings.maven_settings.trim().is_empty()
+                        || !this.settings.maven_repo.trim().is_empty()
+                    {
+                        window.remove_notification::<MavenConfigPrompt>(cx);
+                    }
                     for tab in &this.tabs {
                         tab.editor.update(cx, |state, cx| {
                             state.set_soft_wrap(wrap, window, cx);
