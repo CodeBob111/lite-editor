@@ -1,5 +1,8 @@
 // Find Usages 浮层(对齐 IDEA Find Usages):上半 = 引用列表(代码片段 + 文件:行),
-// 下半 = 选中项的附近代码块预览(可滑动)。↑↓ 选择 / Enter / 点击跳转,Esc 关闭。
+// 下半 = 选中项所在文件的代码预览(虚拟列表,可滑动整个文件,命中行高亮、初始居中)。
+// ↑↓ 选择 / Enter / 点击跳转,Esc 关闭。
+
+use std::sync::Arc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -29,8 +32,11 @@ pub struct UsagesView {
     symbol_file: String,
     usages: Vec<LspUsage>,
     selected: usize,
-    /// 选中项的附近代码块:(行号 0-based, 文本, 是否命中行),随选中变化重载。
-    preview: Vec<(u32, String, bool)>,
+    /// 选中引用所在文件的**全部**行(虚拟列表渲染,可滑全文件)。jdt:// 引用无本地文件 → 空。
+    preview_lines: Arc<Vec<String>>,
+    /// 命中行(0-based)在 preview_lines 里的下标,高亮 + 初始滚到此处。
+    preview_match: usize,
+    preview_scroll: UniformListScrollHandle,
 }
 
 impl EventEmitter<UsagesEvent> for UsagesView {}
@@ -41,15 +47,18 @@ impl UsagesView {
             symbol_file,
             usages,
             selected: 0,
-            preview: Vec::new(),
+            preview_lines: Arc::new(Vec::new()),
+            preview_match: 0,
+            preview_scroll: UniformListScrollHandle::default(),
         };
         this.load_preview();
         this
     }
 
-    /// 读选中引用所在文件命中行上下文(各 ~5 行)。jdt:// 引用无本地文件 → 不预览。
+    /// 读选中引用所在文件全文做预览,并把滚动定位到命中行居中。jdt:// 引用无本地文件 → 不预览。
     fn load_preview(&mut self) {
-        self.preview.clear();
+        self.preview_lines = Arc::new(Vec::new());
+        self.preview_match = 0;
         let Some(u) = self.usages.get(self.selected) else {
             return;
         };
@@ -60,14 +69,11 @@ impl UsagesView {
         let Ok(content) = std::fs::read_to_string(&path) else {
             return;
         };
-        let lines: Vec<&str> = content.lines().collect();
-        let center = u.line as usize;
-        // 命中行附近:上 3 下 18(命中行靠预览顶部、初始即可见,下方留足内容可向下滚)
-        let start = center.saturating_sub(3);
-        let end = (center + 19).min(lines.len());
-        for (i, line) in lines.iter().enumerate().take(end).skip(start) {
-            self.preview.push((i as u32, line.to_string(), i == center));
-        }
+        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        self.preview_match = (u.line as usize).min(lines.len().saturating_sub(1));
+        self.preview_lines = Arc::new(lines);
+        self.preview_scroll
+            .scroll_to_item(self.preview_match, ScrollStrategy::Center);
     }
 
     pub fn move_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -106,7 +112,7 @@ impl Render for UsagesView {
             .map(|(ix, u)| {
                 let selected = ix == self.selected;
                 let label = usage_label(&u.uri);
-                // 代码片段(左,主)+ 文件:行(右,次)—— 对齐 IDEA Find Usages 行样式
+                // 代码片段(左,主)+ 文件名:行(右,次)—— 对齐 IDEA Find Usages 行样式
                 let code = if u.text.trim().is_empty() {
                     label.clone()
                 } else {
@@ -147,38 +153,43 @@ impl Render for UsagesView {
             })
             .collect();
 
-        // 下半:选中引用的附近代码块(可滑动),命中行高亮
-        let info = cx.theme().info;
-        let hit_bg = info.opacity(0.14);
-        let preview_rows: Vec<_> = self
-            .preview
-            .iter()
-            .map(|(ln, text, hit)| {
-                h_flex()
-                    .px_2()
-                    .gap_3()
-                    .items_start()
-                    .when(*hit, |s| s.bg(hit_bg))
-                    .font_family(mono.clone())
-                    .text_size(px(12.))
-                    .child(
-                        div()
-                            .w(px(44.))
-                            .flex_none()
-                            .text_right()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{}", ln + 1)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .child(SharedString::from(text.clone())),
-                    )
-            })
-            .collect();
+        // 下半:选中引用所在文件的代码预览(虚拟列表,可滑全文件,命中行高亮)
+        let lines = self.preview_lines.clone();
+        let match_ix = self.preview_match;
+        let has_preview = !lines.is_empty();
+        let preview = uniform_list("usages-preview", lines.len(), move |range, _, cx| {
+            let mono = cx.theme().mono_font_family.clone();
+            let muted = cx.theme().muted_foreground;
+            let hit_bg = cx.theme().info.opacity(0.14);
+            range
+                .map(|i| {
+                    h_flex()
+                        .px_2()
+                        .gap_3()
+                        .items_start()
+                        .when(i == match_ix, |s| s.bg(hit_bg))
+                        .font_family(mono.clone())
+                        .text_size(px(12.))
+                        .child(
+                            div()
+                                .w(px(48.))
+                                .flex_none()
+                                .text_right()
+                                .text_color(muted)
+                                .child(format!("{}", i + 1)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(SharedString::from(lines[i].clone())),
+                        )
+                })
+                .collect::<Vec<_>>()
+        })
+        .track_scroll(&self.preview_scroll);
 
         v_flex()
             .w(px(760.))
@@ -212,20 +223,15 @@ impl Render for UsagesView {
                     .p_1()
                     .children(rows),
             )
-            .when(!preview_rows.is_empty(), |c| {
-                // 预览区:自身固定上限高度 + 滚动(不依赖 flex_1,否则 max_h 父容器里
-                // 拿不到确定高度,overflow_y_scroll 不生效)。内容超过即可向下滚。
+            .when(has_preview, |c| {
                 c.child(
-                    v_flex()
-                        .id("usages-preview")
-                        .flex_none()
-                        .max_h(px(260.))
-                        .overflow_y_scroll()
+                    div()
+                        .h(px(260.))
                         .py_1()
                         .border_t_1()
                         .border_color(cx.theme().border)
                         .bg(cx.theme().background)
-                        .children(preview_rows),
+                        .child(preview.size_full()),
                 )
             })
     }

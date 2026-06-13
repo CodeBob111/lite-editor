@@ -32,8 +32,11 @@ pub struct SearchPanel {
     searching: bool,
     /// 查询序号守卫:只接受最新一次查询的结果
     query_seq: u64,
-    /// 选中结果的附近代码块:(行号 0-based, 文本, 是否命中行),随选中变化重载。
-    preview: Vec<(u32, String, bool)>,
+    /// 选中结果所在文件的**全部**行(虚拟列表渲染,可滑全文件)。
+    preview_lines: Arc<Vec<String>>,
+    /// 命中行(0-based),高亮 + 初始滚到此处。
+    preview_match: usize,
+    preview_scroll: UniformListScrollHandle,
     _subscription: Subscription,
 }
 
@@ -58,28 +61,28 @@ impl SearchPanel {
             selected: 0,
             searching: false,
             query_seq: 0,
-            preview: Vec::new(),
+            preview_lines: Arc::new(Vec::new()),
+            preview_match: 0,
+            preview_scroll: UniformListScrollHandle::default(),
             _subscription: subscription,
         }
     }
 
-    /// 读选中结果所在文件命中行上下文(各 ~5 行),命中行高亮。
+    /// 读选中结果所在文件全文做预览,并把滚动定位到命中行居中。
     fn load_preview(&mut self) {
-        self.preview.clear();
+        self.preview_lines = Arc::new(Vec::new());
+        self.preview_match = 0;
         let Some(hit) = self.results.get(self.selected) else {
             return;
         };
         let Ok(content) = std::fs::read_to_string(&hit.path) else {
             return;
         };
-        let lines: Vec<&str> = content.lines().collect();
-        let center = hit.line as usize;
-        // 命中行附近:上 3 下 18(命中行靠预览顶部、初始即可见,下方留足内容可向下滚)
-        let start = center.saturating_sub(3);
-        let end = (center + 19).min(lines.len());
-        for (i, line) in lines.iter().enumerate().take(end).skip(start) {
-            self.preview.push((i as u32, line.to_string(), i == center));
-        }
+        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        self.preview_match = (hit.line as usize).min(lines.len().saturating_sub(1));
+        self.preview_lines = Arc::new(lines);
+        self.preview_scroll
+            .scroll_to_item(self.preview_match, ScrollStrategy::Center);
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -204,37 +207,43 @@ impl Render for SearchPanel {
             })
             .collect();
 
-        // 下半:选中结果的附近代码块(可滑动),命中行高亮
-        let hit_bg = cx.theme().info.opacity(0.14);
-        let preview_rows: Vec<_> = self
-            .preview
-            .iter()
-            .map(|(ln, text, hit)| {
-                h_flex()
-                    .px_2()
-                    .gap_3()
-                    .items_start()
-                    .when(*hit, |s| s.bg(hit_bg))
-                    .font_family(mono.clone())
-                    .text_size(px(12.))
-                    .child(
-                        div()
-                            .w(px(48.))
-                            .flex_none()
-                            .text_right()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("{}", ln + 1)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .child(SharedString::from(text.clone())),
-                    )
-            })
-            .collect();
+        // 下半:选中结果所在文件的代码预览(虚拟列表,可滑全文件,命中行高亮)
+        let lines = self.preview_lines.clone();
+        let match_ix = self.preview_match;
+        let has_preview = !lines.is_empty();
+        let preview = uniform_list("search-preview", lines.len(), move |range, _, cx| {
+            let mono = cx.theme().mono_font_family.clone();
+            let muted = cx.theme().muted_foreground;
+            let hit_bg = cx.theme().info.opacity(0.14);
+            range
+                .map(|i| {
+                    h_flex()
+                        .px_2()
+                        .gap_3()
+                        .items_start()
+                        .when(i == match_ix, |s| s.bg(hit_bg))
+                        .font_family(mono.clone())
+                        .text_size(px(12.))
+                        .child(
+                            div()
+                                .w(px(48.))
+                                .flex_none()
+                                .text_right()
+                                .text_color(muted)
+                                .child(format!("{}", i + 1)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .child(SharedString::from(lines[i].clone())),
+                        )
+                })
+                .collect::<Vec<_>>()
+        })
+        .track_scroll(&self.preview_scroll);
 
         v_flex()
             .w(px(760.))
@@ -279,20 +288,15 @@ impl Render for SearchPanel {
                     .pb_1()
                     .children(rows),
             )
-            .when(!preview_rows.is_empty(), |c| {
-                // 预览区:自身固定上限高度 + 滚动(不依赖 flex_1,否则 max_h 父里拿不到
-                // 确定高度,overflow_y_scroll 不生效)。
+            .when(has_preview, |c| {
                 c.child(
-                    v_flex()
-                        .id("search-preview")
-                        .flex_none()
-                        .max_h(px(280.))
-                        .overflow_y_scroll()
+                    div()
+                        .h(px(280.))
                         .py_1()
                         .border_t_1()
                         .border_color(cx.theme().border)
                         .bg(cx.theme().background)
-                        .children(preview_rows),
+                        .child(preview.size_full()),
                 )
             })
     }
