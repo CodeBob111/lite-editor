@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{h_flex, v_flex, ActiveTheme};
-use nib_core::maven::{MavenDepTree, MavenModule};
+use nib_core::maven::{MavenConfig, MavenDepTree, MavenModule};
 
 pub struct MavenPanel {
     project_root: PathBuf,
@@ -16,6 +16,8 @@ pub struct MavenPanel {
     loading: bool,
     status: SharedString,
     seq: u64,
+    /// 用户配置的 Maven 信息(home/settings/repo);从设置注入。
+    config: MavenConfig,
 }
 
 impl MavenPanel {
@@ -28,9 +30,21 @@ impl MavenPanel {
             loading: false,
             status: "".into(),
             seq: 0,
+            config: MavenConfig::default(),
         };
         this.refresh_modules(cx);
         this
+    }
+
+    /// 注入/更新 Maven 配置(设置变更时调用)。变了就重刷依赖树。
+    pub fn set_config(&mut self, home: String, settings: String, repo: String, cx: &mut Context<Self>) {
+        let changed = self.config.home != home
+            || self.config.settings != settings
+            || self.config.repo != repo;
+        self.config = MavenConfig { home, settings, repo };
+        if changed {
+            self.refresh_modules(cx);
+        }
     }
 
     pub fn set_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
@@ -75,12 +89,13 @@ impl MavenPanel {
 
         self.seq += 1;
         let seq = self.seq;
+        let cfg = self.config.clone();
         let module_dir = PathBuf::from(&module.pom_path)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| self.project_root.to_string_lossy().to_string());
         cx.spawn(async move |weak, cx| {
-            let tree = nib_core::maven::maven_dependency_tree(module_dir).await;
+            let tree = nib_core::maven::maven_dependency_tree(module_dir, cfg).await;
             let _ = weak.update(cx, |this, cx| {
                 if this.seq != seq {
                     return;
@@ -96,7 +111,16 @@ impl MavenPanel {
                         .into();
                         this.dep_tree = Some(tree);
                     }
-                    Err(err) => this.status = format!("解析失败: {}", err).into(),
+                    Err(err) => {
+                        // mvn 找不到/跑不起来 → 提示去设置配置 Maven(尤其用 amaven 的内网工程)
+                        this.status = if err.contains("No such file")
+                            || err.contains("Failed to run mvn")
+                        {
+                            "未找到 mvn —— 请到 设置(⌘,)→ Maven 配置 Maven home(如 amaven)".into()
+                        } else {
+                            format!("解析失败: {}", err).into()
+                        };
+                    }
                 }
                 cx.notify();
             });

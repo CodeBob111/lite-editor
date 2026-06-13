@@ -567,11 +567,13 @@ impl Workbench {
             let settings = session::load_settings().await;
             let _ = cx.update_window(window_handle, |_, window, cx| {
                 let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                    let (wrap, folding) = (settings.word_wrap, settings.folding);
                     this.settings = settings;
+                    this.apply_maven_config(cx);
                     for tab in &this.tabs {
                         tab.editor.update(cx, |state, cx| {
-                            state.set_soft_wrap(settings.word_wrap, window, cx);
-                            state.set_folding(settings.folding, window, cx);
+                            state.set_soft_wrap(wrap, window, cx);
+                            state.set_folding(folding, window, cx);
                         });
                     }
                     cx.notify();
@@ -1435,7 +1437,7 @@ impl Workbench {
         self.mark_op(label);
         let lang = language_for(&path.to_string_lossy());
         let text_for_lsp = text.clone();
-        let settings = self.settings;
+        let settings = self.settings.clone();
         let editor = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor(lang)
@@ -2180,6 +2182,15 @@ impl Workbench {
     }
 
     /// 设置浮层:保存即持久化 + 热应用(换行/折叠经运行时 setter 下发已开标签)
+    /// 把设置里的 Maven 配置(home/settings/repo)推给 Maven 面板;变了会重刷依赖树。
+    fn apply_maven_config(&mut self, cx: &mut Context<Self>) {
+        let home = self.settings.maven_home.clone();
+        let settings = self.settings.maven_settings.clone();
+        let repo = self.settings.maven_repo.clone();
+        self.maven_panel
+            .update(cx, |p, cx| p.set_config(home, settings, repo, cx));
+    }
+
     fn on_open_settings(
         &mut self,
         _: &OpenSettings,
@@ -2190,7 +2201,7 @@ impl Workbench {
             self.close_palette(window, cx);
             return;
         }
-        let view = cx.new(|cx| SettingsView::new(self.settings, window, cx));
+        let view = cx.new(|cx| SettingsView::new(self.settings.clone(), window, cx));
         let sub = cx.subscribe_in(
             &view,
             window,
@@ -2198,13 +2209,15 @@ impl Workbench {
                 SettingsEvent::Apply(settings) => {
                     // 设置页改动实时生效:存盘(异步)+ 热应用到已开标签,**不关闭页面**
                     // (整页设计下改动即时反馈;关闭由 Esc 负责)。
-                    let settings = *settings;
-                    this.settings = settings;
+                    let settings = settings.clone();
+                    let (wrap, folding) = (settings.word_wrap, settings.folding);
+                    this.settings = settings.clone();
                     session::save_settings(settings);
+                    this.apply_maven_config(cx);
                     for tab in &this.tabs {
                         tab.editor.update(cx, |state, cx| {
-                            state.set_soft_wrap(settings.word_wrap, window, cx);
-                            state.set_folding(settings.folding, window, cx);
+                            state.set_soft_wrap(wrap, window, cx);
+                            state.set_folding(folding, window, cx);
                         });
                     }
                     this.status = "设置已更新 ✓".into();

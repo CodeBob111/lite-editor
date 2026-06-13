@@ -79,7 +79,7 @@ pub fn save(session: &PersistedSession) {
 
 // ---- 编辑器偏好(沿用旧 Nib settings.json 的扁平键 schema) ----
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct EditorSettings {
     #[serde(rename = "editor.fontSize", default = "default_font_size")]
     pub font_size: f32,
@@ -89,6 +89,15 @@ pub struct EditorSettings {
     pub word_wrap: bool,
     #[serde(rename = "editor.folding", default = "default_true")]
     pub folding: bool,
+    /// Maven home(含 bin/mvn 的目录,如 ~/amaven-3.5.0)。空=用 PATH 里的 mvn。
+    #[serde(rename = "maven.home", default)]
+    pub maven_home: String,
+    /// Maven settings.xml(内网仓库配置)。空=mvn 默认(~/.m2/settings.xml)。
+    #[serde(rename = "maven.settings", default)]
+    pub maven_settings: String,
+    /// 本地仓库目录。空=mvn 默认(~/.m2/repository)。
+    #[serde(rename = "maven.repo", default)]
+    pub maven_repo: String,
 }
 
 fn default_font_size() -> f32 {
@@ -108,6 +117,9 @@ impl Default for EditorSettings {
             tab_size: default_tab_size(),
             word_wrap: false,
             folding: true,
+            maven_home: String::new(),
+            maven_settings: String::new(),
+            maven_repo: String::new(),
         }
     }
 }

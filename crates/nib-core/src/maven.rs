@@ -352,10 +352,49 @@ pub(crate) fn build_dep_tree(exit_code: i32, output: &str) -> MavenDepTree {
     }
 }
 
-pub async fn maven_dependency_tree(project_path: String) -> Result<MavenDepTree, String> {
+/// 用户可配置的 Maven 信息(像 IDEA)。空字段=用默认。
+#[derive(Clone, Default)]
+pub struct MavenConfig {
+    /// Maven home(含 bin/mvn 的目录,如 ~/amaven-3.5.0)。空=用 PATH 里的 mvn。
+    pub home: String,
+    /// settings.xml(内网仓库配置)。空=mvn 默认 ~/.m2/settings.xml。
+    pub settings: String,
+    /// 本地仓库目录。空=mvn 默认 ~/.m2/repository。
+    pub repo: String,
+}
+
+impl MavenConfig {
+    /// 解析 mvn 可执行:配了 home 用 {home}/bin/mvn,否则用 PATH 的 mvn。
+    fn mvn_bin(&self) -> String {
+        let h = self.home.trim();
+        if h.is_empty() {
+            "mvn".to_string()
+        } else {
+            format!("{}/bin/mvn", h.trim_end_matches('/'))
+        }
+    }
+    /// 附加 -s settings / -Dmaven.repo.local 参数。
+    fn extra_args(&self) -> Vec<String> {
+        let mut a = Vec::new();
+        if !self.settings.trim().is_empty() {
+            a.push("-s".into());
+            a.push(self.settings.trim().to_string());
+        }
+        if !self.repo.trim().is_empty() {
+            a.push(format!("-Dmaven.repo.local={}", self.repo.trim()));
+        }
+        a
+    }
+}
+
+pub async fn maven_dependency_tree(
+    project_path: String,
+    cfg: MavenConfig,
+) -> Result<MavenDepTree, String> {
     on_worker(move || {
-        let result = Command::new("mvn")
+        let result = Command::new(cfg.mvn_bin())
             .arg("dependency:tree")
+            .args(cfg.extra_args())
             .current_dir(&project_path)
             // Dock 启动的 app 拿不到 /opt/homebrew/bin,mvn 找不到(同 jdtls PATH 问题);
             // 且 mvn 脚本要 JAVA_HOME 才能跑(实测仅 java 在 PATH 不够),显式设上。
