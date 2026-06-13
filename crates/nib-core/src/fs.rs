@@ -195,3 +195,33 @@ pub async fn rename_path(old_path: String, new_path: String) -> Result<(), Strin
     })
     .await
 }
+
+/// 把文件/目录移到 macOS 废纸篓(~/.Trash),返回废纸篓里的目标路径(供 undo 还原)。
+/// 比永久删除安全:删错了能从废纸篓或 cmd+Z 找回。同名已存在则加纳秒后缀去重。
+pub async fn move_to_trash(path: String) -> Result<String, String> {
+    on_worker(move || {
+        let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+        let src = Path::new(&path);
+        if !src.exists() {
+            return Err(format!("Path does not exist: {}", path));
+        }
+        let name = src
+            .file_name()
+            .ok_or_else(|| "无效路径".to_string())?
+            .to_string_lossy()
+            .to_string();
+        let trash_dir = Path::new(&home).join(".Trash");
+        std::fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
+        let mut dest = trash_dir.join(&name);
+        if dest.exists() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            dest = trash_dir.join(format!("{name}.{ts}"));
+        }
+        std::fs::rename(src, &dest).map_err(|e| format!("移到废纸篓失败: {e}"))?;
+        Ok(dest.to_string_lossy().to_string())
+    })
+    .await
+}

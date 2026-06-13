@@ -82,6 +82,7 @@ actions!(
         CopyItem,
         CutItem,
         PasteItem,
+        UndoFileOp,
         CopyPath,
         PaletteConfirm,
         Quit
@@ -210,6 +211,43 @@ struct NavLoc {
     line: u32,
 }
 
+/// 资源管理器文件操作的可撤销记录(cmd+Z)。每个变体存还原所需的信息。
+enum UndoOp {
+    /// 删除=移到废纸篓:还原=从废纸篓移回原位
+    Trashed { original: PathBuf, trashed: PathBuf },
+    /// 剪切粘贴(移动):还原=移回
+    Moved { from: PathBuf, to: PathBuf },
+    /// 新建 / 粘贴副本:还原=移到废纸篓
+    Created { path: PathBuf },
+    /// 重命名:还原=改回原名
+    Renamed { from: PathBuf, to: PathBuf },
+}
+
+/// 复制粘贴到同目录时生成不冲突的副本名:`<stem> copy.<ext>` → `<stem> copy 2.<ext>` …
+fn unique_copy_path(dir: &str, name: &str) -> PathBuf {
+    let p = std::path::Path::new(name);
+    let stem = p
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_string());
+    let ext = p
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let base = std::path::Path::new(dir);
+    let first = base.join(format!("{stem} copy{ext}"));
+    if !first.exists() {
+        return first;
+    }
+    for i in 2..1000 {
+        let c = base.join(format!("{stem} copy {i}{ext}"));
+        if !c.exists() {
+            return c;
+        }
+    }
+    first
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum SidebarView {
     Files,
@@ -291,6 +329,8 @@ struct Workbench {
     nav_history: Vec<NavLoc>,
     nav_index: i32,
     nav_restoring: bool,
+    /// 资源管理器文件操作撤销栈(cmd+Z 时焦点在树上)
+    undo_stack: Vec<UndoOp>,
     tabs: Vec<OpenTab>,
     active_tab: Option<usize>,
     /// 全项目文件清单缓存(quick-open 用;core runtime 预载)
@@ -474,6 +514,7 @@ impl Workbench {
             nav_history: Vec::new(),
             nav_index: -1,
             nav_restoring: false,
+            undo_stack: Vec::new(),
             tabs: Vec::new(),
             active_tab: None,
             all_files: Arc::new(Vec::new()),
@@ -1023,13 +1064,55 @@ impl Workbench {
         if paths.is_empty() {
             return;
         }
-        self.status = format!("已删除 {} 项", paths.len()).into();
+        self.status = format!("已删除 {} 项(cmd+Z 撤销)", paths.len()).into();
         self.selected_paths.clear();
         cx.spawn(async move |weak, cx| {
+            // 删除=移到废纸篓(可 cmd+Z 还原 / 也能从废纸篓找回),不永久 rm
+            let mut undos = Vec::new();
             for p in paths {
-                let _ = nib_core::fs::delete_path(p).await;
+                if let Ok(trashed) = nib_core::fs::move_to_trash(p.clone()).await {
+                    undos.push(UndoOp::Trashed {
+                        original: PathBuf::from(p),
+                        trashed: PathBuf::from(trashed),
+                    });
+                }
             }
-            let _ = weak.update(cx, |this, cx| this.reload_tree(cx));
+            let _ = weak.update(cx, |this, cx| {
+                this.undo_stack.extend(undos);
+                this.reload_tree(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn on_undo_file_op(&mut self, _: &UndoFileOp, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(op) = self.undo_stack.pop() else {
+            self.status = "没有可撤销的文件操作".into();
+            cx.notify();
+            return;
+        };
+        self.status = "撤销中…".into();
+        cx.notify();
+        let s = |p: PathBuf| p.to_string_lossy().to_string();
+        cx.spawn(async move |weak, cx| {
+            match op {
+                // 还原删除:从废纸篓移回原位
+                UndoOp::Trashed { original, trashed } => {
+                    let _ = nib_core::fs::rename_path(s(trashed), s(original)).await;
+                }
+                // 还原移动 / 重命名:移回原处
+                UndoOp::Moved { from, to } | UndoOp::Renamed { from, to } => {
+                    let _ = nib_core::fs::rename_path(s(to), s(from)).await;
+                }
+                // 还原新建 / 粘贴副本:移到废纸篓
+                UndoOp::Created { path } => {
+                    let _ = nib_core::fs::move_to_trash(s(path)).await;
+                }
+            }
+            let _ = weak.update(cx, |this, cx| {
+                this.status = "已撤销".into();
+                this.reload_tree(cx);
+            });
         })
         .detach();
     }
@@ -1074,23 +1157,40 @@ impl Workbench {
             self.file_clipboard = None;
         }
         cx.spawn(async move |weak, cx| {
+            let mut undos = Vec::new();
             for src in srcs {
-                let Some(name) = src.file_name() else { continue };
-                let dest = std::path::Path::new(&dir).join(name);
-                // 防自我覆盖:目标与源同路径时跳过
-                if dest == src {
+                let Some(name) = src.file_name().map(|n| n.to_string_lossy().to_string()) else {
                     continue;
-                }
-                let dest = dest.to_string_lossy().to_string();
-                let src = src.to_string_lossy().to_string();
+                };
+                let mut dest = std::path::Path::new(&dir).join(&name);
                 if is_cut {
-                    let _ = nib_core::fs::rename_path(src, dest).await;
+                    // 移到同目录 = no-op
+                    if dest == src {
+                        continue;
+                    }
+                    let d = dest.to_string_lossy().to_string();
+                    let s = src.to_string_lossy().to_string();
+                    if nib_core::fs::rename_path(s, d).await.is_ok() {
+                        undos.push(UndoOp::Moved {
+                            from: src.clone(),
+                            to: dest,
+                        });
+                    }
                 } else {
-                    let _ = nib_core::fs::copy_path(src, dest).await;
+                    // 复制:粘到同目录(或同名)→ 生成 "xxx copy" 副本名,不再静默跳过
+                    if dest == src || dest.exists() {
+                        dest = unique_copy_path(&dir, &name);
+                    }
+                    let d = dest.to_string_lossy().to_string();
+                    let s = src.to_string_lossy().to_string();
+                    if nib_core::fs::copy_path(s, d).await.is_ok() {
+                        undos.push(UndoOp::Created { path: dest });
+                    }
                 }
             }
             let _ = weak.update(cx, |this, cx| {
                 this.status = "".into();
+                this.undo_stack.extend(undos);
                 if is_cut {
                     // 剪切的源已移走,清掉残留的多选高亮
                     this.selected_paths.clear();
@@ -1114,28 +1214,46 @@ impl Workbench {
         let op = op.clone();
         self.overlay = None;
         self._overlay_sub = None;
+        // 执行并产出可撤销记录(新建→Created,重命名→Renamed)
         let task = async move {
             match op {
                 NameOp::NewFile(dir) => {
                     let p = std::path::Path::new(&dir).join(&name);
-                    let _ = nib_core::fs::create_file(p.to_string_lossy().to_string()).await;
+                    nib_core::fs::create_file(p.to_string_lossy().to_string())
+                        .await
+                        .ok()
+                        .map(|_| UndoOp::Created { path: p })
                 }
                 NameOp::NewFolder(dir) => {
                     let p = std::path::Path::new(&dir).join(&name);
-                    let _ = nib_core::fs::create_dir(p.to_string_lossy().to_string()).await;
+                    nib_core::fs::create_dir(p.to_string_lossy().to_string())
+                        .await
+                        .ok()
+                        .map(|_| UndoOp::Created { path: p })
                 }
                 NameOp::Rename(old) => {
                     let new = std::path::Path::new(&old)
                         .parent()
                         .map(|d| d.join(&name))
                         .unwrap_or_else(|| std::path::PathBuf::from(&name));
-                    let _ = nib_core::fs::rename_path(old, new.to_string_lossy().to_string()).await;
+                    nib_core::fs::rename_path(old.clone(), new.to_string_lossy().to_string())
+                        .await
+                        .ok()
+                        .map(|_| UndoOp::Renamed {
+                            from: PathBuf::from(old),
+                            to: new,
+                        })
                 }
             }
         };
         cx.spawn(async move |weak, cx| {
-            task.await;
-            let _ = weak.update(cx, |this, cx| this.reload_tree(cx));
+            let undo = task.await;
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(u) = undo {
+                    this.undo_stack.push(u);
+                }
+                this.reload_tree(cx);
+            });
         })
         .detach();
         cx.notify();
@@ -2328,6 +2446,7 @@ fn jdt_temp_path(uri: &str) -> Option<PathBuf> {
     Some(base)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_tree_item(
     ix: usize,
     entry: &gpui_component::tree::TreeEntry,
@@ -3307,6 +3426,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_copy_item))
             .on_action(cx.listener(Self::on_cut_item))
             .on_action(cx.listener(Self::on_paste_item))
+            .on_action(cx.listener(Self::on_undo_file_op))
             .on_action(cx.listener(Self::on_copy_path))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
@@ -3917,6 +4037,11 @@ fn main() {
             KeyBinding::new("cmd-c", CopyItem, Some("Tree")),
             KeyBinding::new("cmd-x", CutItem, Some("Tree")),
             KeyBinding::new("cmd-v", PasteItem, Some("Tree")),
+            // 删除键(删到废纸篓,可撤销)+ cmd+Z 撤销文件操作(焦点在树上时)
+            KeyBinding::new("backspace", DeleteItem, Some("Tree")),
+            KeyBinding::new("delete", DeleteItem, Some("Tree")),
+            KeyBinding::new("cmd-backspace", DeleteItem, Some("Tree")),
+            KeyBinding::new("cmd-z", UndoFileOp, Some("Tree")),
             KeyBinding::new("up", PaletteUp, Some("QuickOpen")),
             KeyBinding::new("down", PaletteDown, Some("QuickOpen")),
             KeyBinding::new("escape", PaletteDismiss, Some("QuickOpen")),
