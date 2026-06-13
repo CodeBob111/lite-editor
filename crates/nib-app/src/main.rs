@@ -2312,6 +2312,53 @@ impl Workbench {
                                 this.close_palette(window, cx);
                                 this.open_file(path, cx);
                             }
+                            DiffViewEvent::RevertHunk {
+                                path,
+                                new_start,
+                                new_count,
+                                old_content,
+                            } => {
+                                // 把工作区文件该 hunk 区间替换回旧内容,写盘后重算 diff+刷新 git。
+                                // 编辑器标签靠 watcher 自动重载。
+                                let path = path.clone();
+                                let (new_start, new_count) = (*new_start, *new_count);
+                                let old_content = old_content.clone();
+                                let rel = path
+                                    .strip_prefix(&this.project_root)
+                                    .ok()
+                                    .map(|p| p.to_string_lossy().to_string());
+                                let window_handle = this.window_handle;
+                                cx.spawn(async move |weak, cx| {
+                                    let p = path.to_string_lossy().to_string();
+                                    let Ok(content) = nib_core::fs::read_file(p.clone()).await
+                                    else {
+                                        return;
+                                    };
+                                    let trailing_nl = content.ends_with('\n');
+                                    let mut lines: Vec<String> =
+                                        content.lines().map(|s| s.to_string()).collect();
+                                    let start = new_start.saturating_sub(1).min(lines.len());
+                                    let end = (start + new_count).min(lines.len());
+                                    lines.splice(start..end, old_content);
+                                    let mut out = lines.join("\n");
+                                    if trailing_nl {
+                                        out.push('\n');
+                                    }
+                                    if nib_core::fs::write_file(p, out).await.is_err() {
+                                        return;
+                                    }
+                                    let _ = cx.update_window(window_handle, |_, _, cx| {
+                                        let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                                            this.git_panel.update(cx, |g, cx| g.refresh(cx));
+                                            this.refresh_git_marks(cx);
+                                            if let Some(rel) = rel.clone() {
+                                                this.open_diff(rel, path.clone(), cx);
+                                            }
+                                        });
+                                    });
+                                })
+                                .detach();
+                            }
                         },
                     );
                     this.overlay = Some(Overlay::Diff(view));
