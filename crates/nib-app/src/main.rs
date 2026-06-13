@@ -4110,7 +4110,23 @@ impl Render for Workbench {
                         .on_action(cx.listener(Self::on_palette_down))
                         .on_action(cx.listener(Self::on_palette_dismiss))
                         .on_action(cx.listener(Self::on_palette_confirm))
-                        .child(div().mt(px(110.)).child(content)),
+                        // 点浮层外的任意空白处关闭(等价 Esc);浮层框内的 mouse_down
+                        // 被下面的 stop_propagation 拦住,不会冒泡到这里 → 框内点击不关。
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                // 消费这次点击(stop_propagation),避免同一下既关浮层又点中
+                                // 背后工作区(树里的文件 / 编辑器)
+                                cx.stop_propagation();
+                                this.close_palette(window, cx);
+                            }),
+                        )
+                        .child(
+                            div()
+                                .mt(px(110.))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .child(content),
+                        ),
                 )
             })
     }
