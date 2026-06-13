@@ -768,7 +768,9 @@ impl Workbench {
         } = &event
         {
             if language == "java" {
-                if kind == "end" {
+                // 只有 jdtls 发 ServiceReady(serviceReady)才算真就绪;$/progress 的
+                // end 只是某个早期工作项结束,此时还在导入,不能当就绪(会误导用户早点)。
+                if kind == "serviceReady" {
                     self.lsp_phase = LspPhase::Ready;
                 } else if self.lsp_phase != LspPhase::Ready {
                     let label = match percentage {

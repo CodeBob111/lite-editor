@@ -320,7 +320,7 @@ fn start_lsp_blocking(
                                             }
                                         },
                                         "maven": {
-                                            "downloadSources": true
+                                            "downloadSources": false
                                         },
                                         "referencesCodeLens": { "enabled": false },
                                         "implementationsCodeLens": { "enabled": false }
@@ -396,6 +396,40 @@ fn start_lsp_blocking(
                                     }
                                 }
                             }
+                            // jdtls 完全就绪(工作区导入/构建完成)才发 language/status
+                            // type=ServiceReady——用它驱动状态灯"就绪",比首个 $/progress
+                            // end 准(后者只是某个早期工作项结束,此时还在导入)。
+                            "language/status" => {
+                                if let Some(params) = msg.get("params") {
+                                    let st = params
+                                        .get("type")
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("");
+                                    let smsg = params
+                                        .get("message")
+                                        .and_then(|m| m.as_str())
+                                        .unwrap_or("");
+                                    // 只有 ServiceReady 才算真就绪(实测 jdtls 导入期间发的是
+                                    // type=Starting 带百分比,完成才发 ServiceReady)。
+                                    if st == "ServiceReady" {
+                                        ready_clone.store(true, Ordering::Relaxed);
+                                        events_for_reader.emit(CoreEvent::LspProgress {
+                                            language: lang_clone.clone(),
+                                            kind: "serviceReady".to_string(),
+                                            message: String::new(),
+                                            percentage: None,
+                                        });
+                                    } else if st == "Starting" && !smsg.is_empty() {
+                                        // 把 "27% ... Importing project" 喂给状态灯显示真实进度
+                                        events_for_reader.emit(CoreEvent::LspProgress {
+                                            language: lang_clone.clone(),
+                                            kind: "report".to_string(),
+                                            message: smsg.to_string(),
+                                            percentage: None,
+                                        });
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -457,7 +491,7 @@ fn start_lsp_blocking(
                             }
                         },
                         "maven": {
-                            "downloadSources": true
+                            "downloadSources": false
                         }
                     }
                 },
