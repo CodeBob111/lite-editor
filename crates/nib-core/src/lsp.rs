@@ -592,6 +592,34 @@ pub async fn lsp_goto_definition(
     Ok(locations.into_iter().next())
 }
 
+/// 取 jdt:// 类文件的(反编译/源码)文本。jdtls 自定义请求 java/classFileContents,
+/// 参数 { uri }, 返回一个 JSON 字符串(整份 .class 反编译出的 Java 源码)。
+/// context_file = 用户当前所在的 .java(用来定位对应项目的 java server)。
+pub async fn lsp_class_file_contents(
+    jdt_uri: String,
+    context_file: String,
+    state: &LspState,
+) -> Result<String, String> {
+    let server = {
+        let servers = state.servers.lock().map_err(|e| e.to_string())?;
+        find_server_for_file(&servers, &context_file, "java")?
+    };
+    let id = server.next_id.fetch_add(1, Ordering::Relaxed);
+    let params = serde_json::json!({ "uri": jdt_uri });
+    let response = request_and_wait_on_worker(
+        server,
+        id,
+        "java/classFileContents",
+        params,
+        Duration::from_secs(5),
+    )
+    .await?;
+    match response.as_str() {
+        Some(s) if !s.is_empty() => Ok(s.to_string()),
+        _ => Err("classFileContents 返回空/非字符串".into()),
+    }
+}
+
 /// 返回整份文档的符号树(textDocument/documentSymbol)的原始 LSP result,
 /// 前端据此按 range 命中找到光标所在的方法(像 IDEA 用 PSI 那样结构化解析,
 /// 不靠正则猜方法名)。jdtls 返回层级化的 DocumentSymbol[]。

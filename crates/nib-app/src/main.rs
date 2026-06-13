@@ -1301,8 +1301,10 @@ impl Workbench {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.display().to_string())
             .into();
-        // Java:起 jdtls(幂等)并 didOpen——diagnostics 会经 EventSink 流回
-        if lang == "java" {
+        // Java:起 jdtls(幂等)并 didOpen——diagnostics 会经 EventSink 流回。
+        // 仅对工程内文件;反编译的库源码(临时目录)不归 jdtls 管,别触发启动/didOpen,
+        // 否则会把状态栏 LSP 状态从就绪打回"启动中",且给 jdtls 灌工程外的脏文档。
+        if lang == "java" && path.starts_with(&self.project_root) {
             // 还没起(或上次失败)→ 进入"启动中",让状态栏如实显示
             if self.lsp_phase == LspPhase::Off || self.lsp_phase == LspPhase::Failed {
                 self.lsp_phase = LspPhase::Starting;
@@ -1621,7 +1623,7 @@ impl Workbench {
                     .await;
             enum Goto {
                 File(PathBuf, u32, u32),
-                Lib(String),
+                Status(String),
                 NotFound,
             }
             let goto = match lsp_res {
@@ -1629,7 +1631,29 @@ impl Workbench {
                     let p = PathBuf::from(u.uri.strip_prefix("file://").unwrap_or(&u.uri));
                     Goto::File(p, u.line, u.character)
                 }
-                Ok(Some(u)) => Goto::Lib(u.uri),
+                // 依赖 jar 里的定义:jdtls 返回 jdt://。取反编译源码 → 写临时 .java →
+                // 当普通文件打开并跳到定义行(像 IDEA 跳进反编译的 .class)。
+                Ok(Some(u)) if u.uri.starts_with("jdt://") => {
+                    match nib_core::lsp::lsp_class_file_contents(u.uri.clone(), file.clone(), &lsp)
+                        .await
+                    {
+                        Ok(text) => match jdt_temp_path(&u.uri) {
+                            Some(path) => {
+                                let w = std::fs::create_dir_all(
+                                    path.parent().unwrap_or(path.as_path()),
+                                )
+                                .and_then(|_| std::fs::write(&path, text));
+                                match w {
+                                    Ok(_) => Goto::File(path, u.line, u.character),
+                                    Err(e) => Goto::Status(format!("写库源码临时文件失败: {e}")),
+                                }
+                            }
+                            None => Goto::Status(format!("无法解析库类 URI: {}", u.uri)),
+                        },
+                        Err(e) => Goto::Status(format!("取库源码失败: {e}")),
+                    }
+                }
+                Ok(Some(_)) => Goto::NotFound,
                 _ => match nib_core::lsp::text_fallback_definition(
                     file,
                     pos.line,
@@ -1652,11 +1676,7 @@ impl Workbench {
                             this.status = path.display().to_string().into();
                             this.open_file_at(path, line, character, window, cx);
                         }
-                        Goto::Lib(uri) => {
-                            // 依赖 jar 定义,jdtls 返回 jdt://(需 java/classFileContents
-                            // 取反编译文本 + 只读虚拟标签页,待做),先回显 URI。
-                            this.status = format!("库定义 URI: {}", uri).into();
-                        }
+                        Goto::Status(msg) => this.status = msg.into(),
                         Goto::NotFound => this.status = "未找到定义".into(),
                     }
                     cx.notify();
@@ -2205,6 +2225,22 @@ impl Workbench {
 /// Explorer 树行(对齐旧版):文件夹用折叠图标,文件用类型字形图标(file-icons 同源),
 /// 文件名按 git 状态着色(M=橙 A/?=绿 D=红),lock/忽略类淡化
 #[allow(clippy::too_many_arguments)]
+/// 把 jdt:// 库类 URI 映射到一个临时 .java 路径(按包名建目录,便于阅读和复用)。
+/// 形如 jdt://contents/<jar>/<dotted.package>/<Class.java>?<query> → temp/nib-jdt-sources/<pkg path>/<Class.java>
+fn jdt_temp_path(uri: &str) -> Option<PathBuf> {
+    let no_query = uri.split('?').next()?;
+    let after = no_query.strip_prefix("jdt://contents/")?;
+    let segs: Vec<&str> = after.split('/').filter(|s| !s.is_empty()).collect();
+    let class_file = *segs.last()?;
+    let mut base = std::env::temp_dir();
+    base.push("nib-jdt-sources");
+    if segs.len() >= 2 {
+        base.push(segs[segs.len() - 2].replace('.', "/"));
+    }
+    base.push(class_file);
+    Some(base)
+}
+
 fn render_tree_item(
     ix: usize,
     entry: &gpui_component::tree::TreeEntry,
