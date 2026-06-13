@@ -75,9 +75,9 @@
       "highlight": {
         "editor.background": "#080b11",
         "editor.foreground": "#c9d3e0",
-        "editor.active_line.background": "#3b82f60e",
+        "editor.active_line.background": "#3b82f633",
         "editor.line_number": "#4d5870",
-        "editor.active_line_number": "#7a8699",
+        "editor.active_line_number": "#c9d3e0",
         "syntax": {
           "keyword": { "color": "#ff7b72" },
           "type": { "color": "#ffb784" },

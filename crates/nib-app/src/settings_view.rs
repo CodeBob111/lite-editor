@@ -464,7 +464,7 @@ impl Render for SettingsView {
         ];
         let indent = " ".repeat(self.tab_size as usize);
         let preview = v_flex()
-            .w(px(392.))
+            .w(px(300.))
             .flex_none()
             .h_full()
             .bg(bg)
@@ -501,8 +501,10 @@ impl Render for SettingsView {
             );
 
         // —— 外壳:标题条 + 三栏 ——
+        // 宽度 1040(原 960 太窄):三栏壳里中间内容列 = 1040-导航212-预览300 ≈ 内宽 460,
+        // 编辑器字段「左说明+右控件」横排才放得下,不再把说明压成竖排(原 960 时内宽仅 ~288)。
         v_flex()
-            .w(px(960.))
+            .w(px(1040.))
             .h(px(620.))
             .bg(cx.theme().popover)
             .border_1()
