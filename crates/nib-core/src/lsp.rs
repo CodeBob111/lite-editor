@@ -768,6 +768,85 @@ pub async fn lsp_goto_definition(
     Ok(locations.into_iter().next())
 }
 
+/// 在库源码临时文件(nib-jdt-sources，不属任何项目根)里点类名跳转:
+/// jdtls 按文件找 server 会落空(temp 路径不 starts_with 任何项目根),改用**活动项目**
+/// 的 jdtls 做 `workspace/symbol` 按类名查,返回最匹配类的位置(可能是 jdt:// 库类或
+/// file:// 项目类,上层用同一套处理打开)。只对**大写开头的类型名**生效,字段/方法不处理。
+/// 找不到 server / 取不到词 / 无匹配 → Ok(None)，让上层走文本兜底,零回归。
+pub async fn lsp_workspace_symbol_definition(
+    file_path: String,
+    line: u32,
+    character: u32,
+    project_root: String,
+    state: &LspState,
+) -> Result<Option<LspUsage>, String> {
+    // 1. 从临时文件里取点击处的标识符(类名)
+    let content = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
+    let line_text = content.lines().nth(line as usize).unwrap_or("");
+    let Some((_, word)) = word_and_receiver(line_text, character as usize) else {
+        return Ok(None);
+    };
+    // 只对类型名(大写开头)做 symbol 跳;小写的字段/方法 symbol 噪音大,留给文本兜底
+    if !word.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+        return Ok(None);
+    }
+    dbg_log(&format!(
+        "[jdtls-sym] 库源码内跳类名 word={word} 经活动项目 {project_root}"
+    ));
+    // 2. 活动项目的 jdtls(project_root starts_with project_root 必然成立)
+    let server = {
+        let servers = state.servers.lock().map_err(|e| e.to_string())?;
+        find_server_for_file(&servers, &project_root, "java")?
+    };
+    // 3. workspace/symbol 按名查
+    let id = server.next_id.fetch_add(1, Ordering::Relaxed);
+    let params = serde_json::json!({ "query": word });
+    let response = request_and_wait_on_worker(
+        server,
+        id,
+        "workspace/symbol",
+        params,
+        Duration::from_secs(5),
+    )
+    .await?;
+    // 4. 挑 name 精确等于 word 的;优先类/接口/枚举(SymbolKind 5/10/11),否则首个匹配
+    let arr = response.as_array().cloned().unwrap_or_default();
+    let mut first: Option<LspUsage> = None;
+    for sym in arr {
+        if sym.get("name").and_then(|v| v.as_str()) != Some(word.as_str()) {
+            continue;
+        }
+        let loc = sym.get("location").cloned().unwrap_or_default();
+        let uri = loc
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if uri.is_empty() {
+            continue;
+        }
+        let start = loc
+            .get("range")
+            .and_then(|r| r.get("start"))
+            .cloned()
+            .unwrap_or_default();
+        let usage = LspUsage {
+            uri,
+            line: start.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            character: start.get("character").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            text: String::new(),
+        };
+        let kind = sym.get("kind").and_then(|v| v.as_u64()).unwrap_or(0);
+        if matches!(kind, 5 | 10 | 11) {
+            return Ok(Some(usage)); // 类/枚举/接口,精确命中直接用
+        }
+        if first.is_none() {
+            first = Some(usage);
+        }
+    }
+    Ok(first)
+}
+
 /// 取 jdt:// 类文件的(反编译/源码)文本。jdtls 自定义请求 java/classFileContents,
 /// 参数 { uri }, 返回一个 JSON 字符串(整份 .class 反编译出的 Java 源码)。
 /// context_file = 用户当前所在的 .java(用来定位对应项目的 java server)。

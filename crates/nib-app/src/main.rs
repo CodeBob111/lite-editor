@@ -1887,19 +1887,40 @@ impl Workbench {
         let lsp = self.lsp.clone();
         let files = self.all_files.clone();
         let window_handle = self.window_handle;
+        let project_root = self.project_root.to_string_lossy().to_string();
         self.status = "跳转定义…".into();
         cx.notify();
         cx.spawn(async move |weak, cx| {
             // 先问 jdtls;命中 file:// 用它,jdt:// 是库代码(单独提示),
             // 空/超时/出错 → 文本兜底(移植重构前逻辑,不依赖 jdtls 是否就绪)。
-            let lsp_res =
-                nib_core::lsp::lsp_goto_definition(file.clone(), pos.line, pos.character, &lsp)
-                    .await;
+            let in_project = file.starts_with(&project_root);
+            let lsp_res = if in_project {
+                nib_core::lsp::lsp_goto_definition(file.clone(), pos.line, pos.character, &lsp).await
+            } else {
+                // 当前是库源码临时文件(nib-jdt-sources,不属任何项目根)→ 按文件找不到
+                // jdtls server。改用活动项目的 jdtls 做 workspace/symbol 按类名跳,
+                // 像 IDEA 在反编译类里点类型能继续跳进去。
+                nib_core::lsp::lsp_workspace_symbol_definition(
+                    file.clone(),
+                    pos.line,
+                    pos.character,
+                    project_root.clone(),
+                    &lsp,
+                )
+                .await
+            };
             enum Goto {
                 File(PathBuf, u32, u32),
                 Status(String),
                 NotFound,
             }
+            // jdt:// 取源码要按"项目"定位 jdtls server。当前文件若是库源码临时文件,
+            // 拿它去找 server 会再次落空(同 server 查找漏洞下沉一层)→ 用活动项目根当上下文。
+            let lsp_ctx = if in_project {
+                file.clone()
+            } else {
+                project_root.clone()
+            };
             let goto = match lsp_res {
                 Ok(Some(u)) if u.uri.starts_with("file://") => {
                     let p = PathBuf::from(u.uri.strip_prefix("file://").unwrap_or(&u.uri));
@@ -1908,7 +1929,7 @@ impl Workbench {
                 // 依赖 jar 里的定义:jdtls 返回 jdt://。取反编译源码 → 写临时 .java →
                 // 当普通文件打开并跳到定义行(像 IDEA 跳进反编译的 .class)。
                 Ok(Some(u)) if u.uri.starts_with("jdt://") => {
-                    match nib_core::lsp::lsp_class_file_contents(u.uri.clone(), file.clone(), &lsp)
+                    match nib_core::lsp::lsp_class_file_contents(u.uri.clone(), lsp_ctx.clone(), &lsp)
                         .await
                     {
                         Ok(text) => match jdt_temp_path(&u.uri) {
