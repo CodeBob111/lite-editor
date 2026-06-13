@@ -1768,6 +1768,25 @@ impl Workbench {
     }
 
     /// 打开文件并定位到行列(全局搜索跳转用)
+    /// 跳转后把目标行滚到编辑器视口垂直居中(IDEA 式)。line_height / 可见行数要等
+    /// 布局后才有(新开文件首帧前为 None)→ 延到下一帧再算并 set_scroll_offset
+    /// (deferred + 自动 clamp 到合法范围)。
+    fn center_editor_line(editor: Entity<InputState>, line: u32, window: &mut Window) {
+        window.on_next_frame(move |_, cx| {
+            editor.update(cx, |state, cx| {
+                let Some(lh) = state.line_height() else {
+                    return;
+                };
+                let visible = state.visible_row_range().map(|r| r.len()).unwrap_or(20);
+                // 目标顶行 = 命中行 - 可见行数/2;offset.y 为负(内容上移=向下滚)
+                let target_top = (line as i64 - (visible as i64) / 2).max(0) as f32;
+                let mut off = state.scroll_offset();
+                off.y = px(-(target_top * f32::from(lh)));
+                state.set_scroll_offset(off, cx);
+            });
+        });
+    }
+
     fn open_file_at(
         &mut self,
         path: PathBuf,
@@ -1788,9 +1807,11 @@ impl Workbench {
         if let Some(ix) = self.tabs.iter().position(|t| t.path == path) {
             self.activate_tab(ix, window, cx);
             if let Some(tab) = self.tabs.get(ix) {
-                tab.editor.update(cx, |state, cx| {
+                let editor = tab.editor.clone();
+                editor.update(cx, |state, cx| {
                     state.set_cursor_position(Position::new(line, column), window, cx);
                 });
+                Self::center_editor_line(editor, line, window);
             }
             return;
         }
@@ -1806,9 +1827,11 @@ impl Workbench {
                         let ix = this.insert_tab(path.clone(), text, window, cx);
                         this.activate_tab(ix, window, cx);
                         if let Some(tab) = this.tabs.get(ix) {
-                            tab.editor.update(cx, |state, cx| {
+                            let editor = tab.editor.clone();
+                            editor.update(cx, |state, cx| {
                                 state.set_cursor_position(Position::new(line, column), window, cx);
                             });
+                            Self::center_editor_line(editor, line, window);
                         }
                     }
                     cx.notify();
