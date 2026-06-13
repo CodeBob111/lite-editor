@@ -130,8 +130,10 @@ fn start_lsp_blocking(
             let hash = root_path.replace('/', "_");
             jdtls_data_dir = jdtls_root.join(hash).to_string_lossy().to_string();
             let _ = std::fs::create_dir_all(&jdtls_data_dir);
+            // 堆 1536m 对大型多模块工程(如 rateplatform2)不够,jdtls 会在 "Building"
+            // 阶段 OutOfMemoryError 崩溃 → start_lsp 失败 → "jdtls 未启动"。给到 4g。
             ("jdtls", vec![
-                "--jvm-arg=-Xmx1536m".into(),
+                "--jvm-arg=-Xmx4g".into(),
                 "-data".into(),
                 jdtls_data_dir.clone(),
             ])

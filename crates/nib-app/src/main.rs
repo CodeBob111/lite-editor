@@ -685,6 +685,23 @@ impl Workbench {
         .detach();
     }
 
+    /// 把文件在项目内的所有祖先目录写进 expanded_paths。打开/激活文件时
+    /// set_selected_item 会在控件层自动展开祖先,但这些展开**不回写** expanded_paths
+    /// (控件 entries 私有读不到),于是 reload_tree 用 expanded_paths 重建时,凡是仅靠
+    /// 自动展开露出的链全塌回根(尤其删掉活动文件后,连自动展开都没了→整棵塌)。
+    /// 这里显式补上,让 expanded_paths 成为完整真源。
+    fn reveal_ancestors(&mut self, file_path: &std::path::Path) {
+        let root = self.project_root.as_path();
+        let mut cur = file_path.parent();
+        while let Some(dir) = cur {
+            if dir == root || !dir.starts_with(root) {
+                break;
+            }
+            self.expanded_paths.insert(dir.to_string_lossy().to_string());
+            cur = dir.parent();
+        }
+    }
+
     /// 重读目录树(项目加载/外部结构变化共用;core runtime 上跑,带陈旧守卫)。
     /// 重建后回放展开态 + 恢复当前标签的选中(set_items 会清掉两者)。
     fn reload_tree(&mut self, cx: &mut Context<Self>) {
@@ -1517,13 +1534,16 @@ impl Workbench {
         self.mark_op(label);
         self.active_tab = Some(ix);
         self.tabs[ix].last_used = Instant::now();
-        let tab = &self.tabs[ix];
+        let path = self.tabs[ix].path.clone();
+        let title = self.tabs[ix].title.clone();
         // 路径在面包屑显示;状态栏左侧留给 git/诊断(对齐设计稿),切标签清空消息
         self.status = "".into();
-        let handle = tab.editor.read(cx).focus_handle(cx);
+        let handle = self.tabs[ix].editor.read(cx).focus_handle(cx);
         window.focus(&handle, cx);
+        // 把当前文件的祖先链写进 expanded_paths,reload_tree 后树不塌(见 reveal_ancestors)
+        self.reveal_ancestors(&path);
         // 树高亮跟随当前标签(按 id 匹配,自动展开祖先;观察者对已激活文件是 no-op)
-        let tree_item = TreeItem::new(tab.path.to_string_lossy().to_string(), tab.title.clone());
+        let tree_item = TreeItem::new(path.to_string_lossy().to_string(), title);
         self.tree_state
             .update(cx, |state, cx| state.set_selected_item(Some(&tree_item), cx));
         self.persist_session(cx);
@@ -3612,6 +3632,10 @@ impl Render for Workbench {
                                                     .menu("复制", Box::new(CopyItem))
                                                     .menu("剪切", Box::new(CutItem))
                                                     .menu("粘贴", Box::new(PasteItem))
+                                                    .separator()
+                                                    // 撤销上一步文件操作:菜单项与焦点无关,
+                                                    // 解决"粘贴后焦点在编辑器、cmd+Z 撤的是文本"
+                                                    .menu("撤销上一步", Box::new(UndoFileOp))
                                                     .menu("复制路径", Box::new(CopyPath))
                                             })
                                             .child(tree(&self.tree_state, {
@@ -4082,6 +4106,7 @@ fn main() {
             KeyBinding::new("backspace", DeleteItem, Some("Tree")),
             KeyBinding::new("delete", DeleteItem, Some("Tree")),
             KeyBinding::new("cmd-backspace", DeleteItem, Some("Tree")),
+            KeyBinding::new("cmd-delete", DeleteItem, Some("Tree")),
             KeyBinding::new("cmd-z", UndoFileOp, Some("Tree")),
             KeyBinding::new("up", PaletteUp, Some("QuickOpen")),
             KeyBinding::new("down", PaletteDown, Some("QuickOpen")),
