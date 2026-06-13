@@ -1,3 +1,4 @@
+use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
@@ -8,6 +9,40 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::events::{CoreEvent, EventSink};
+
+/// file:// URI 路径段里要 percent-encode 的字符集:控制符 + RFC3986 在路径里非法/有歧义的,
+/// 但**保留 `/`**(路径分隔符)与常规路径字符(字母/数字/`.`/`-`/`_`/`~`)。
+/// jdtls/Eclipse 用 `java.net.URI` 解析,路径含空格(如 Finder 复制出的 "Foo copy.java")
+/// 时裸拼 `file://Foo copy.java` 会抛 URISyntaxException → 破坏整个工作区导入。
+const URI_PATH: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}');
+
+/// 文件系统路径 → file:// URI(percent-encode 危险字符,保留 `/`)。
+/// 普通 ASCII 路径(无空格等特殊字符)编码后字节完全不变,零回归。
+pub fn file_uri(path: &str) -> String {
+    format!("file://{}", utf8_percent_encode(path, URI_PATH))
+}
+
+/// file:// URI → 文件系统路径(strip 前缀 + percent-decode),与 [`file_uri`] 对称。
+/// jdtls 返回编码过的 URI(如 `file:///a/Foo%20copy.java`)时还原回真实路径。
+pub fn path_from_file_uri(uri: &str) -> String {
+    let raw = uri.strip_prefix("file://").unwrap_or(uri);
+    percent_decode_str(raw).decode_utf8_lossy().into_owned()
+}
 
 #[derive(Default)]
 pub struct LspState {
@@ -211,10 +246,11 @@ fn start_lsp_blocking(
             let hash = root_path.replace('/', "_");
             jdtls_data_dir = jdtls_root.join(hash).to_string_lossy().to_string();
             let _ = std::fs::create_dir_all(&jdtls_data_dir);
-            // 堆 1536m 对大型多模块工程(如 rateplatform2)不够,jdtls 会在 "Building"
-            // 阶段 OutOfMemoryError 崩溃 → start_lsp 失败 → "jdtls 未启动"。给到 4g。
+            // 堆对大型多模块工程(如 rateplatform2,215 文件 + 全套内网依赖)要够,否则
+            // jdtls 在 import/build 阶段 OutOfMemoryError(实测 4g 仍 "Java heap space" ×3)
+            // → GC 死亡螺旋(284% CPU)→ 应答不了 initialize → 超时被杀 → 永远导不完。给到 8g。
             ("jdtls", vec![
-                "--jvm-arg=-Xmx4g".into(),
+                "--jvm-arg=-Xmx8g".into(),
                 "-data".into(),
                 jdtls_data_dir.clone(),
             ])
@@ -281,7 +317,7 @@ fn start_lsp_blocking(
         });
     }
 
-    let root_uri = format!("file://{}", root_path);
+    let root_uri = file_uri(&root_path);
 
     let (tx, rx) = mpsc::channel::<serde_json::Value>();
 
@@ -620,7 +656,7 @@ pub async fn lsp_did_open(
     crate::rt::spawn_blocking(move || {
         let params = serde_json::json!({
             "textDocument": {
-                "uri": format!("file://{}", file_path),
+                "uri": file_uri(&file_path),
                 "languageId": language_id,
                 "version": 1,
                 "text": content
@@ -649,7 +685,7 @@ pub async fn lsp_did_change(
     crate::rt::spawn_blocking(move || {
         let params = serde_json::json!({
             "textDocument": {
-                "uri": format!("file://{}", file_path),
+                "uri": file_uri(&file_path),
                 "version": 2
             },
             "contentChanges": [{ "text": content }]
@@ -675,7 +711,7 @@ pub async fn lsp_find_references(
     let character = snap_to_identifier(&file_path, line, character);
     let id = server.next_id.fetch_add(1, Ordering::Relaxed);
     let params = serde_json::json!({
-        "textDocument": { "uri": format!("file://{}", file_path) },
+        "textDocument": { "uri": file_uri(&file_path) },
         "position": { "line": line, "character": character },
         "context": { "includeDeclaration": true }
     });
@@ -713,7 +749,7 @@ pub async fn lsp_goto_definition(
     let character = snap_to_identifier(&file_path, line, character);
     let id = server.next_id.fetch_add(1, Ordering::Relaxed);
     let params = serde_json::json!({
-        "textDocument": { "uri": format!("file://{}", file_path) },
+        "textDocument": { "uri": file_uri(&file_path) },
         "position": { "line": line, "character": character }
     });
 
@@ -775,7 +811,7 @@ pub async fn lsp_document_symbols(
 
     let id = server.next_id.fetch_add(1, Ordering::Relaxed);
     let params = serde_json::json!({
-        "textDocument": { "uri": format!("file://{}", file_path) }
+        "textDocument": { "uri": file_uri(&file_path) }
     });
 
     request_and_wait_on_worker(
@@ -810,7 +846,7 @@ fn build_workspace_folders(root_path: &str, root_uri: &str) -> serde_json::Value
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("project");
-                let uri = format!("file://{}", path.display());
+                let uri = file_uri(&path.display().to_string());
                 folders.push(serde_json::json!({ "uri": uri, "name": name }));
             }
         }
@@ -970,7 +1006,7 @@ fn text_fallback_definition_blocking(
         let l = find_method_line(target, &word).unwrap_or(1);
         dbg_log(&format!("[fallback] ✓ {type_name}.{word} → {target}:{l}"));
         return Some(LspUsage {
-            uri: format!("file://{}", target),
+            uri: file_uri(&target),
             line: (l.saturating_sub(1)) as u32,
             character: 0,
             text: String::new(),
@@ -990,7 +1026,7 @@ fn text_fallback_definition_blocking(
         };
         dbg_log(&format!("[fallback] ✓ 类型 {word} → {target}"));
         Some(LspUsage {
-            uri: format!("file://{}", target),
+            uri: file_uri(&target),
             line: 0,
             character: 0,
             text: String::new(),
@@ -1002,7 +1038,7 @@ fn text_fallback_definition_blocking(
         };
         dbg_log(&format!("[fallback] ✓ 同文件方法 {word} → 行 {l}"));
         Some(LspUsage {
-            uri: format!("file://{}", file_path),
+            uri: file_uri(&file_path),
             line: l,
             character: 0,
             text: String::new(),
@@ -1301,8 +1337,8 @@ fn parse_locations(result: serde_json::Value) -> Result<Vec<LspUsage>, String> {
         let line = start.get("line").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let character = start.get("character").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-        let file_path = uri.strip_prefix("file://").unwrap_or(&uri);
-        let text = read_source_line(file_path, line);
+        let file_path = path_from_file_uri(&uri);
+        let text = read_source_line(&file_path, line);
 
         usages.push(LspUsage {
             uri,
@@ -1563,6 +1599,34 @@ fn decompile_class(jar_path: &str, fqn: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 普通 ASCII 路径编码后必须字节不变(否则会把 file:///a/b 这种全网址搞坏,
+    // goto-def 全线崩 —— 这是"修 bug 反引入灾难性回归"的雷区,务必守住)。
+    #[test]
+    fn file_uri_normal_path_unchanged() {
+        assert_eq!(
+            file_uri("/Users/x/IdeaProjects/proj/src/main/java/com/a/Foo.java"),
+            "file:///Users/x/IdeaProjects/proj/src/main/java/com/a/Foo.java"
+        );
+        // '/' 必须保留为分隔符,不能被编码成 %2F
+        assert!(!file_uri("/a/b/c").contains("%2F"));
+    }
+
+    // 带空格的文件名(Finder 复制出的 "Foo copy.java")必须编码成 %20,
+    // 否则 jdtls 用 java.net.URI 解析时抛 URISyntaxException 破坏整个工作区导入。
+    #[test]
+    fn file_uri_encodes_space_and_round_trips() {
+        let p = "/Users/x/proj/InteractUtils copy.java";
+        let uri = file_uri(p);
+        assert_eq!(uri, "file:///Users/x/proj/InteractUtils%20copy.java");
+        assert_eq!(path_from_file_uri(&uri), p);
+    }
+
+    // 反解析对未编码的旧式 URI 也要兼容(无 %xx 时原样返回路径)
+    #[test]
+    fn path_from_uri_plain() {
+        assert_eq!(path_from_file_uri("file:///a/b/Foo.java"), "/a/b/Foo.java");
+    }
 
     // 验证 kill_all 真正杀死并回收子进程(应用退出路径 RunEvent::Exit 依赖它,
     // 否则 jdtls 孤儿跨重启累积——曾在真机上发现存活 23 小时的孤儿实例)。

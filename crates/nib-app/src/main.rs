@@ -872,10 +872,10 @@ impl Workbench {
         let Some(uri) = params.get("uri").and_then(|v| v.as_str()) else {
             return;
         };
-        let path = match uri.strip_prefix("file://") {
-            Some(p) => PathBuf::from(p),
-            None => return,
-        };
+        if !uri.starts_with("file://") {
+            return;
+        }
+        let path = PathBuf::from(nib_core::lsp::path_from_file_uri(uri));
         let Some(tab_ix) = self.tabs.iter().position(|t| t.path == path) else {
             return;
         };
@@ -1937,7 +1937,7 @@ impl Workbench {
                 .await
                 {
                     Some(u) => {
-                        let p = PathBuf::from(u.uri.strip_prefix("file://").unwrap_or(&u.uri));
+                        let p = PathBuf::from(nib_core::lsp::path_from_file_uri(&u.uri));
                         Goto::File(p, u.line, u.character)
                     }
                     None => Goto::NotFound,
