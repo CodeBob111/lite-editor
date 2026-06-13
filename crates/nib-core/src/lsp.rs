@@ -428,12 +428,15 @@ fn start_lsp_blocking(
             let _ = proc.wait();
         }
     };
+    // 90s 对 rateplatform2 这种巨型多模块工程不够:jdtls 的 initialize 应答会被它
+    // 启动期的工作区初始化拖到 >90s(实测日志:initialize timed out,但 jdtls 后续
+    // 仍跑到 build jobs finished,说明它会完成只是慢)。放宽到 300s,让它注册成功。
     if let Err(e) = request_and_wait(
         &server,
         1,
         "initialize",
         init_params,
-        Duration::from_secs(90),
+        Duration::from_secs(300),
     ) {
         kill_on_err(&server);
         return Err(e);
