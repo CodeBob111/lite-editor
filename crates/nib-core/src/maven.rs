@@ -357,8 +357,10 @@ pub async fn maven_dependency_tree(project_path: String) -> Result<MavenDepTree,
         let result = Command::new("mvn")
             .arg("dependency:tree")
             .current_dir(&project_path)
-            // Dock 启动的 app 拿不到 /opt/homebrew/bin,mvn 找不到(同 jdtls PATH 问题)
+            // Dock 启动的 app 拿不到 /opt/homebrew/bin,mvn 找不到(同 jdtls PATH 问题);
+            // 且 mvn 脚本要 JAVA_HOME 才能跑(实测仅 java 在 PATH 不够),显式设上。
             .env("PATH", crate::lsp::augmented_path())
+            .env("JAVA_HOME", crate::lsp::java_home())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -867,6 +869,7 @@ pub fn run_maven_command(
         .args(&goals)
         .current_dir(&project_path)
         .env("PATH", crate::lsp::augmented_path())
+        .env("JAVA_HOME", crate::lsp::java_home())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

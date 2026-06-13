@@ -107,13 +107,40 @@ pub(crate) fn augmented_path() -> String {
         "/opt/homebrew/sbin".into(),
         "/usr/local/bin".into(),
     ];
+    // JDK 的 bin:让 java/jps/jar/javap 在 Dock 最小 PATH 下也能找到(homebrew java
+    // 常 keg-only 不在 /opt/homebrew/bin)。java_home 解析见下。
+    dirs.push(format!("{}/bin", java_home()));
     if let Ok(home) = std::env::var("HOME") {
         dirs.push(format!("{home}/.local/bin"));
     }
-    dirs.push(
-        std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into()),
-    );
+    dirs.push(std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin:/usr/sbin:/sbin".into()));
     dirs.join(":")
+}
+
+/// 解析 JAVA_HOME(mvn 需要它、arthas 的 java 也靠它的 bin)。优先环境变量,
+/// 否则用 macOS 规范工具 /usr/libexec/java_home(自动找系统默认 JDK,适配任意安装位置),
+/// 都拿不到再回落 homebrew openjdk。结果缓存(一会话内 JDK 不变)。
+pub(crate) fn java_home() -> String {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            if let Ok(jh) = std::env::var("JAVA_HOME") {
+                if !jh.trim().is_empty() {
+                    return jh;
+                }
+            }
+            if let Ok(out) = Command::new("/usr/libexec/java_home").output() {
+                if out.status.success() {
+                    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                    if !s.is_empty() {
+                        return s;
+                    }
+                }
+            }
+            "/opt/homebrew/opt/openjdk".to_string()
+        })
+        .clone()
 }
 
 fn start_lsp_blocking(
