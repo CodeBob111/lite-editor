@@ -83,6 +83,12 @@ impl SettingsView {
         }
     }
 
+    /// 切到 Maven 分类(供「检测到 Maven 工程」提醒的「去设置」按钮直达)。
+    pub fn show_maven(&mut self, cx: &mut Context<Self>) {
+        self.cat = Cat::Maven;
+        cx.notify();
+    }
+
     /// 全字段打包 emit,父级(Workbench)订阅后热应用 + 持久化。
     fn apply(&self, cx: &mut Context<Self>) {
         let font_size = self.font_slider.read(cx).value().start().round();

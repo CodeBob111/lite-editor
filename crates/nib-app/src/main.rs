@@ -24,13 +24,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
+    button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, TabSize},
     list::ListItem,
     menu::ContextMenuExt,
+    notification::{Notification, NotificationType},
     resizable::{h_resizable, resizable_panel, ResizableState},
     tree::{tree, TreeItem, TreeState},
-    v_flex, ActiveTheme, Icon, IconName, Root, Theme, ThemeMode, ThemeRegistry, TitleBar,
+    v_flex, ActiveTheme, Icon, IconName, Root, Theme, ThemeMode, ThemeRegistry, TitleBar, WindowExt,
 };
 
 use futures::StreamExt as _;
@@ -178,6 +180,9 @@ enum NameOp {
     /// 重命名(旧绝对路径)
     Rename(String),
 }
+
+/// Maven 未配置提醒通知的去重类型 id(同类只留一条,切项目不叠多条)
+struct MavenConfigPrompt;
 
 /// 标签上限(LRU 淘汰,脏标签豁免)
 const MAX_TABS: usize = 30;
@@ -669,6 +674,10 @@ impl Workbench {
             .update(cx, |panel, cx| panel.set_project(git_root.clone(), cx));
         self.astore_panel
             .update(cx, |panel, cx| panel.set_project(git_root, cx));
+
+        // 检测到 Maven 工程但未配置 Maven → 主动弹提醒去设置(内网 amaven 工程依赖
+        // 解析常需指定 settings.xml/私服;不主动提示用户不知道要去哪配)。
+        self.maybe_prompt_maven_config(cx);
 
         // quick-open 文件清单预载
         let files_root = root.to_string_lossy().to_string();
@@ -2189,6 +2198,66 @@ impl Workbench {
         let repo = self.settings.maven_repo.clone();
         self.maven_panel
             .update(cx, |p, cx| p.set_config(home, settings, repo, cx));
+    }
+
+    /// 检测到根 pom.xml 且 Maven 三项配置全空 → 弹一条带「去设置」按钮的提醒。
+    /// 触发条件取「未配置」而非「mvn 跑不起来」:用户明确要的是"有 pom + 没配 Maven
+    /// 就提醒"(像 IDEA);配了任意一项就认为用户已知晓,不再打扰。带类型 id 去重,
+    /// 切项目反复进 load_project 不会叠多条。
+    /// 配置从持久化文件**异步重读**,不信内存 self.settings——启动恢复项目(load_project)
+    /// 与 settings 异步加载是两个独立 spawn,谁先不定;读内存可能拿到还没加载完的默认空值,
+    /// 对已配置用户误弹。
+    fn maybe_prompt_maven_config(&mut self, cx: &mut Context<Self>) {
+        let pom = self.project_root.join("pom.xml");
+        let window_handle = self.window_handle;
+        let weak = cx.entity().downgrade();
+        cx.spawn(async move |_, cx| {
+            if !pom.exists() {
+                return;
+            }
+            let s = session::load_settings().await;
+            let configured = !s.maven_home.trim().is_empty()
+                || !s.maven_settings.trim().is_empty()
+                || !s.maven_repo.trim().is_empty();
+            if configured {
+                return;
+            }
+            let _ = cx.update_window(window_handle, move |_, window, cx| {
+                window.push_notification(
+                    Notification::new()
+                        .id::<MavenConfigPrompt>()
+                        .with_type(NotificationType::Warning)
+                        .title("检测到 Maven 工程")
+                        .message(
+                            "尚未配置 Maven。依赖解析失败时(尤其内网 amaven),\
+                             到设置里指定 Maven home / settings.xml / 本地仓库。",
+                        )
+                        .action(move |_, _, _| {
+                            let weak = weak.clone();
+                            Button::new("goto-maven-settings")
+                                .primary()
+                                .label("去设置")
+                                .on_click(move |_, window, cx| {
+                                    let _ = weak.update(cx, |wb, cx| {
+                                        wb.open_settings_at_maven(window, cx);
+                                    });
+                                })
+                        }),
+                    cx,
+                );
+            });
+        })
+        .detach();
+    }
+
+    /// 打开设置页并直接切到 Maven 分类(给 Maven 提醒的「去设置」按钮用)。
+    fn open_settings_at_maven(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !matches!(self.overlay, Some(Overlay::Settings(_))) {
+            self.on_open_settings(&OpenSettings, window, cx);
+        }
+        if let Some(Overlay::Settings(view)) = &self.overlay {
+            view.update(cx, |v, cx| v.show_maven(cx));
+        }
     }
 
     fn on_open_settings(
