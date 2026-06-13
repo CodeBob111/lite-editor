@@ -357,12 +357,42 @@ impl Render for SettingsView {
                         .child(desc),
                 )
         };
-        // Maven 路径输入控件
-        let mi = |st: &Entity<InputState>| {
-            div()
-                .w(px(360.))
-                .child(Input::new(st).font_family(mono.clone()).text_size(px(12.5)))
-                .into_any_element()
+        // Maven 路径字段:路径需要整行宽度,纵向堆叠(标题/key/说明/全宽输入)。
+        // 不用编辑器那种「左说明+右窄控件」横排——内容列仅 ~288px,塞不下宽输入框,
+        // 会把左说明列压成 0 宽 → 说明文字每字一行的竖排乱码。
+        let mfield = |name: &'static str, key: &'static str, desc: &'static str, st: &Entity<InputState>| {
+            v_flex()
+                .py(px(16.))
+                .gap(px(6.))
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .gap(px(9.))
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(14.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg)
+                                .child(name),
+                        )
+                        .child(badge("已实现", success, border)),
+                )
+                .child(
+                    div()
+                        .font_family(mono.clone())
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child(key),
+                )
+                .child(div().text_size(px(12.5)).text_color(muted).child(desc))
+                .child(
+                    div()
+                        .mt(px(4.))
+                        .w_full()
+                        .child(Input::new(st).font_family(mono.clone()).text_size(px(12.5))),
+                )
         };
         let content = v_flex()
             .id("settings-content")
@@ -397,23 +427,23 @@ impl Render for SettingsView {
                         "Maven",
                         "像 IDEA 一样指定 Maven home / settings.xml / 本地仓库。留空则用 PATH 里的 mvn 与默认 ~/.m2。改动即时生效,Maven 面板会按新配置重新解析。",
                     ))
-                    .child(field(
+                    .child(mfield(
                         "Maven home",
                         "maven.home",
                         "自定义 Maven 目录(含 bin/mvn),如 ~/amaven-3.5.0。留空=用 PATH 的 mvn。",
-                        mi(&self.maven_home),
+                        &self.maven_home,
                     ))
-                    .child(field(
+                    .child(mfield(
                         "settings.xml",
                         "maven.settings",
                         "内网仓库等配置文件路径。留空=mvn 默认 ~/.m2/settings.xml。",
-                        mi(&self.maven_settings),
+                        &self.maven_settings,
                     ))
-                    .child(field(
+                    .child(mfield(
                         "本地仓库",
                         "maven.repo",
                         "依赖本地缓存目录。留空=mvn 默认 ~/.m2/repository。",
-                        mi(&self.maven_repo),
+                        &self.maven_repo,
                     )),
             });
 
