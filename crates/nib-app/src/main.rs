@@ -3550,7 +3550,7 @@ impl Workbench {
 }
 
 impl Render for Workbench {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.first_frame_logged {
             self.first_frame_logged = true;
             if let Some(t0) = APP_START.get() {
@@ -3562,6 +3562,11 @@ impl Render for Workbench {
             Some(tab) => format!("{} — {}", self.project_name, tab.title).into(),
             None => self.project_name.clone(),
         };
+
+        // 本版本 gpui-component 的 Root::render 不渲染通知层(只画 view/tooltip/menu),
+        // 需根视图自挂(对齐 story 的 StoryRoot::render)。否则 window.push_notification
+        // 只把通知入队、永远不显示——Maven 未配置提醒看不到的真因就在这。
+        let notification_layer = Root::render_notification_layer(window, cx);
 
         v_flex()
             .size_full()
@@ -4170,6 +4175,9 @@ impl Render for Workbench {
                     div()
                         .absolute()
                         .inset_0()
+                        // occlude:吃掉落在背板上的鼠标/滚轮事件,别穿透到背后编辑器
+                        // (否则设置/diff 页滚动时,后面的代码也跟着滚)。
+                        .occlude()
                         .flex()
                         .flex_col()
                         .items_center()
@@ -4198,6 +4206,8 @@ impl Render for Workbench {
                         ),
                 )
             })
+            // 通知层挂在最上层(浮层之上),右上角弹出
+            .children(notification_layer)
     }
 }
 
