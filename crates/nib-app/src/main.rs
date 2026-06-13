@@ -71,6 +71,9 @@ actions!(
         ArthasMonitor,
         ArthasTt,
         ToggleArthas,
+        // 导航历史 cmd+[ / cmd+]
+        NavBack,
+        NavForward,
         // 文件树操作
         NewFile,
         NewFolder,
@@ -200,6 +203,13 @@ struct OpenTab {
     diag_sig: u64,
 }
 
+/// 导航历史一个落点(文件 + 0-based 行)。cmd+[ 后退 / cmd+] 前进(IDEA 式)。
+#[derive(Clone, PartialEq)]
+struct NavLoc {
+    path: PathBuf,
+    line: u32,
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum SidebarView {
     Files,
@@ -276,6 +286,11 @@ struct Workbench {
     selected_paths: std::collections::HashSet<String>,
     /// 当前项目 java LSP(jdtls)的真实状态(状态栏据此显示,取代硬编码"就绪")
     lsp_phase: LspPhase,
+    /// 导航历史(IDEA 式 cmd+[ 后退 / cmd+] 前进)。jump 时记离开点+目标点;
+    /// 新 jump 截断 nav_index 之后的 forward 历史。nav_restoring 期间不记录。
+    nav_history: Vec<NavLoc>,
+    nav_index: i32,
+    nav_restoring: bool,
     tabs: Vec<OpenTab>,
     active_tab: Option<usize>,
     /// 全项目文件清单缓存(quick-open 用;core runtime 预载)
@@ -456,6 +471,9 @@ impl Workbench {
             file_clipboard: None,
             selected_paths: std::collections::HashSet::new(),
             lsp_phase: LspPhase::Off,
+            nav_history: Vec::new(),
+            nav_index: -1,
+            nav_restoring: false,
             tabs: Vec::new(),
             active_tab: None,
             all_files: Arc::new(Vec::new()),
@@ -1564,6 +1582,14 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         use gpui_component::input::Position;
+        // 导航历史:记离开点(当前光标)+ 目标点(back/forward 触发时不记)
+        self.nav_record_jump(
+            NavLoc {
+                path: path.clone(),
+                line,
+            },
+            cx,
+        );
         if let Some(ix) = self.tabs.iter().position(|t| t.path == path) {
             self.activate_tab(ix, window, cx);
             if let Some(tab) = self.tabs.get(ix) {
@@ -1595,6 +1621,67 @@ impl Workbench {
             });
         })
         .detach();
+    }
+
+    /// 当前光标落点(文件 + 0-based 行),用于导航历史记录离开点。
+    fn current_nav_loc(&self, cx: &App) -> Option<NavLoc> {
+        let tab = self.active()?;
+        let line = tab.editor.read(cx).cursor_position().line;
+        Some(NavLoc {
+            path: tab.path.clone(),
+            line,
+        })
+    }
+
+    /// 记录一个导航落点:与栈顶相同则跳过;否则截断 forward 历史后追加,上限 100。
+    fn nav_push(&mut self, loc: NavLoc) {
+        if self.nav_index >= 0 {
+            if let Some(top) = self.nav_history.get(self.nav_index as usize) {
+                if *top == loc {
+                    return;
+                }
+            }
+        }
+        self.nav_history.truncate((self.nav_index + 1).max(0) as usize);
+        self.nav_history.push(loc);
+        if self.nav_history.len() > 100 {
+            self.nav_history.remove(0);
+        }
+        self.nav_index = self.nav_history.len() as i32 - 1;
+    }
+
+    /// jump 时(open_file_at/open_file 顶部)调用:记离开点(当前光标)+ 目标点。
+    /// nav_restoring 期间(back/forward 触发的打开)不记录,否则历史会无限自增。
+    fn nav_record_jump(&mut self, target: NavLoc, cx: &App) {
+        if self.nav_restoring {
+            return;
+        }
+        if let Some(leave) = self.current_nav_loc(cx) {
+            self.nav_push(leave);
+        }
+        self.nav_push(target);
+    }
+
+    fn on_nav_back(&mut self, _: &NavBack, window: &mut Window, cx: &mut Context<Self>) {
+        if self.nav_index <= 0 {
+            return;
+        }
+        self.nav_index -= 1;
+        let loc = self.nav_history[self.nav_index as usize].clone();
+        self.nav_restoring = true;
+        self.open_file_at(loc.path, loc.line, 0, window, cx);
+        self.nav_restoring = false;
+    }
+
+    fn on_nav_forward(&mut self, _: &NavForward, window: &mut Window, cx: &mut Context<Self>) {
+        if self.nav_index < 0 || self.nav_index + 1 >= self.nav_history.len() as i32 {
+            return;
+        }
+        self.nav_index += 1;
+        let loc = self.nav_history[self.nav_index as usize].clone();
+        self.nav_restoring = true;
+        self.open_file_at(loc.path, loc.line, 0, window, cx);
+        self.nav_restoring = false;
     }
 
     /// F12 跳定义(旧版主路径):跨文件由宿主完成,绕开组件只支持同文件的限制
@@ -3190,6 +3277,8 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_open_folder))
             .on_action(cx.listener(Self::on_goto_definition))
             .on_action(cx.listener(Self::on_find_usages))
+            .on_action(cx.listener(Self::on_nav_back))
+            .on_action(cx.listener(Self::on_nav_forward))
             .on_action(cx.listener(Self::on_toggle_md_preview))
             .on_action(cx.listener(Self::on_toggle_terminal))
             .on_action(cx.listener(Self::on_toggle_astore))
@@ -3815,6 +3904,14 @@ fn main() {
             KeyBinding::new("cmd-w", CloseTab, Some("Workbench")),
             KeyBinding::new("cmd-p", ToggleQuickOpen, Some("Workbench")),
             KeyBinding::new("cmd-shift-f", ToggleSearch, Some("Workbench")),
+            // 导航历史(IDEA 式):cmd+[ 后退、cmd+] 前进。
+            // 编辑器("Input")默认把 cmd-[/] 绑成反缩进/缩进,且它是更深的 context——
+            // 必须在 "Input" 上重绑覆盖(我的 bind_keys 在 gpui_component::init 之后,
+            // 同深度按后绑优先)。缩进仍可用 Tab/Shift-Tab。再绑 "Workbench" 兜底非编辑器焦点。
+            KeyBinding::new("cmd-[", NavBack, Some("Input")),
+            KeyBinding::new("cmd-]", NavForward, Some("Input")),
+            KeyBinding::new("cmd-[", NavBack, Some("Workbench")),
+            KeyBinding::new("cmd-]", NavForward, Some("Workbench")),
             // 资源管理器文件操作:绑到 tree 控件的 "Tree" 上下文,只有焦点在树上才触发,
             // 不影响编辑器("Input" 上下文)自带的文本 cmd-c/x/v
             KeyBinding::new("cmd-c", CopyItem, Some("Tree")),
