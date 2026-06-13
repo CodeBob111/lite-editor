@@ -12,6 +12,9 @@ anyhow = "1"
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
 gpui-component = { git = "https://github.com/longbridge/gpui-component", features = ["tree-sitter-languages"] }
+# 内置图标 SVG(rust-embed 嵌入二进制),给 Application 注册 AssetSource——
+# 否则 Icon::new(IconName::*) 这类 svg 图标(活动栏/设置/定位)无资源源,渲染为空白。
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 nib-core = { path = "../nib-core" }
 nucleo-matcher = "0.3"
 dirs = "5"

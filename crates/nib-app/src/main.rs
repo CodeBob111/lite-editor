@@ -3658,6 +3658,9 @@ impl Render for Workbench {
                             .child(div().flex_1().min_h_0().map(|this| {
                                 match self.active() {
                                     Some(tab) => {
+                                        // markdown 文件:右键菜单加"预览"项(标签随当前预览开关变化)
+                                        let is_md = tab.lang == "markdown";
+                                        let preview_on = self.md_preview;
                                         // 外层包一层捕获 cmd+click:编辑器点击会把光标移到点击处,
                                         // 我们在 mouse_up 时(光标已定)复用 F12 的跳转定义链路(支持跨文件开标签)。
                                         let editor_el = div()
@@ -3677,9 +3680,10 @@ impl Render for Workbench {
                                                     },
                                                 ),
                                             )
-                                            // 右键菜单:Arthas 命令(对光标方法)+ 跳转/复制粘贴
-                                            .context_menu(|menu, _window, _cx| {
-                                                menu.menu("Watch 光标方法", Box::new(ArthasWatch))
+                                            // 右键菜单:(markdown)预览 + Arthas 命令 + 跳转/复制粘贴
+                                            .context_menu(move |menu, _window, _cx| {
+                                                let menu = menu
+                                                    .menu("Watch 光标方法", Box::new(ArthasWatch))
                                                     .menu("Trace 光标方法", Box::new(ArthasTrace))
                                                     .menu("Stack 光标方法", Box::new(ArthasStack))
                                                     .menu(
@@ -3701,7 +3705,20 @@ impl Render for Workbench {
                                                     .menu(
                                                         "粘贴",
                                                         Box::new(gpui_component::input::Paste),
+                                                    );
+                                                // markdown 文件才显示预览开关(标签随当前状态)
+                                                if is_md {
+                                                    menu.separator().menu(
+                                                        if preview_on {
+                                                            "隐藏 Markdown 预览"
+                                                        } else {
+                                                            "显示 Markdown 预览"
+                                                        },
+                                                        Box::new(ToggleMdPreview),
                                                     )
+                                                } else {
+                                                    menu
+                                                }
                                             })
                                             .child(
                                                 Input::new(&tab.editor)
@@ -3962,7 +3979,10 @@ impl Render for Workbench {
 
 fn main() {
     APP_START.set(Instant::now()).ok();
-    gpui_platform::application().run(move |cx| {
+    // 注册 gpui-component 内置图标资源(嵌入二进制),否则 IconName::* 的 svg 图标
+    // (活动栏 文件/源码/Git/Maven、设置齿轮、定位准星)无 AssetSource → 渲染空白。
+    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    app.run(move |cx| {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
         // Warm Earth:旧 Nib(webview 版)的 cobalt 色板逐项移植(src/styles/main.css

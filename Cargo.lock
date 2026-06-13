@@ -3932,6 +3932,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui-component",
+ "gpui-component-assets",
  "gpui_platform",
  "lsp-types",
  "nib-core",
