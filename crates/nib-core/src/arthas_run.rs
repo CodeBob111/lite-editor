@@ -21,9 +21,10 @@ pub struct JavaProc {
 
 /// 列当前机器上的 Java 进程(`jps -l`)。同步瞬时,UI 可直接调;jps 缺失则返回空。
 pub fn list_java_processes() -> Vec<JavaProc> {
-    let Ok(out) = Command::new("jps")
+    // 用绝对 java_home/bin/jps:java 不在 Dock 最小 PATH,也不在 augmented_path
+    // (那里特意不放 JDK,免得 jdtls 撞到 Java 11)。jps 用哪个 JDK 无所谓。
+    let Ok(out) = Command::new(format!("{}/bin/jps", crate::lsp::java_home()))
         .arg("-l")
-        .env("PATH", crate::lsp::augmented_path())
         .output()
     else {
         return Vec::new();
@@ -101,14 +102,13 @@ impl ArthasRun {
         command: &str,
         waker: Arc<dyn Fn() + Send + Sync>,
     ) -> std::io::Result<ArthasRun> {
-        let mut child = Command::new("java")
+        let mut child = Command::new(format!("{}/bin/java", crate::lsp::java_home()))
             .arg("-jar")
             .arg(boot_jar)
             .arg(pid)
             .arg("-c")
             .arg(command)
             .arg("--batch-mode")
-            .env("PATH", crate::lsp::augmented_path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

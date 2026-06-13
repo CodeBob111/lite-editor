@@ -107,9 +107,11 @@ pub(crate) fn augmented_path() -> String {
         "/opt/homebrew/sbin".into(),
         "/usr/local/bin".into(),
     ];
-    // JDK 的 bin:让 java/jps/jar/javap 在 Dock 最小 PATH 下也能找到(homebrew java
-    // 常 keg-only 不在 /opt/homebrew/bin)。java_home 解析见下。
-    dirs.push(format!("{}/bin", java_home()));
+    // 注意:**不要**把 java_home()/bin 加进来。/usr/libexec/java_home 给的常是系统默认
+    // JDK(用户机上=Corretto 11),而 jdtls 1.58 要 Java 21+——把 11 放进 PATH 会让
+    // jdtls 包装脚本检测到 Java 11 直接崩("requires at least Java 21")。jdtls 的包装
+    // 脚本自带 JAVA_HOME 默认(/opt/homebrew/opt/openjdk=Java 25),不干扰它即可;
+    // 需要 java 的 arthas/mvn 各自用绝对路径 / 显式 JAVA_HOME(见调用处)。
     if let Ok(home) = std::env::var("HOME") {
         dirs.push(format!("{home}/.local/bin"));
     }
@@ -139,6 +141,54 @@ pub(crate) fn java_home() -> String {
                 }
             }
             "/opt/homebrew/opt/openjdk".to_string()
+        })
+        .clone()
+}
+
+/// 找一个 Java 21+ 的 JDK 给 jdtls(它 1.58 起要求 21+)。系统默认(java_home())
+/// 在用户机上是 Corretto 11,不能用。优先:继承的 JAVA_HOME 若已 21+ 就用,
+/// 否则按常见 homebrew openjdk 路径找(都 ≥21)。找不到返回 None(回落 jdtls 包装
+/// 脚本自带的默认)。结果缓存。
+fn jdtls_java_home() -> Option<String> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<String>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let major_ge_21 = |home: &str| -> bool {
+                let java = format!("{home}/bin/java");
+                let Ok(out) = Command::new(&java).arg("-version").output() else {
+                    return false;
+                };
+                let s = String::from_utf8_lossy(&out.stderr);
+                // 形如 openjdk version "25.0.2" / "11.0.31" / "1.8.0_xxx"
+                let Some(v) = s.split('"').nth(1) else {
+                    return false;
+                };
+                let major = if let Some(rest) = v.strip_prefix("1.") {
+                    rest.split('.').next().and_then(|x| x.parse::<u32>().ok())
+                } else {
+                    v.split('.').next().and_then(|x| x.parse::<u32>().ok())
+                };
+                major.map(|m| m >= 21).unwrap_or(false)
+            };
+            if let Ok(jh) = std::env::var("JAVA_HOME") {
+                if !jh.is_empty() && major_ge_21(&jh) {
+                    return Some(jh);
+                }
+            }
+            for p in [
+                "/opt/homebrew/opt/openjdk",
+                "/opt/homebrew/opt/openjdk@25",
+                "/opt/homebrew/opt/openjdk@23",
+                "/opt/homebrew/opt/openjdk@21",
+                "/usr/local/opt/openjdk",
+            ] {
+                let home = format!("{p}/libexec/openjdk.jdk/Contents/Home");
+                if std::path::Path::new(&home).join("bin/java").exists() && major_ge_21(&home) {
+                    return Some(home);
+                }
+            }
+            None
         })
         .clone()
 }
@@ -175,6 +225,15 @@ fn start_lsp_blocking(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    // jdtls 1.58 要 Java 21+。jdtls.py 优先用 $JAVA_HOME/bin/java——若继承到的
+    // JAVA_HOME 是更老的 JDK(用户机系统默认=Corretto 11),jdtls 直接崩
+    // "requires at least Java 21"。显式钉到一个 21+ 的 JDK,不被继承环境带歪。
+    if language == "java" {
+        if let Some(jh) = jdtls_java_home() {
+            command.env("JAVA_HOME", jh);
+        }
+    }
 
     #[cfg(unix)]
     if language == "java" {
@@ -428,15 +487,15 @@ fn start_lsp_blocking(
             let _ = proc.wait();
         }
     };
-    // 90s 对 rateplatform2 这种巨型多模块工程不够:jdtls 的 initialize 应答会被它
-    // 启动期的工作区初始化拖到 >90s(实测日志:initialize timed out,但 jdtls 后续
-    // 仍跑到 build jobs finished,说明它会完成只是慢)。放宽到 300s,让它注册成功。
+    // 之前以为 initialize 慢(放到 300s),实测真因是 jdtls 跑在 Java 11 上直接崩
+    // (无响应→必超时)。用对 Java 21+ 后实测 initialize 仅 ~25s。120s 足够,
+    // 且 jdtls 真崩时 reader EOF 会让 recv 快速失败,不必干等。
     if let Err(e) = request_and_wait(
         &server,
         1,
         "initialize",
         init_params,
-        Duration::from_secs(300),
+        Duration::from_secs(120),
     ) {
         kill_on_err(&server);
         return Err(e);
