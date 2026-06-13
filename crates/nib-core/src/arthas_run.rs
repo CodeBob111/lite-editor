@@ -21,7 +21,11 @@ pub struct JavaProc {
 
 /// 列当前机器上的 Java 进程(`jps -l`)。同步瞬时,UI 可直接调;jps 缺失则返回空。
 pub fn list_java_processes() -> Vec<JavaProc> {
-    let Ok(out) = Command::new("jps").arg("-l").output() else {
+    let Ok(out) = Command::new("jps")
+        .arg("-l")
+        .env("PATH", crate::lsp::augmented_path())
+        .output()
+    else {
         return Vec::new();
     };
     String::from_utf8_lossy(&out.stdout)
@@ -104,6 +108,7 @@ impl ArthasRun {
             .arg("-c")
             .arg(command)
             .arg("--batch-mode")
+            .env("PATH", crate::lsp::augmented_path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

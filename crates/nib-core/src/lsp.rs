@@ -101,7 +101,7 @@ pub async fn start_lsp(
 /// 于是裸 `Command::new("jdtls")` 在装机后从 Dock 启动时 spawn 失败 NotFound,
 /// server 永不入 map,跳转/查引用全报 "No LSP server"。dev 时 `cargo run` 从带
 /// homebrew PATH 的 shell 跑所以一直没暴露。这里把常见包管理器 bin 目录补进子进程 PATH。
-fn augmented_path() -> String {
+pub(crate) fn augmented_path() -> String {
     let mut dirs: Vec<String> = vec![
         "/opt/homebrew/bin".into(),
         "/opt/homebrew/sbin".into(),

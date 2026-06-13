@@ -56,6 +56,8 @@ pub fn run_git_with_timeout_raw(
     let mut cmd = Command::new("git");
     cmd.args(args)
         .current_dir(cwd)
+        // /usr/bin/git 在最小 PATH 里通常能用,但补 PATH 兜住 homebrew git / git 调外部工具
+        .env("PATH", crate::lsp::augmented_path())
         .env("GIT_TERMINAL_PROMPT", "0")
         .env(
             "GIT_SSH_COMMAND",

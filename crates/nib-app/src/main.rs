@@ -1076,10 +1076,24 @@ impl Workbench {
         self.open_name_input("重命名", &name, NameOp::Rename(path), window, cx);
     }
 
-    fn on_delete_item(&mut self, _: &DeleteItem, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_delete_item(&mut self, _: &DeleteItem, window: &mut Window, cx: &mut Context<Self>) {
         let paths = self.target_paths(cx);
         if paths.is_empty() {
             return;
+        }
+        // 删除的文件(或被删目录下的文件)若在标签里打开,先关掉——否则编辑器还显示已删文件。
+        // starts_with 同时覆盖"删的就是该文件"和"删的是其所在目录"。高→低索引关,避免串位。
+        let del: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        let mut to_close: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| del.iter().any(|d| t.path.starts_with(d)))
+            .map(|(i, _)| i)
+            .collect();
+        to_close.sort_unstable_by(|a, b| b.cmp(a));
+        for ix in to_close {
+            self.close_tab_at(ix, window, cx);
         }
         self.status = format!("已删除 {} 项(cmd+Z 撤销)", paths.len()).into();
         self.selected_paths.clear();
@@ -1682,6 +1696,9 @@ impl Workbench {
                         if let Some(tab) = this.tabs.iter_mut().find(|t| t.path == path) {
                             tab.dirty = false;
                         }
+                        // 保存后立即刷新 git 改动列表 + 树徽标(不必等 watcher 500ms 防抖)
+                        this.git_panel.update(cx, |p, cx| p.refresh(cx));
+                        this.refresh_git_marks(cx);
                         format!("已保存 {}", path.display()).into()
                     }
                     Err(err) => format!("保存失败: {}", err).into(),
