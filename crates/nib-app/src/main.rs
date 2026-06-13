@@ -1469,6 +1469,19 @@ impl Workbench {
             let content = text_for_lsp;
             cx.spawn(async move |weak, cx| {
                 let jdtls_root = session::data_dirs().jdtls_workspaces();
+                // 临时诊断:把 start_lsp 的 root 与结果落盘(/tmp/nib-goto.log),
+                // 定位"jdtls 就绪却 No LSP server"=server 没入 map 的真因
+                let log = |m: String| {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/nib-goto.log")
+                    {
+                        let _ = writeln!(f, "{m}");
+                    }
+                };
+                log(format!("[start_lsp] 调用 root={root}"));
                 if let Err(err) = nib_core::lsp::start_lsp(
                     "java".into(),
                     root,
@@ -1478,6 +1491,7 @@ impl Workbench {
                 )
                 .await
                 {
+                    log(format!("[start_lsp] 失败 → server 不入 map: {err}"));
                     eprintln!("[nib-lsp] jdtls 启动失败: {}", err);
                     let _ = weak.update(cx, |this: &mut Workbench, cx| {
                         this.lsp_phase = LspPhase::Failed;
@@ -1485,6 +1499,7 @@ impl Workbench {
                     });
                     return;
                 }
+                log("[start_lsp] 成功 → server 已入 map".to_string());
                 if let Err(err) =
                     nib_core::lsp::lsp_did_open(file, "java".into(), content, &lsp).await
                 {
