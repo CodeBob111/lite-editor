@@ -3820,6 +3820,27 @@ impl Render for Workbench {
                     .border_color(cx.theme().status_bar_border)
                     .text_size(px(11.))
                     .text_color(cx.theme().muted_foreground)
+                    // 状态栏左侧可点「终端」按钮(等价 ctrl+`):给底部终端一个显眼入口
+                    .child(
+                        div()
+                            .id("status-terminal")
+                            .flex_none()
+                            .px_1p5()
+                            .rounded(cx.theme().radius)
+                            .cursor_pointer()
+                            .whitespace_nowrap()
+                            .hover(|s| s.bg(cx.theme().accent))
+                            .when(self.terminal_visible, |s| {
+                                s.text_color(cx.theme().foreground)
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, window, cx| {
+                                    this.on_toggle_terminal(&ToggleTerminal, window, cx)
+                                }),
+                            )
+                            .child(">_ 终端"),
+                    )
                     .map(|bar| {
                         // 左侧对齐设计稿:分支 · git 领先/落后 · 改动数 · 诊断数
                         let (branch, ahead, behind, changes) = {
