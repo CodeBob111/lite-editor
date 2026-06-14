@@ -296,8 +296,8 @@ enum LspPhase {
     Off,
     /// 文件已打开,jdtls 启动中(spawn + initialize)
     Starting,
-    /// 已连上,正在索引/导入(带进度消息);此阶段跳转可能返回空
-    Indexing(String),
+    /// 已连上,正在索引/导入(带进度百分比);此阶段跳转可能返回空
+    Indexing(Option<u8>),
     /// 索引完成,可正常跳转/查引用
     Ready,
     /// jdtls 启动失败(如未安装/spawn 失败)
@@ -782,7 +782,7 @@ impl Workbench {
         if let nib_core::CoreEvent::LspProgress {
             language,
             kind,
-            message,
+            message: _,
             percentage,
         } = &event
         {
@@ -792,16 +792,8 @@ impl Workbench {
                 if kind == "serviceReady" {
                     self.lsp_phase = LspPhase::Ready;
                 } else if self.lsp_phase != LspPhase::Ready {
-                    let label = match percentage {
-                        Some(p) => format!("{} {}%", message, p),
-                        None => message.clone(),
-                    };
-                    let label = if label.trim().is_empty() {
-                        "索引中".to_string()
-                    } else {
-                        label
-                    };
-                    self.lsp_phase = LspPhase::Indexing(label);
+                    self.lsp_phase =
+                        LspPhase::Indexing((*percentage).map(|p| p.min(100) as u8));
                 }
                 cx.notify();
             }
@@ -4301,28 +4293,47 @@ impl Render for Workbench {
                     })
                     .when(active_lang == "java", |this| {
                         // jdtls 真实状态(取代硬编码"就绪"):点颜色 + 文案随 lsp_phase。
-                        // 索引中点黄,让用户知道此时跳转可能为空、需等待而非"坏了"。
-                        let (dot, label) = match &self.lsp_phase {
-                            LspPhase::Ready => (cx.theme().success, "jdtls 就绪".to_string()),
-                            LspPhase::Starting => {
-                                (cx.theme().warning, "jdtls 启动中".to_string())
-                            }
-                            LspPhase::Indexing(_) => {
-                                (cx.theme().warning, "jdtls 索引中".to_string())
-                            }
-                            LspPhase::Failed => {
-                                (cx.theme().danger, "jdtls 未启动".to_string())
-                            }
-                            LspPhase::Off => {
-                                (cx.theme().muted_foreground, "jdtls 未连接".to_string())
-                            }
+                        // 启动/索引阶段显示进度条(jdtls 发的 % 进度),让用户知道在动、要等多久。
+                        let (dot, label, starting) = match &self.lsp_phase {
+                            LspPhase::Ready => (cx.theme().success, "jdtls 就绪", false),
+                            LspPhase::Starting => (cx.theme().warning, "jdtls 启动中", true),
+                            LspPhase::Indexing(_) => (cx.theme().warning, "jdtls 启动中", true),
+                            LspPhase::Failed => (cx.theme().danger, "jdtls 未启动", false),
+                            LspPhase::Off => (cx.theme().muted_foreground, "jdtls 未连接", false),
                         };
+                        let percent = match &self.lsp_phase {
+                            LspPhase::Indexing(p) => *p,
+                            _ => None,
+                        };
+                        let muted = cx.theme().muted_foreground;
+                        let accent = cx.theme().primary;
                         this.child(
                             h_flex()
                                 .items_center()
-                                .gap_1()
+                                .gap_1p5()
                                 .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(dot))
-                                .child(div().text_color(cx.theme().muted_foreground).child(label)),
+                                .child(div().text_color(muted).child(label))
+                                // 进度条:启动/索引阶段显示,有 % 就按比例填充(无 % 显示空槽)
+                                .when(starting, |row| {
+                                    let frac = percent.unwrap_or(0).min(100) as f32 / 100.;
+                                    row.child(
+                                        div()
+                                            .w(px(64.))
+                                            .h(px(5.))
+                                            .rounded_full()
+                                            .bg(muted.opacity(0.3))
+                                            .child(
+                                                div()
+                                                    .h_full()
+                                                    .w(relative(frac))
+                                                    .rounded_full()
+                                                    .bg(accent),
+                                            ),
+                                    )
+                                })
+                                .when_some(percent, |row, p| {
+                                    row.child(div().text_color(muted).child(format!("{}%", p)))
+                                }),
                         )
                     }),
             )

@@ -19,9 +19,6 @@ pub enum SettingsEvent {
     Apply(EditorSettings),
 }
 
-/// 提案分类(无后端;仅展示,不可选)
-const PROPOSAL_CATS: [&str; 5] = ["外观", "终端", "Git", "Arthas", "Astore"];
-
 #[derive(Clone, Copy, PartialEq)]
 enum Cat {
     Editor,
@@ -104,19 +101,6 @@ impl SettingsView {
     }
 }
 
-/// 「已实现 / 提案」徽标
-fn badge(text: &'static str, color: Hsla, border: Hsla) -> impl IntoElement {
-    div()
-        .text_size(px(10.))
-        .text_color(color)
-        .border_1()
-        .border_color(border)
-        .rounded(px(5.))
-        .px(px(7.))
-        .py(px(2.))
-        .child(text)
-}
-
 impl Render for SettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let fg = cx.theme().foreground;
@@ -125,7 +109,6 @@ impl Render for SettingsView {
         let border = cx.theme().border;
         let sidebar = cx.theme().sidebar;
         let bg = cx.theme().background;
-        let success = cx.theme().success;
         let mono = cx.theme().mono_font_family.clone();
         let font_size = self.font_slider.read(cx).value().start().round();
         let entity = cx.entity();
@@ -189,30 +172,7 @@ impl Render for SettingsView {
             )
             // 真分类:编辑器 / Maven(可切换)
             .child(cat_item("编辑器", Cat::Editor))
-            .child(cat_item("Maven", Cat::Maven))
-            .child(
-                div()
-                    .px(px(12.))
-                    .pt(px(14.))
-                    .pb(px(5.))
-                    .text_size(px(10.))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(muted)
-                    .child("提案"),
-            )
-            // 提案分类:灰 + 「提案」徽标,不可选
-            .children(PROPOSAL_CATS.iter().map(|name| {
-                h_flex()
-                    .mx(px(8.))
-                    .px(px(9.))
-                    .py(px(7.))
-                    .gap(px(9.))
-                    .items_center()
-                    .rounded(px(7.))
-                    .text_color(muted)
-                    .child(div().flex_1().text_size(px(13.)).child(*name))
-                    .child(badge("提案", muted, border))
-            }));
+            .child(cat_item("Maven", Cat::Maven));
 
         // —— 字段行 helper(name/key/desc | 控件 + 徽标) ——
         let field = |name: &'static str, key: &'static str, desc: &'static str, control: AnyElement| {
@@ -228,17 +188,11 @@ impl Render for SettingsView {
                         .min_w_0()
                         .max_w(px(430.))
                         .child(
-                            h_flex()
-                                .gap(px(9.))
-                                .items_center()
-                                .child(
-                                    div()
-                                        .text_size(px(14.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(fg)
-                                        .child(name),
-                                )
-                                .child(badge("已实现", success, border)),
+                            div()
+                                .text_size(px(14.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg)
+                                .child(name),
                         )
                         .child(
                             div()
@@ -373,17 +327,11 @@ impl Render for SettingsView {
                 .border_b_1()
                 .border_color(border)
                 .child(
-                    h_flex()
-                        .gap(px(9.))
-                        .items_center()
-                        .child(
-                            div()
-                                .text_size(px(14.))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(fg)
-                                .child(name),
-                        )
-                        .child(badge("已实现", success, border)),
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child(name),
                 )
                 .child(
                     div()
