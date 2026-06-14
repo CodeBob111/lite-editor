@@ -683,10 +683,13 @@ pub async fn lsp_did_change(
     };
 
     crate::rt::spawn_blocking(move || {
+        // version 必须单调递增,否则 jdtls 会丢弃旧版本的 didChange(诊断更新一次后僵)。
+        // 复用单调的 next_id 当版本号(只需递增,不必连续)。
+        let version = server.next_id.fetch_add(1, Ordering::Relaxed);
         let params = serde_json::json!({
             "textDocument": {
                 "uri": file_uri(&file_path),
-                "version": 2
+                "version": version
             },
             "contentChanges": [{ "text": content }]
         });

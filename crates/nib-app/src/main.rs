@@ -380,6 +380,8 @@ struct Workbench {
     prev_modifiers: Modifiers,
     /// 最近一次鼠标按下的位置(窗口坐标),供引用列表浮层锚到鼠标附近弹出。
     last_mouse: Point<Pixels>,
+    /// 编辑防抖序号:每次击键 +1,延迟后只有序号未变才发 didChange(实时诊断)。
+    lsp_change_seq: u64,
 }
 
 /// 欢迎页「最近项目」一行的展示数据(路径 + 派生的名称/缩写/类型标签/首字母色)。
@@ -556,6 +558,7 @@ impl Workbench {
             last_shift: None,
             prev_modifiers: Modifiers::default(),
             last_mouse: Point::default(),
+            lsp_change_seq: 0,
         };
         let lsp_for_quit = this.lsp.clone();
         cx.on_app_quit(move |_, _| {
@@ -819,6 +822,8 @@ impl Workbench {
         }
         self.git_panel.update(cx, |panel, cx| panel.refresh(cx));
         self.refresh_git_marks(cx);
+        // 磁盘文件被外部改动(git checkout / 另一编辑器 / 格式化工具)→ 重载已开标签显示最新
+        self.reload_open_tabs_from_disk(cx);
         let _ = window;
         for tab in &self.tabs {
             if tab.dirty {
@@ -855,6 +860,106 @@ impl Workbench {
                         }
                     });
                 });
+            })
+            .detach();
+        }
+    }
+
+    /// 编辑后防抖发 didChange,让 jdtls 重新分析 → publishDiagnostics → 边敲边报错。
+    /// 仅 java 工程内文件;每次击键 +seq 重置防抖,~400ms 静默后只有 seq 未变才发,
+    /// 避免每键都把整份文件写给 jdtls。
+    fn schedule_did_change(&mut self, editor: Entity<InputState>, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|t| t.editor == editor) else {
+            return;
+        };
+        if tab.lang != "java" || !tab.path.starts_with(&self.project_root) {
+            return;
+        }
+        let path = tab.path.to_string_lossy().to_string();
+        self.lsp_change_seq += 1;
+        let seq = self.lsp_change_seq;
+        let lsp = self.lsp.clone();
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            let content = weak
+                .update(cx, |this, cx| {
+                    if this.lsp_change_seq != seq {
+                        return None; // 期间又敲了 → 放弃,让最后一次发
+                    }
+                    this.tabs
+                        .iter()
+                        .find(|t| t.path.to_string_lossy() == path)
+                        .map(|t| t.editor.read(cx).value().to_string())
+                })
+                .ok()
+                .flatten();
+            if let Some(content) = content {
+                let _ = nib_core::lsp::lsp_did_change(path, content, &lsp).await;
+            }
+        })
+        .detach();
+    }
+
+    /// 磁盘文件被外部改动 → 重载未保存改动的标签(脏标签跳过,避免覆盖编辑),保留光标。
+    /// set_value 内部 emit_events=false,不会误标脏;内容没变就不重设(常见:本应用刚保存)。
+    fn reload_open_tabs_from_disk(&mut self, cx: &mut Context<Self>) {
+        let window_handle = self.window_handle;
+        let targets: Vec<(usize, String, bool)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| !t.dirty)
+            .map(|(i, t)| {
+                let java = t.lang == "java" && t.path.starts_with(&self.project_root);
+                (i, t.path.to_string_lossy().to_string(), java)
+            })
+            .collect();
+        for (ix, path, is_java) in targets {
+            let lsp = self.lsp.clone();
+            cx.spawn(async move |weak, cx| {
+                let Ok(disk) = nib_core::fs::read_file(path.clone()).await else {
+                    return;
+                };
+                let reloaded = cx
+                    .update_window(window_handle, {
+                        let disk = disk.clone();
+                        let path = path.clone();
+                        move |_, window, cx| {
+                            weak.update(cx, |this, cx| {
+                                let Some(tab) = this.tabs.get(ix) else {
+                                    return false;
+                                };
+                                // 重读期间标签可能切走/变脏/换路径 → 守卫
+                                if tab.dirty || tab.path.to_string_lossy() != path {
+                                    return false;
+                                }
+                                let editor = tab.editor.clone();
+                                if editor.read(cx).value().to_string() == disk {
+                                    return false; // 内容没变 → 不重置光标
+                                }
+                                // 只对活动标签恢复光标:set_cursor_position 末尾会聚焦,
+                                // 对后台标签调用会把焦点偷到看不见的编辑器上(键入跑错地方)。
+                                let is_active = this.active_tab == Some(ix);
+                                let pos = editor.read(cx).cursor_position();
+                                editor.update(cx, |state, cx| {
+                                    state.set_value(disk.clone(), window, cx);
+                                    if is_active {
+                                        state.set_cursor_position(pos, window, cx);
+                                    }
+                                });
+                                cx.notify();
+                                true
+                            })
+                            .unwrap_or(false)
+                        }
+                    })
+                    .unwrap_or(false);
+                // 重载了才告诉 jdtls 新内容(set_value 不发 didChange)
+                if reloaded && is_java {
+                    let _ = nib_core::lsp::lsp_did_change(path, disk, &lsp).await;
+                }
             })
             .detach();
         }
@@ -1474,6 +1579,8 @@ impl Workbench {
                 if this.md_preview {
                     cx.notify();
                 }
+                // 实时诊断:防抖后把改动发给 jdtls,边敲边报错(不必等保存)
+                this.schedule_did_change(editor_for_sub.clone(), cx);
             }
         });
         let title: SharedString = path
