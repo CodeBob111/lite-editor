@@ -63,6 +63,10 @@ pub fn run_git_with_timeout_raw(
             "GIT_SSH_COMMAND",
             "ssh -o ConnectTimeout=10 -o BatchMode=yes",
         )
+        // HTTPS 也要快速失败:GIT_SSH_COMMAND 的 ConnectTimeout 只管 SSH,HTTPS 走 libcurl。
+        // 低速阈值(<1KB/s 持续 10s 即中止)让卡住的 HTTPS 连接 ~10s 失败,而不是干等整体超时。
+        .env("GIT_HTTP_LOW_SPEED_LIMIT", "1000")
+        .env("GIT_HTTP_LOW_SPEED_TIME", "10")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

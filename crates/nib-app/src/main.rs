@@ -382,6 +382,8 @@ struct Workbench {
     last_mouse: Point<Pixels>,
     /// 编辑防抖序号:每次击键 +1,延迟后只有序号未变才发 didChange(实时诊断)。
     lsp_change_seq: u64,
+    /// Markdown 预览防抖序号:每次击键 +1,输入停 150ms 才刷新预览(避免每键重渲染重解析)。
+    md_seq: u64,
 }
 
 /// 欢迎页「最近项目」一行的展示数据(路径 + 派生的名称/缩写/类型标签/首字母色)。
@@ -559,6 +561,7 @@ impl Workbench {
             prev_modifiers: Modifiers::default(),
             last_mouse: Point::default(),
             lsp_change_seq: 0,
+            md_seq: 0,
         };
         let lsp_for_quit = this.lsp.clone();
         cx.on_app_quit(move |_, _| {
@@ -898,6 +901,24 @@ impl Workbench {
             if let Some(content) = content {
                 let _ = nib_core::lsp::lsp_did_change(path, content, &lsp).await;
             }
+        })
+        .detach();
+    }
+
+    /// Markdown 预览防抖刷新:输入停 150ms 后才 cx.notify 一次(让预览栏重渲染拿最新文本),
+    /// 避免每次击键都整窗重渲染 + 重读全文 + 重建 TextView。
+    fn schedule_md_refresh(&mut self, cx: &mut Context<Self>) {
+        self.md_seq += 1;
+        let seq = self.md_seq;
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.md_seq == seq && this.md_preview {
+                    cx.notify();
+                }
+            });
         })
         .detach();
     }
@@ -1519,7 +1540,9 @@ impl Workbench {
                             );
                             let _ = tx.send(line);
                         }
-                        cx.notify();
+                        // 不在此 cx.notify():检测到停顿立即触发全窗重绘 → Markdown 重解析/
+                        // 文本重排 → 更卡的正反馈环(这正是长卡顿放大的源头)。stall_count 让它
+                        // 在下一次自然渲染时更新即可,哨兵只负责记录、绝不自造重绘。
                     }
                     last = now;
                 });
@@ -1576,8 +1599,10 @@ impl Workbench {
                         cx.notify();
                     }
                 }
+                // Markdown 预览防抖刷新:每键都 cx.notify 会让 Workbench 整窗重渲染 + 重读
+                // 编辑器全文 + 重建 TextView,输入停 150ms 才刷一次(编辑器自身仍实时更新)。
                 if this.md_preview {
-                    cx.notify();
+                    this.schedule_md_refresh(cx);
                 }
                 // 实时诊断:防抖后把改动发给 jdtls,边敲边报错(不必等保存)
                 this.schedule_did_change(editor_for_sub.clone(), cx);

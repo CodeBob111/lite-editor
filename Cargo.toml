@@ -11,3 +11,4 @@ rust-version = "1.85"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+strip = true        # 裁掉符号:二进制从 ~57MB 显著瘦身,降低安装体积
