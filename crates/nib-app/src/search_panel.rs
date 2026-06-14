@@ -14,6 +14,8 @@ use gpui_component::{
 };
 use nib_core::search::SearchResult;
 
+use crate::preview::{line_text, PreviewDoc};
+
 const MAX_SHOWN: usize = 100;
 
 pub enum SearchEvent {
@@ -32,10 +34,10 @@ pub struct SearchPanel {
     searching: bool,
     /// 查询序号守卫:只接受最新一次查询的结果
     query_seq: u64,
-    /// 选中结果所在文件的**全部**行(虚拟列表渲染,可滑全文件)。
-    preview_lines: Arc<Vec<String>>,
-    /// 命中行(0-based),高亮 + 初始滚到此处。
-    preview_match: usize,
+    /// 选中结果所在文件的预览(异步读盘 + 行偏移切片)。
+    preview: Option<PreviewDoc>,
+    /// 预览读盘防抖序号:连续切选区只让最后一次的异步读应用。
+    preview_seq: u64,
     preview_scroll: UniformListScrollHandle,
     _subscription: Subscription,
 }
@@ -61,28 +63,48 @@ impl SearchPanel {
             selected: 0,
             searching: false,
             query_seq: 0,
-            preview_lines: Arc::new(Vec::new()),
-            preview_match: 0,
+            preview: None,
+            preview_seq: 0,
             preview_scroll: UniformListScrollHandle::default(),
             _subscription: subscription,
         }
     }
 
-    /// 读选中结果所在文件全文做预览,并把滚动定位到命中行居中。
-    fn load_preview(&mut self) {
-        self.preview_lines = Arc::new(Vec::new());
-        self.preview_match = 0;
+    /// 异步读选中结果所在文件做预览,定位命中行居中。读盘在后台线程(不阻塞 UI);
+    /// 选中项还在同一文件 → 只移命中行不重读;带 seq 防抖,连按方向键只应用最后一次。
+    fn load_preview(&mut self, cx: &mut Context<Self>) {
         let Some(hit) = self.results.get(self.selected) else {
+            self.preview = None;
             return;
         };
-        let Ok(content) = std::fs::read_to_string(&hit.path) else {
-            return;
-        };
-        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-        self.preview_match = (hit.line as usize).min(lines.len().saturating_sub(1));
-        self.preview_lines = Arc::new(lines);
-        self.preview_scroll
-            .scroll_to_item(self.preview_match, ScrollStrategy::Center);
+        let path = hit.path.clone();
+        let match_line = hit.line as usize;
+        if let Some(doc) = &mut self.preview {
+            if doc.path == path {
+                doc.match_line = match_line.min(doc.line_count().saturating_sub(1));
+                self.preview_scroll
+                    .scroll_to_item(doc.match_line, ScrollStrategy::Center);
+                return;
+            }
+        }
+        self.preview_seq += 1;
+        let seq = self.preview_seq;
+        cx.spawn(async move |weak, cx| {
+            let content = nib_core::fs::read_file(path.clone()).await.ok();
+            let _ = weak.update(cx, |this, cx| {
+                if this.preview_seq != seq {
+                    return;
+                }
+                this.preview = content.map(|c| {
+                    let doc = PreviewDoc::new(path, c, match_line);
+                    this.preview_scroll
+                        .scroll_to_item(doc.match_line, ScrollStrategy::Center);
+                    doc
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -117,7 +139,7 @@ impl SearchPanel {
                 }
                 this.results = Arc::new(result.unwrap_or_default());
                 this.selected = 0;
-                this.load_preview();
+                this.load_preview(cx);
                 this.searching = false;
                 cx.notify();
             });
@@ -132,7 +154,7 @@ impl SearchPanel {
         }
         let next = (self.selected as i32 + delta).rem_euclid(len);
         self.selected = next as usize;
-        self.load_preview();
+        self.load_preview(cx);
         cx.notify();
     }
 
@@ -207,11 +229,19 @@ impl Render for SearchPanel {
             })
             .collect();
 
-        // 下半:选中结果所在文件的代码预览(虚拟列表,可滑全文件,命中行高亮)
-        let lines = self.preview_lines.clone();
-        let match_ix = self.preview_match;
-        let has_preview = !lines.is_empty();
-        let preview = uniform_list("search-preview", lines.len(), move |range, _, cx| {
+        // 下半:选中结果所在文件的代码预览(虚拟列表,可滑全文件,命中行高亮)。
+        // 捕获两个 Arc(克隆廉价),只对可见行切片取文本,不碰全文、不建 Vec<String>。
+        let (content, line_starts, match_ix, count) = match &self.preview {
+            Some(d) => (
+                d.content.clone(),
+                d.line_starts.clone(),
+                d.match_line,
+                d.line_count(),
+            ),
+            None => (Arc::new(String::new()), Arc::new(vec![]), 0, 0),
+        };
+        let has_preview = count > 0;
+        let preview = uniform_list("search-preview", count, move |range, _, cx| {
             let mono = cx.theme().mono_font_family.clone();
             let muted = cx.theme().muted_foreground;
             let hit_bg = cx.theme().info.opacity(0.14);
@@ -238,7 +268,7 @@ impl Render for SearchPanel {
                                 .min_w_0()
                                 .overflow_hidden()
                                 .whitespace_nowrap()
-                                .child(SharedString::from(lines[i].clone())),
+                                .child(SharedString::from(line_text(&content, &line_starts, i))),
                         )
                 })
                 .collect::<Vec<_>>()

@@ -2,12 +2,12 @@
 // 下半 = 选中项所在文件的代码预览(虚拟列表,可滑动整个文件,命中行高亮、初始居中)。
 // ↑↓ 选择 / Enter / 点击跳转,Esc 关闭。
 
-use std::sync::Arc;
-
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{h_flex, v_flex, ActiveTheme};
 use nib_core::lsp::LspUsage;
+
+use crate::preview::{line_text, PreviewDoc};
 
 pub enum UsagesEvent {
     /// 跳到某处引用。uri 可能是 file://(项目文件)或 jdt://(库类内引用),
@@ -32,48 +32,69 @@ pub struct UsagesView {
     symbol_file: String,
     usages: Vec<LspUsage>,
     selected: usize,
-    /// 选中引用所在文件的**全部**行(虚拟列表渲染,可滑全文件)。jdt:// 引用无本地文件 → 空。
-    preview_lines: Arc<Vec<String>>,
-    /// 命中行(0-based)在 preview_lines 里的下标,高亮 + 初始滚到此处。
-    preview_match: usize,
+    /// 选中引用所在文件的预览(异步读盘 + 行偏移切片;jdt:// 引用无本地文件 → None)。
+    preview: Option<PreviewDoc>,
+    /// 预览读盘防抖序号:连续切选区只让最后一次的异步读应用。
+    preview_seq: u64,
     preview_scroll: UniformListScrollHandle,
 }
 
 impl EventEmitter<UsagesEvent> for UsagesView {}
 
 impl UsagesView {
-    pub fn new(symbol_file: String, usages: Vec<LspUsage>) -> Self {
+    pub fn new(symbol_file: String, usages: Vec<LspUsage>, cx: &mut Context<Self>) -> Self {
         let mut this = Self {
             symbol_file,
             usages,
             selected: 0,
-            preview_lines: Arc::new(Vec::new()),
-            preview_match: 0,
+            preview: None,
+            preview_seq: 0,
             preview_scroll: UniformListScrollHandle::default(),
         };
-        this.load_preview();
+        this.load_preview(cx);
         this
     }
 
-    /// 读选中引用所在文件全文做预览,并把滚动定位到命中行居中。jdt:// 引用无本地文件 → 不预览。
-    fn load_preview(&mut self) {
-        self.preview_lines = Arc::new(Vec::new());
-        self.preview_match = 0;
+    /// 异步读选中引用所在文件做预览,定位命中行居中。读盘在后台线程(不阻塞 UI);
+    /// 选中项还在同一文件 → 只移命中行不重读;带 seq 防抖,连按方向键只应用最后一次。
+    fn load_preview(&mut self, cx: &mut Context<Self>) {
         let Some(u) = self.usages.get(self.selected) else {
+            self.preview = None;
             return;
         };
         if !u.uri.starts_with("file://") {
+            self.preview = None; // jdt:// 库引用无本地文件
             return;
         }
         let path = nib_core::lsp::path_from_file_uri(&u.uri);
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            return;
-        };
-        let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-        self.preview_match = (u.line as usize).min(lines.len().saturating_sub(1));
-        self.preview_lines = Arc::new(lines);
-        self.preview_scroll
-            .scroll_to_item(self.preview_match, ScrollStrategy::Center);
+        let match_line = u.line as usize;
+        // 同文件:只改命中行 + 重新居中,不重读
+        if let Some(doc) = &mut self.preview {
+            if doc.path == path {
+                doc.match_line = match_line.min(doc.line_count().saturating_sub(1));
+                self.preview_scroll
+                    .scroll_to_item(doc.match_line, ScrollStrategy::Center);
+                return;
+            }
+        }
+        self.preview_seq += 1;
+        let seq = self.preview_seq;
+        cx.spawn(async move |weak, cx| {
+            let content = nib_core::fs::read_file(path.clone()).await.ok();
+            let _ = weak.update(cx, |this, cx| {
+                if this.preview_seq != seq {
+                    return; // 期间又切了选区 → 放弃本次
+                }
+                this.preview = content.map(|c| {
+                    let doc = PreviewDoc::new(path, c, match_line);
+                    this.preview_scroll
+                        .scroll_to_item(doc.match_line, ScrollStrategy::Center);
+                    doc
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub fn move_selection(&mut self, delta: i32, cx: &mut Context<Self>) {
@@ -82,7 +103,7 @@ impl UsagesView {
         }
         let len = self.usages.len() as i32;
         self.selected = ((self.selected as i32 + delta).rem_euclid(len)) as usize;
-        self.load_preview();
+        self.load_preview(cx);
         cx.notify();
     }
 
@@ -153,11 +174,19 @@ impl Render for UsagesView {
             })
             .collect();
 
-        // 下半:选中引用所在文件的代码预览(虚拟列表,可滑全文件,命中行高亮)
-        let lines = self.preview_lines.clone();
-        let match_ix = self.preview_match;
-        let has_preview = !lines.is_empty();
-        let preview = uniform_list("usages-preview", lines.len(), move |range, _, cx| {
+        // 下半:选中引用所在文件的代码预览(虚拟列表,可滑全文件,命中行高亮)。
+        // 捕获 content/line_starts 两个 Arc(克隆廉价),只对可见行切片取文本,不碰全文。
+        let (content, line_starts, match_ix, count) = match &self.preview {
+            Some(d) => (
+                d.content.clone(),
+                d.line_starts.clone(),
+                d.match_line,
+                d.line_count(),
+            ),
+            None => (std::sync::Arc::new(String::new()), std::sync::Arc::new(vec![]), 0, 0),
+        };
+        let has_preview = count > 0;
+        let preview = uniform_list("usages-preview", count, move |range, _, cx| {
             let mono = cx.theme().mono_font_family.clone();
             let muted = cx.theme().muted_foreground;
             let hit_bg = cx.theme().info.opacity(0.14);
@@ -184,7 +213,7 @@ impl Render for UsagesView {
                                 .min_w_0()
                                 .overflow_hidden()
                                 .whitespace_nowrap()
-                                .child(SharedString::from(lines[i].clone())),
+                                .child(SharedString::from(line_text(&content, &line_starts, i))),
                         )
                 })
                 .collect::<Vec<_>>()

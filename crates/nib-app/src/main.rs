@@ -9,6 +9,7 @@ mod arthas_panel;
 mod git_panel;
 mod maven_panel;
 mod merge_view;
+mod preview;
 mod recents_view;
 mod settings_view;
 mod terminal_panel;
@@ -2240,7 +2241,7 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         self.status = format!("{} 处引用", usages.len()).into();
-        let view = cx.new(|_| UsagesView::new(title, usages));
+        let view = cx.new(|cx| UsagesView::new(title, usages, cx));
         let sub = cx.subscribe_in(
             &view,
             window,
