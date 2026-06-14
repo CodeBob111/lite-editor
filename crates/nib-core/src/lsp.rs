@@ -854,6 +854,7 @@ pub async fn lsp_workspace_symbol_definition(
 /// 即可答 definition/references,无需 didOpen)发给**活动项目**的 jdtls。临时文件不被 jdtls
 /// 跟踪(临时路径),但其内容 = classFileContents 原文,位置与 jdt:// 文档 1:1。
 /// local_file 仅用于 snap 列。
+#[allow(clippy::too_many_arguments)] // jdt:// 请求需要的上下文就是这么多;拆 struct 反而更绕
 async fn lsp_request_at_jdt_uri(
     method: &'static str,
     with_decl: bool,
@@ -1167,7 +1168,7 @@ fn text_fallback_definition_blocking(
         let l = find_method_line(target, &word).unwrap_or(1);
         dbg_log(&format!("[fallback] ✓ {type_name}.{word} → {target}:{l}"));
         return Some(LspUsage {
-            uri: file_uri(&target),
+            uri: file_uri(target),
             line: (l.saturating_sub(1)) as u32,
             character: 0,
             text: String::new(),
@@ -1187,7 +1188,7 @@ fn text_fallback_definition_blocking(
         };
         dbg_log(&format!("[fallback] ✓ 类型 {word} → {target}"));
         Some(LspUsage {
-            uri: file_uri(&target),
+            uri: file_uri(target),
             line: 0,
             character: 0,
             text: String::new(),
@@ -1199,7 +1200,7 @@ fn text_fallback_definition_blocking(
         };
         dbg_log(&format!("[fallback] ✓ 同文件方法 {word} → 行 {l}"));
         Some(LspUsage {
-            uri: file_uri(&file_path),
+            uri: file_uri(file_path),
             line: l,
             character: 0,
             text: String::new(),

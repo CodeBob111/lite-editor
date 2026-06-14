@@ -223,6 +223,10 @@ struct OpenTab {
     /// 上次应用的 LSP 诊断签名:jdtls 对同一文件常重复推送相同诊断,
     /// 签名不变就跳过 set.reset+重渲染,避免空闲期每秒重复整屏重绘
     diag_sig: u64,
+    /// 本标签**独立**的 didChange 防抖序号。曾用全局单计数器:400ms 内先敲 A 再敲 B
+    /// 会把 A 的 didChange 取消(B 的 +seq 顶掉了 A 的 seq),导致 A 的诊断不刷新。
+    /// 每标签各持各的序号后,跨标签编辑互不取消。
+    lsp_change_seq: u64,
 }
 
 /// 导航历史一个落点(文件 + 0-based 行)。cmd+[ 后退 / cmd+] 前进(IDEA 式)。
@@ -396,8 +400,6 @@ struct Workbench {
     prev_modifiers: Modifiers,
     /// 最近一次鼠标按下的位置(窗口坐标),供引用列表浮层锚到鼠标附近弹出。
     last_mouse: Point<Pixels>,
-    /// 编辑防抖序号:每次击键 +1,延迟后只有序号未变才发 didChange(实时诊断)。
-    lsp_change_seq: u64,
     /// Markdown 预览防抖序号:每次击键 +1,输入停 150ms 才刷新预览(避免每键重渲染重解析)。
     md_seq: u64,
     /// 上一次 Workbench::render 构建元素树的耗时(微秒),由 RenderTimer 守卫在 render 末尾写入,
@@ -508,7 +510,7 @@ impl Workbench {
             },
         );
 
-        Self::start_stall_sentinel(cx);
+        Self::start_stall_sentinel(window.window_handle(), cx);
 
         // 空窗口也要有焦点锚点,否则 Cmd+P/双击Shift 的按键分发没有落点
         let focus_handle = cx.focus_handle();
@@ -581,7 +583,6 @@ impl Workbench {
             last_shift: None,
             prev_modifiers: Modifiers::default(),
             last_mouse: Point::default(),
-            lsp_change_seq: 0,
             md_seq: 0,
             render_us: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
@@ -852,61 +853,27 @@ impl Workbench {
         // 磁盘文件被外部改动 → 只重载本次突发里实际变更、且正打开的标签(定向,不再把所有
         // 已打开文件全读一遍)。git checkout / 另一编辑器 / 格式化工具改盘都走这。
         let changed: std::collections::HashSet<String> = paths.into_iter().collect();
+        // 唯一的外部重载路径:只读本次实际变更、且正打开、非脏的标签(含光标恢复 + jdtls
+        // didChange)。早先这里还跟着一段无差别 `for tab in &self.tabs` 全量读盘的旧实现,
+        // 与本调用重复且每次文件变更都把所有打开文件读一遍 —— 即「全标签重复读盘」,已删。
         self.reload_open_tabs_from_disk(&changed, cx);
         let _ = window;
-        for tab in &self.tabs {
-            if tab.dirty {
-                continue; // 本地有未保存编辑,绝不覆盖
-            }
-            let path = tab.path.clone();
-            let editor = tab.editor.clone();
-            let window_handle = self.window_handle;
-            cx.spawn(async move |weak, cx| {
-                let Ok(disk) = nib_core::fs::read_file(path.to_string_lossy().to_string()).await
-                else {
-                    return;
-                };
-                let _ = cx.update_window(window_handle, |_, window, cx| {
-                    let _ = weak.update(cx, |this: &mut Workbench, cx| {
-                        // 陈旧守卫:标签还在、仍非脏、内容确实变了才回灌
-                        let still = this
-                            .tabs
-                            .iter()
-                            .any(|t| t.path == path && !t.dirty && t.editor == editor);
-                        if !still {
-                            return;
-                        }
-                        let changed = editor.read(cx).value().as_ref() != disk.as_str();
-                        if changed {
-                            editor.update(cx, |state, cx| {
-                                state.set_value(disk.clone(), window, cx);
-                            });
-                            // set_value 会触发 Change 订阅误标脏,这里立刻洗掉
-                            if let Some(tab) = this.tabs.iter_mut().find(|t| t.path == path) {
-                                tab.dirty = false;
-                            }
-                            cx.notify();
-                        }
-                    });
-                });
-            })
-            .detach();
-        }
     }
 
     /// 编辑后防抖发 didChange,让 jdtls 重新分析 → publishDiagnostics → 边敲边报错。
     /// 仅 java 工程内文件;每次击键 +seq 重置防抖,~400ms 静默后只有 seq 未变才发,
     /// 避免每键都把整份文件写给 jdtls。
     fn schedule_did_change(&mut self, editor: Entity<InputState>, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.iter().find(|t| t.editor == editor) else {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.editor == editor) else {
             return;
         };
         if tab.lang != "java" || !tab.path.starts_with(&self.project_root) {
             return;
         }
         let path = tab.path.to_string_lossy().to_string();
-        self.lsp_change_seq += 1;
-        let seq = self.lsp_change_seq;
+        // 用本标签自己的序号:跨标签编辑不再互相取消对方的 didChange
+        tab.lsp_change_seq += 1;
+        let seq = tab.lsp_change_seq;
         let lsp = self.lsp.clone();
         cx.spawn(async move |weak, cx| {
             cx.background_executor()
@@ -914,13 +881,11 @@ impl Workbench {
                 .await;
             let content = weak
                 .update(cx, |this, cx| {
-                    if this.lsp_change_seq != seq {
-                        return None; // 期间又敲了 → 放弃,让最后一次发
+                    let tab = this.tabs.iter().find(|t| t.path.to_string_lossy() == path)?;
+                    if tab.lsp_change_seq != seq {
+                        return None; // 期间这个标签又敲了 → 放弃,让最后一次发
                     }
-                    this.tabs
-                        .iter()
-                        .find(|t| t.path.to_string_lossy() == path)
-                        .map(|t| t.editor.read(cx).value().to_string())
+                    Some(tab.editor.read(cx).value().to_string())
                 })
                 .ok()
                 .flatten();
@@ -1509,7 +1474,7 @@ impl Workbench {
     /// 一次可感知停顿。除 stderr + 状态栏计数外,把当时的操作面包屑落盘 jank.log 供事后分析:
     /// 哨兵心跳排在被阻塞的主线程队列里,跑到时 last_op 正指向那个操作,op_age≈drift 即元凶。
     /// 只记原始信号(drift/op/op_age/ts),归因留到分析时,省阈值调参。
-    fn start_stall_sentinel(cx: &mut Context<Self>) {
+    fn start_stall_sentinel(window_handle: AnyWindowHandle, cx: &mut Context<Self>) {
         // 日志写入口:独立线程串行 append,主线程只 send 一行(O(1)),绝不让日志器自造卡顿
         // (gpui foreground task 的 await 续体仍在主线程,同步 fs 写会卡→写→更卡的正反馈)
         let log_path = session::data_dirs().app_data.join("jank.log");
@@ -1538,10 +1503,15 @@ impl Workbench {
             let mut last_log: Option<Instant> = None;
             loop {
                 cx.background_executor().timer(BEAT).await;
+                // 窗口在后台时 macOS 会节流事件循环/定时器,心跳必然迟到 → 误判为主线程卡顿
+                // (实测后台 79/81 条全是误报)。后台只更新基线、不记录;唯前台才统计真实停顿。
+                let active = cx
+                    .update_window(window_handle, |_, window, _| window.is_window_active())
+                    .unwrap_or(false);
                 let alive = this.update(cx, |this, cx| {
                     let now = Instant::now();
                     let drift = now.duration_since(last).saturating_sub(BEAT);
-                    if drift > BUDGET {
+                    if active && drift > BUDGET {
                         this.stall_count += 1;
                         eprintln!(
                             "[nib-sentinel] 主线程停顿 ~{}ms(第 {} 次)",
@@ -1739,6 +1709,7 @@ impl Workbench {
             _change_sub: change_sub,
             _observe_sub: observe_sub,
             diag_sig: 0,
+            lsp_change_seq: 0,
         });
         self.tabs.len() - 1
     }
