@@ -253,6 +253,8 @@ impl TerminalSession {
     }
 
     /// 拉当前视口:逐行把同样式格子合并成 run。锁内只做拷贝,不做布局。
+    /// 取可见网格快照。term 是 FairMutex(公平锁,主线程不会被 PTY 线程饿死,等待有界),
+    /// 配合 16ms 拉取节流,主线程等锁开销已可控。
     pub fn snapshot(&self) -> TermSnapshot {
         let term = self.term.lock();
         let content = term.renderable_content();

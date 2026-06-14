@@ -18,19 +18,30 @@ use nucleo_matcher::{Config, Matcher};
 
 const MAX_RESULTS: usize = 60;
 
+/// 绝对路径 → 项目相对路径(去根前缀 + 前导 /)。预计算一次,不在每次击键里重复生成。
+fn rel_of(root: &str, abs: &str) -> String {
+    abs.strip_prefix(root)
+        .map(|s| s.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| abs.to_string())
+}
+
 pub enum QuickOpenEvent {
     Open(PathBuf),
 }
 
 pub struct QuickOpen {
     input: Entity<InputState>,
-    project_root: PathBuf,
     /// 绝对路径全量清单(Workbench 预载)
     files: Arc<Vec<String>>,
+    /// 与 files 等长、一一对应的相对路径,**开面板时预计算一次**——避免每次击键对全部文件
+    /// 重复生成相对路径 String(原实现的逐键堆分配)。
+    rels: Arc<Vec<String>>,
     /// 命中的 files 下标,按 nucleo 得分降序
     matches: Vec<usize>,
     selected: usize,
     matcher: Matcher,
+    /// 输入防抖序号:连续击键只让最后一次过滤生效。
+    filter_seq: u64,
     _subscription: Subscription,
 }
 
@@ -46,19 +57,24 @@ impl QuickOpen {
         let input = cx.new(|cx| InputState::new(window, cx).placeholder("输入文件名(模糊匹配)…"));
         let subscription = cx.subscribe(&input, |this: &mut Self, _, event: &InputEvent, cx| {
             match event {
-                InputEvent::Change => this.refilter(cx),
+                InputEvent::Change => this.schedule_refilter(cx),
                 InputEvent::PressEnter { .. } => this.confirm(cx),
                 _ => {}
             }
         });
 
+        let root = project_root.to_string_lossy();
+        let rels: Vec<String> = files.iter().map(|p| rel_of(&root, p)).collect();
+        drop(root);
+
         let mut this = Self {
             input,
-            project_root,
             files,
+            rels: Arc::new(rels),
             matches: Vec::new(),
             selected: 0,
             matcher: Matcher::new(Config::DEFAULT.match_paths()),
+            filter_seq: 0,
             _subscription: subscription,
         };
         this.refilter(cx);
@@ -70,34 +86,52 @@ impl QuickOpen {
         window.focus(&handle, cx);
     }
 
-    fn rel(&self, abs: &str) -> String {
-        let root = self.project_root.to_string_lossy();
-        abs.strip_prefix(root.as_ref())
-            .map(|s| s.trim_start_matches('/').to_string())
-            .unwrap_or_else(|| abs.to_string())
+    /// 输入防抖:连续击键 +seq,~40ms 静默后只有 seq 未变才真正过滤(大项目逐键全量匹配很贵)。
+    fn schedule_refilter(&mut self, cx: &mut Context<Self>) {
+        self.filter_seq += 1;
+        let seq = self.filter_seq;
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(40))
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.filter_seq == seq {
+                    this.refilter(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     fn refilter(&mut self, cx: &mut Context<Self>) {
         let query = self.input.read(cx).value().to_string();
         if query.trim().is_empty() {
-            // 空查询:按路径长度给一批浅层文件,够看即可
+            // 空查询:取最浅的一批文件。用 select_nth 部分选择 + 只排前 K,不全排序所有文件。
+            let rels = self.rels.clone();
             let mut ixs: Vec<usize> = (0..self.files.len()).collect();
-            ixs.sort_by_key(|&i| self.files[i].len());
-            ixs.truncate(MAX_RESULTS);
+            if ixs.len() > MAX_RESULTS {
+                ixs.select_nth_unstable_by_key(MAX_RESULTS - 1, |&i| rels[i].len());
+                ixs.truncate(MAX_RESULTS);
+            }
+            ixs.sort_by_key(|&i| rels[i].len());
             self.matches = ixs;
         } else {
             let pattern = Pattern::parse(&query, CaseMatching::Smart, Normalization::Smart);
             let mut scored: Vec<(u32, usize)> = Vec::new();
             let mut buf = Vec::new();
-            for (ix, path) in self.files.iter().enumerate() {
-                let rel = self.rel(path);
-                let haystack = nucleo_matcher::Utf32Str::new(&rel, &mut buf);
+            // 用预计算的 rels,不在循环里重复生成相对路径
+            for (ix, rel) in self.rels.iter().enumerate() {
+                let haystack = nucleo_matcher::Utf32Str::new(rel, &mut buf);
                 if let Some(score) = pattern.score(haystack, &mut self.matcher) {
                     scored.push((score, ix));
                 }
             }
+            // Top-K:部分选择出得分最高的 MAX_RESULTS 个,只排这 K 个,不对全部命中全排序
+            if scored.len() > MAX_RESULTS {
+                scored.select_nth_unstable_by(MAX_RESULTS - 1, |a, b| b.0.cmp(&a.0));
+                scored.truncate(MAX_RESULTS);
+            }
             scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
-            scored.truncate(MAX_RESULTS);
             self.matches = scored.into_iter().map(|(_, ix)| ix).collect();
         }
         self.selected = 0;
@@ -133,7 +167,7 @@ impl Render for QuickOpen {
             .iter()
             .enumerate()
             .map(|(row, &file_ix)| {
-                let rel = self.rel(&self.files[file_ix]);
+                let rel = self.rels[file_ix].clone();
                 let (dir, name) = match rel.rsplit_once('/') {
                     Some((d, n)) => (Some(d.to_string()), n.to_string()),
                     None => (None, rel.clone()),

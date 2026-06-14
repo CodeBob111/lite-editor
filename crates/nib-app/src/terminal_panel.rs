@@ -212,9 +212,11 @@ impl TerminalPanel {
                         }) else {
                             break; // 面板已销毁,任务退出
                         };
-                        // 8ms 节流:大量输出时合帧,不按 PTY chunk 频率刷
+                        // 16ms 节流(~60FPS):大量输出时合帧,不按 PTY chunk 频率刷。
+                        // 原 8ms=125FPS 过高,每帧都在主线程锁终端+遍历网格+重建字符串,
+                        // 是「终端输出」类卡顿来源;60FPS 对终端足够顺滑且开销减半。
                         cx.background_executor()
-                            .timer(std::time::Duration::from_millis(8))
+                            .timer(std::time::Duration::from_millis(16))
                             .await;
                     }
                 })
