@@ -809,6 +809,7 @@ impl Workbench {
         let nib_core::CoreEvent::FileChanged {
             project,
             has_structural,
+            paths,
         } = event
         else {
             return;
@@ -826,8 +827,10 @@ impl Workbench {
         }
         self.git_panel.update(cx, |panel, cx| panel.refresh(cx));
         self.refresh_git_marks(cx);
-        // 磁盘文件被外部改动(git checkout / 另一编辑器 / 格式化工具)→ 重载已开标签显示最新
-        self.reload_open_tabs_from_disk(cx);
+        // 磁盘文件被外部改动 → 只重载本次突发里实际变更、且正打开的标签(定向,不再把所有
+        // 已打开文件全读一遍)。git checkout / 另一编辑器 / 格式化工具改盘都走这。
+        let changed: std::collections::HashSet<String> = paths.into_iter().collect();
+        self.reload_open_tabs_from_disk(&changed, cx);
         let _ = window;
         for tab in &self.tabs {
             if tab.dirty {
@@ -924,9 +927,14 @@ impl Workbench {
         .detach();
     }
 
-    /// 磁盘文件被外部改动 → 重载未保存改动的标签(脏标签跳过,避免覆盖编辑),保留光标。
-    /// set_value 内部 emit_events=false,不会误标脏;内容没变就不重设(常见:本应用刚保存)。
-    fn reload_open_tabs_from_disk(&mut self, cx: &mut Context<Self>) {
+    /// 磁盘文件被外部改动 → 只重载**本次突发实际变更**且正打开、未保存改动的标签(脏标签
+    /// 跳过避免覆盖编辑),保留光标。set_value 内部 emit_events=false 不会误标脏;内容没变
+    /// 就不重设(常见:本应用刚保存)。changed 为空 = 没有命中已打开文件,直接返回。
+    fn reload_open_tabs_from_disk(
+        &mut self,
+        changed: &std::collections::HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
         let window_handle = self.window_handle;
         let targets: Vec<(usize, String, bool)> = self
             .tabs
@@ -937,7 +945,11 @@ impl Workbench {
                 let java = t.lang == "java" && t.path.starts_with(&self.project_root);
                 (i, t.path.to_string_lossy().to_string(), java)
             })
+            .filter(|(_, path, _)| changed.contains(path))
             .collect();
+        if targets.is_empty() {
+            return;
+        }
         for (ix, path, is_java) in targets {
             let lsp = self.lsp.clone();
             cx.spawn(async move |weak, cx| {

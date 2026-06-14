@@ -10,6 +10,9 @@ pub enum CoreEvent {
     FileChanged {
         project: String,
         has_structural: bool,
+        /// 本次(已防抖合并的)突发里实际变更的文件绝对路径,供宿主只刷受影响的标签,
+        /// 不必把所有已打开文件全读一遍。
+        paths: Vec<String>,
     },
     /// 原样转发 LSP textDocument/publishDiagnostics 的 params
     LspDiagnostics(serde_json::Value),
