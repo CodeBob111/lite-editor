@@ -6,7 +6,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::events::{CoreEvent, EventSink};
 
@@ -50,6 +50,10 @@ pub struct LspState {
     /// 串行化 start_lsp 全程(检查→慢启动→插入):没有它,并发打开两个
     /// Java 文件会双开 jdtls,第二个 insert 覆盖第一个 → 进程孤儿化
     start_lock: tokio::sync::Mutex<()>,
+    /// 启动失败退避:(lang, root) → 上次失败时刻。某项目 jdtls 启动失败后,FAIL_BACKOFF
+    /// 窗口内的后续 start_lsp 直接返回 Err 不重试——否则恢复会话时 N 个 Java 标签各触发
+    /// 一次 ~120s 启动、经 start_lock 串行叠成 N×120s(实测 4 标签 8 分钟全失败、无进程)。
+    failed: Mutex<HashMap<(String, String), Instant>>,
 }
 
 impl LspState {
@@ -105,6 +109,22 @@ pub async fn start_lsp(
     let key = (language.clone(), root_path.clone());
     let _start_guard = state.start_lock.lock().await;
 
+    // 失败退避:上次启动失败且仍在窗口内 → 立即返回,不再起一次 ~120s 的 jdtls。
+    // 过了窗口则清掉记录、允许重试(用户重开项目/标签即自然触发)。
+    const FAIL_BACKOFF: Duration = Duration::from_secs(60);
+    {
+        let mut failed = state.failed.lock().map_err(|e| e.to_string())?;
+        if let Some(at) = failed.get(&key) {
+            if at.elapsed() < FAIL_BACKOFF {
+                return Err(format!(
+                    "jdtls 上次启动失败,{}s 内不重试(避免每标签重复 120s 启动)",
+                    FAIL_BACKOFF.as_secs()
+                ));
+            }
+            failed.remove(&key);
+        }
+    }
+
     {
         let mut servers = state.servers.lock().map_err(|e| e.to_string())?;
 
@@ -120,12 +140,27 @@ pub async fn start_lsp(
 
     let lang = language.clone();
     let rp = root_path.clone();
-    let server = crate::rt::spawn_blocking(move || {
+    let result = crate::rt::spawn_blocking(move || {
         start_lsp_blocking(lang, rp, events, jdtls_root, maven_user_settings)
     })
     .await
-    .map_err(|e| format!("Task failed: {}", e))??;
+    .map_err(|e| format!("Task failed: {}", e))?;
 
+    let server = match result {
+        Ok(server) => server,
+        Err(e) => {
+            // 记下失败时刻,让同项目其余标签在退避窗口内直接返回、不再各自重试 120s。
+            if let Ok(mut failed) = state.failed.lock() {
+                failed.insert(key, Instant::now());
+            }
+            return Err(e);
+        }
+    };
+
+    // 成功 → 清除可能残留的失败记录(过退避窗口后这次成功了的情形)。
+    if let Ok(mut failed) = state.failed.lock() {
+        failed.remove(&key);
+    }
     let mut servers = state.servers.lock().map_err(|e| e.to_string())?;
     servers.insert(key, Arc::new(server));
     Ok(())
@@ -736,20 +771,19 @@ pub async fn lsp_goto_definition(
     character: u32,
     state: &LspState,
 ) -> Result<Option<LspUsage>, String> {
-    dbg_log(&format!("[jdtls-def] 请求 file={file_path} line={line} char={character}"));
     let lang = detect_language(&file_path);
     let server = {
         let servers = state.servers.lock().map_err(|e| e.to_string())?;
-        match find_server_for_file(&servers, &file_path, &lang) {
-            Ok(s) => s,
-            Err(e) => {
-                dbg_log(&format!("[jdtls-def] 没有可用 server: {e}"));
-                return Err(e);
-            }
-        }
+        find_server_for_file(&servers, &file_path, &lang)?
     };
 
-    let character = snap_to_identifier(&file_path, line, character);
+    // snap_to_identifier 要读整份文件 → 放 worker,别在 GPUI 主线程任务里同步读盘。
+    let character = {
+        let fp = file_path.clone();
+        crate::rt::spawn_blocking(move || snap_to_identifier(&fp, line, character))
+            .await
+            .unwrap_or(character)
+    };
     let id = server.next_id.fetch_add(1, Ordering::Relaxed);
     let params = serde_json::json!({
         "textDocument": { "uri": file_uri(&file_path) },
@@ -764,9 +798,6 @@ pub async fn lsp_goto_definition(
         Duration::from_secs(4),
     )
     .await?;
-    dbg_log(&format!(
-        "[jdtls-def] line={line} char={character} 原始响应: {response}"
-    ));
     let locations = parse_locations(response)?;
     Ok(locations.into_iter().next())
 }
@@ -783,8 +814,14 @@ pub async fn lsp_workspace_symbol_definition(
     project_root: String,
     state: &LspState,
 ) -> Result<Option<LspUsage>, String> {
-    // 1. 从临时文件里取点击处的标识符(类名)
-    let content = std::fs::read_to_string(&file_path).map_err(|e| e.to_string())?;
+    // 1. 从临时文件里取点击处的标识符(类名)。读盘放 worker,不在主线程任务里同步读。
+    let content = {
+        let fp = file_path.clone();
+        crate::rt::spawn_blocking(move || std::fs::read_to_string(&fp))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?
+    };
     let line_text = content.lines().nth(line as usize).unwrap_or("");
     let Some((_, word)) = word_and_receiver(line_text, character as usize) else {
         return Ok(None);
@@ -793,9 +830,6 @@ pub async fn lsp_workspace_symbol_definition(
     if !word.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
         return Ok(None);
     }
-    dbg_log(&format!(
-        "[jdtls-sym] 库源码内跳类名 word={word} 经活动项目 {project_root}"
-    ));
     // 2. 活动项目的 jdtls(project_root starts_with project_root 必然成立)
     let server = {
         let servers = state.servers.lock().map_err(|e| e.to_string())?;
@@ -1107,39 +1141,15 @@ pub async fn text_fallback_definition(
     .flatten()
 }
 
-fn dbg_log(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/nib-goto.log")
-    {
-        let _ = writeln!(f, "{msg}");
-    }
-}
-
 fn text_fallback_definition_blocking(
     file_path: &str,
     line: u32,
     character: u32,
     project_files: &[String],
 ) -> Option<LspUsage> {
-    let Ok(content) = std::fs::read_to_string(file_path) else {
-        dbg_log(&format!("[fallback] 读不了文件 {file_path}"));
-        return None;
-    };
-    let Some(line_text) = content.lines().nth(line as usize).map(|s| s.to_string()) else {
-        dbg_log(&format!("[fallback] 没有第 {line} 行"));
-        return None;
-    };
-    let Some((receiver, word)) = word_and_receiver(&line_text, character as usize) else {
-        dbg_log(&format!("[fallback] 光标处取不出标识符 line={line} char={character} 文本=[{line_text}]"));
-        return None;
-    };
-    dbg_log(&format!(
-        "[fallback] line={line} char={character} project_files={} receiver={receiver:?} word={word}",
-        project_files.len()
-    ));
+    let content = std::fs::read_to_string(file_path).ok()?;
+    let line_text = content.lines().nth(line as usize)?.to_string();
+    let (receiver, word) = word_and_receiver(&line_text, character as usize)?;
 
     let uppercase = |s: &str| s.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
 
@@ -1148,25 +1158,12 @@ fn text_fallback_definition_blocking(
         let type_name = if uppercase(recv) {
             recv.clone()
         } else {
-            match resolve_var_type(&content, recv) {
-                Some(t) => t,
-                None => {
-                    dbg_log(&format!("[fallback] 推不出变量 {recv} 的类型"));
-                    return None;
-                }
-            }
+            resolve_var_type(&content, recv)?
         };
-        let Some(fqn) = resolve_fqn(&content, &type_name) else {
-            dbg_log(&format!("[fallback] 解析不出 {type_name} 的 FQN(无 import 且无 package)"));
-            return None;
-        };
+        let fqn = resolve_fqn(&content, &type_name)?;
         let rel = format!("/{}.java", fqn.replace('.', "/"));
-        let Some(target) = project_files.iter().find(|p| p.ends_with(&rel)) else {
-            dbg_log(&format!("[fallback] 工程文件列表里找不到后缀 {rel}(type={type_name} fqn={fqn})"));
-            return None;
-        };
+        let target = project_files.iter().find(|p| p.ends_with(&rel))?;
         let l = find_method_line(target, &word).unwrap_or(1);
-        dbg_log(&format!("[fallback] ✓ {type_name}.{word} → {target}:{l}"));
         return Some(LspUsage {
             uri: file_uri(target),
             line: (l.saturating_sub(1)) as u32,
@@ -1177,16 +1174,9 @@ fn text_fallback_definition_blocking(
 
     // 2) 裸标识符:大写=类型(跳到该类文件首行),小写=同文件方法定义
     if uppercase(&word) {
-        let Some(fqn) = resolve_fqn(&content, &word) else {
-            dbg_log(&format!("[fallback] 裸类型 {word} 解析不出 FQN"));
-            return None;
-        };
+        let fqn = resolve_fqn(&content, &word)?;
         let rel = format!("/{}.java", fqn.replace('.', "/"));
-        let Some(target) = project_files.iter().find(|p| p.ends_with(&rel)) else {
-            dbg_log(&format!("[fallback] 裸类型找不到文件后缀 {rel}"));
-            return None;
-        };
-        dbg_log(&format!("[fallback] ✓ 类型 {word} → {target}"));
+        let target = project_files.iter().find(|p| p.ends_with(&rel))?;
         Some(LspUsage {
             uri: file_uri(target),
             line: 0,
@@ -1194,11 +1184,7 @@ fn text_fallback_definition_blocking(
             text: String::new(),
         })
     } else {
-        let Some(l) = find_method_def_in_content(&content, &word, line as usize) else {
-            dbg_log(&format!("[fallback] 同文件找不到方法 {word} 的定义"));
-            return None;
-        };
-        dbg_log(&format!("[fallback] ✓ 同文件方法 {word} → 行 {l}"));
+        let l = find_method_def_in_content(&content, &word, line as usize)?;
         Some(LspUsage {
             uri: file_uri(file_path),
             line: l,

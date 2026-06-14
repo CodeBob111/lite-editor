@@ -716,9 +716,17 @@ impl Workbench {
         // 解析常需指定 settings.xml/私服;不主动提示用户不知道要去哪配)。
         self.maybe_prompt_maven_config(cx);
 
-        // quick-open 文件清单预载
-        let files_root = root.to_string_lossy().to_string();
-        let guard_root = root;
+        // quick-open / 文本跳转兜底用的文件清单:加载时预载,结构变化时也走同一方法刷新
+        self.refresh_all_files(cx);
+    }
+
+    /// 重建 quick-open 与文本跳转兜底用的全量文件清单。原来只在项目加载时生成一次,
+    /// 新建/删除/重命名文件虽刷新了文件树,却不更新这份清单 → 新文件 quick-open 搜不到、
+    /// 删除的文件仍在清单里。结构变化(has_structural)时调用,与 reload_tree 并列。
+    /// core runtime 上跑 + 陈旧守卫(期间切项目则丢弃)。
+    fn refresh_all_files(&mut self, cx: &mut Context<Self>) {
+        let files_root = self.project_root.to_string_lossy().to_string();
+        let guard_root = self.project_root.clone();
         cx.spawn(async move |weak, cx| {
             if let Ok(mut files) = nib_core::search::list_all_files(files_root).await {
                 files.sort();
@@ -757,7 +765,11 @@ impl Workbench {
         let root_str = self.project_root.to_string_lossy().to_string();
         let guard_root = self.project_root.clone();
         cx.spawn(async move |weak, cx| {
-            let result = nib_core::fs::read_dir_tree(root_str, Some(12)).await;
+            // 深度上限 64:原来的 12 会把深 Java 包(com/alibaba/.../xxx 常超 12 层)截断成空目录。
+            // 64 远超任何真实包深度,保留有限上限(非 None)防病态符号链/超深目录递归爆栈。
+            // should_skip 已剪掉 target/node_modules 等产物目录,加深上限不会显著放大遍历量。
+            // (真·最优是目录懒加载 + 按 watcher 路径增量改节点,属较大的树控件重构,另行处理。)
+            let result = nib_core::fs::read_dir_tree(root_str, Some(64)).await;
             if let Ok(node) = result {
                 // 陈旧守卫:期间切了项目就丢弃;同帧取展开态与当前标签
                 let Ok((still_current, expanded, active_item)) = weak.read_with(cx, |this, _| {
@@ -846,10 +858,14 @@ impl Workbench {
         });
         if has_structural {
             self.reload_tree(cx);
+            // 文件结构变了 → quick-open / 文本跳转兜底的文件清单也要刷新(否则新文件搜不到)。
+            self.refresh_all_files(cx);
         }
-        // git_panel.refresh 内部跑 git status 后会经 StatusUpdated 事件回传,Workbench 据此
-        // 建改动标记——所以这里不再单独 refresh_git_marks(原来每次文件变更跑两次 git status)。
-        self.git_panel.update(cx, |panel, cx| panel.refresh(cx));
+        // 文件变更只需轻量刷新(branch + status + conflicts),用于改动标记/变更列表;
+        // 分支列表与 50 条 log 只在面板打开/手动刷新/提交后才加载,不在每次文件事件里跑。
+        // refresh_light 跑 git status 后经 StatusUpdated 事件回传 → Workbench 建改动标记,
+        // 这里不再单独 refresh_git_marks(避免每次文件变更两次 git status)。
+        self.git_panel.update(cx, |panel, cx| panel.refresh_light(cx));
         // 磁盘文件被外部改动 → 只重载本次突发里实际变更、且正打开的标签(定向,不再把所有
         // 已打开文件全读一遍)。git checkout / 另一编辑器 / 格式化工具改盘都走这。
         let changed: std::collections::HashSet<String> = paths.into_iter().collect();
@@ -1646,19 +1662,6 @@ impl Workbench {
             let maven_settings = settings.maven_settings.clone();
             cx.spawn(async move |weak, cx| {
                 let jdtls_root = session::data_dirs().jdtls_workspaces();
-                // 临时诊断:把 start_lsp 的 root 与结果落盘(/tmp/nib-goto.log),
-                // 定位"jdtls 就绪却 No LSP server"=server 没入 map 的真因
-                let log = |m: String| {
-                    use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/nib-goto.log")
-                    {
-                        let _ = writeln!(f, "{m}");
-                    }
-                };
-                log(format!("[start_lsp] 调用 root={root}"));
                 if let Err(err) = nib_core::lsp::start_lsp(
                     "java".into(),
                     root,
@@ -1669,7 +1672,6 @@ impl Workbench {
                 )
                 .await
                 {
-                    log(format!("[start_lsp] 失败 → server 不入 map: {err}"));
                     eprintln!("[nib-lsp] jdtls 启动失败: {}", err);
                     let _ = weak.update(cx, |this: &mut Workbench, cx| {
                         this.lsp_phase = LspPhase::Failed;
@@ -1677,7 +1679,6 @@ impl Workbench {
                     });
                     return;
                 }
-                log("[start_lsp] 成功 → server 已入 map".to_string());
                 if let Err(err) =
                     nib_core::lsp::lsp_did_open(file, "java".into(), content, &lsp).await
                 {
@@ -1861,9 +1862,10 @@ impl Workbench {
                         if let Some(tab) = this.tabs.iter_mut().find(|t| t.path == path) {
                             tab.dirty = false;
                         }
-                        // 保存后立即刷新 git 改动列表 + 树徽标(不必等 watcher 500ms 防抖)
-                        this.git_panel.update(cx, |p, cx| p.refresh(cx));
-                        this.refresh_git_marks(cx);
+                        // 保存后立即轻量刷新 git 改动列表 + 树徽标(不必等 watcher 防抖)。
+                        // refresh_light 经 StatusUpdated 已驱动改动标记,不再单独 refresh_git_marks
+                        // (原来两条都各跑一次 git status,重复)。分支/log 不受单文件保存影响,不刷。
+                        this.git_panel.update(cx, |p, cx| p.refresh_light(cx));
                         format!("已保存 {}", path.display()).into()
                     }
                     Err(err) => format!("保存失败: {}", err).into(),
@@ -2156,10 +2158,18 @@ impl Workbench {
                         {
                             Ok(text) => match jdt_temp_path(&u.uri) {
                                 Some(path) => {
-                                    let w = std::fs::create_dir_all(
-                                        path.parent().unwrap_or(path.as_path()),
-                                    )
-                                    .and_then(|_| std::fs::write(&path, text));
+                                    // 反编译源码可达数百 KB,写盘放后台线程,别阻塞 GPUI 主线程任务。
+                                    let w = {
+                                        let p = path.clone();
+                                        cx.background_executor()
+                                            .spawn(async move {
+                                                std::fs::create_dir_all(
+                                                    p.parent().unwrap_or(p.as_path()),
+                                                )
+                                                .and_then(|_| std::fs::write(&p, text))
+                                            })
+                                            .await
+                                    };
                                     match w {
                                         Ok(_) => Goto::File(
                                             path,

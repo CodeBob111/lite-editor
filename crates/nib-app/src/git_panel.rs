@@ -143,6 +143,34 @@ impl GitPanel {
         .detach();
     }
 
+    /// 轻量刷新:只查 branch + status + conflicts(改动标记 + 变更列表所需),**不**拉
+    /// 分支列表与 50 条 log。watcher 文件事件 / 保存走这条——分支和 log 重且不随每次文件
+    /// 变更变化,只在 set_project / 手动刷新 / 提交后用全量 refresh 加载。与 refresh 共用
+    /// refresh_seq,二者互不覆盖(最新一次生效)。
+    pub fn refresh_light(&mut self, cx: &mut Context<Self>) {
+        self.refresh_seq += 1;
+        let seq = self.refresh_seq;
+        let cwd = self.project_root.to_string_lossy().to_string();
+        cx.spawn(async move |weak, cx| {
+            let (branch, changes, conflicts) = futures::join!(
+                nib_core::git::git_current_branch(cwd.clone()),
+                nib_core::git::git_status(cwd.clone()),
+                nib_core::git::git_merge_conflicts(cwd),
+            );
+            let _ = weak.update(cx, |this, cx| {
+                if this.refresh_seq != seq {
+                    return;
+                }
+                this.branch = branch.unwrap_or_default().into();
+                this.changes = changes.unwrap_or_default();
+                this.conflicts = conflicts.unwrap_or_default();
+                cx.emit(GitPanelEvent::StatusUpdated(this.changes.clone()));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn commit(&mut self, and_push: bool, cx: &mut Context<Self>) {
         if self.busy {
             return;

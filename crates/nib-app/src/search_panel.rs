@@ -136,6 +136,15 @@ impl SearchPanel {
 
         let root = self.project_root.to_string_lossy().to_string();
         cx.spawn(async move |weak, cx| {
+            // 防抖:静默 150ms 后才真正全仓扫描。期间又敲字 → query_seq 变 → 本任务在扫描**前**
+            // 退出,不启动扫描。原实现每个字符都立即起一次 12 线程全仓扫描,连敲 5 个字叠 5 个
+            // 扫描抢 CPU/磁盘;加防抖后配合下方 query_seq 结果守卫 ≈"每项目最多一个活动搜索"。
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(150))
+                .await;
+            if weak.read_with(cx, |this, _| this.query_seq != seq).unwrap_or(true) {
+                return; // 期间又敲了字 / 面板已关 → 不扫
+            }
             let result =
                 nib_core::search::search_in_files(root, query, Some(false), Some(500)).await;
             let _ = weak.update(cx, |this, cx| {

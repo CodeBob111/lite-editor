@@ -91,12 +91,16 @@ pub async fn search_in_files(
                         if found_count.load(Ordering::Relaxed) >= max as u64 {
                             break;
                         }
-                        if let Some(col) = hay_line.find(query_cmp) {
+                        if let Some(byte_col) = hay_line.find(query_cmp) {
                             found_count.fetch_add(1, Ordering::Relaxed);
+                            // find 返回**字节**偏移,但编辑器跳转按**字符**列定位。命中词前若有
+                            // 中文/emoji(多字节),字节偏移会比字符列大 → 跳转落点偏右。用命中
+                            // 前缀的字符数还原真实列号(纯 ASCII 行字节==字符,零回归)。
+                            let column = hay_line[..byte_col].chars().count() as u32;
                             file_results.push(SearchResult {
                                 path: entry.path().to_string_lossy().to_string(),
                                 line: i as u32,
-                                column: col as u32,
+                                column,
                                 text: line_text.trim().to_string(),
                             });
                         }
@@ -175,6 +179,23 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].line, 0);
         assert_eq!(results[0].column, 6); // "const Foo" 中 Foo 的字节偏移
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn search_column_is_char_index_not_byte_offset() {
+        // 命中词 "bar" 前有两个中文(各 3 字节)+ "foo "(4 字节)= 字节偏移 10,
+        // 但字符列是 6(中0 文1 f2 o3 o4 空5 b6)。修复前会返回 10 → 跳转偏右。
+        let root = std::env::temp_dir().join(format!("nib-search-uni-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("u.txt"), "中文foo bar\n").unwrap();
+        let results = search_in_files(root.to_string_lossy().to_string(), "bar".into(), Some(true), None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].line, 0);
+        assert_eq!(results[0].column, 6, "列号应是字符索引 6,不是字节偏移 10");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
