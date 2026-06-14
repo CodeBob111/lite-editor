@@ -73,6 +73,10 @@ impl SearchPanel {
     /// 异步读选中结果所在文件做预览,定位命中行居中。读盘在后台线程(不阻塞 UI);
     /// 选中项还在同一文件 → 只移命中行不重读;带 seq 防抖,连按方向键只应用最后一次。
     fn load_preview(&mut self, cx: &mut Context<Self>) {
+        // 进入即作废旧的在途读盘任务:无选区的早退路径若不递增序号,之前发起的 read_file
+        // 回来时 seq 仍相等,会把陈旧预览写回、覆盖掉清空结果。
+        self.preview_seq += 1;
+        let seq = self.preview_seq;
         let Some(hit) = self.results.get(self.selected) else {
             self.preview = None;
             return;
@@ -87,8 +91,6 @@ impl SearchPanel {
                 return;
             }
         }
-        self.preview_seq += 1;
-        let seq = self.preview_seq;
         cx.spawn(async move |weak, cx| {
             let content = nib_core::fs::read_file(path.clone()).await.ok();
             let _ = weak.update(cx, |this, cx| {
@@ -121,6 +123,10 @@ impl SearchPanel {
             self.results = Arc::new(Vec::new());
             self.selected = 0;
             self.searching = false;
+            // 清空搜索词时一并清掉预览,并递增 preview_seq 作废在途读盘任务,否则上一次
+            // 选区发起的 read_file 会在清空后把陈旧预览写回到已清空的列表上。
+            self.preview = None;
+            self.preview_seq += 1;
             cx.notify();
             return;
         }

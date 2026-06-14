@@ -58,6 +58,10 @@ impl UsagesView {
     /// 异步读选中引用所在文件做预览,定位命中行居中。读盘在后台线程(不阻塞 UI);
     /// 选中项还在同一文件 → 只移命中行不重读;带 seq 防抖,连按方向键只应用最后一次。
     fn load_preview(&mut self, cx: &mut Context<Self>) {
+        // 进入即作废旧的在途读盘任务:清空预览(无选区 / jdt:// 库引用)的早退路径若不递增
+        // 序号,之前发起的 read_file 回来时 seq 仍相等,会把陈旧预览写回、覆盖掉清空结果。
+        self.preview_seq += 1;
+        let seq = self.preview_seq;
         let Some(u) = self.usages.get(self.selected) else {
             self.preview = None;
             return;
@@ -77,8 +81,6 @@ impl UsagesView {
                 return;
             }
         }
-        self.preview_seq += 1;
-        let seq = self.preview_seq;
         cx.spawn(async move |weak, cx| {
             let content = nib_core::fs::read_file(path.clone()).await.ok();
             let _ = weak.update(cx, |this, cx| {

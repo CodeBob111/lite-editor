@@ -1501,13 +1501,19 @@ impl Workbench {
             const LOG_GAP: Duration = Duration::from_millis(500);
             let mut last = Instant::now();
             let mut last_log: Option<Instant> = None;
+            // 心跳开始这一刻窗口是否在前台。在 timer await **之前**取一次,await **之后**再取
+            // 一次:只有整段心跳期间都在前台才算真实停顿。否则后台休眠(macOS 节流定时器)再
+            // 回到前台的首拍,await 后 active=true 会把整段后台时长记成一次巨停。
+            let mut active_before = cx
+                .update_window(window_handle, |_, window, _| window.is_window_active())
+                .unwrap_or(false);
             loop {
                 cx.background_executor().timer(BEAT).await;
-                // 窗口在后台时 macOS 会节流事件循环/定时器,心跳必然迟到 → 误判为主线程卡顿
-                // (实测后台 79/81 条全是误报)。后台只更新基线、不记录;唯前台才统计真实停顿。
-                let active = cx
+                let active_after = cx
                     .update_window(window_handle, |_, window, _| window.is_window_active())
                     .unwrap_or(false);
+                let active = active_before && active_after;
+                active_before = active_after;
                 let alive = this.update(cx, |this, cx| {
                     let now = Instant::now();
                     let drift = now.duration_since(last).saturating_sub(BEAT);

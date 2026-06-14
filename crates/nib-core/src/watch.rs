@@ -2,6 +2,7 @@
 
 use crate::events::{CoreEvent, EventSink};
 use crate::fs::should_skip;
+use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -89,7 +90,13 @@ pub fn start_file_watcher(
             }) {
                 return;
             }
-            let structural = matches!(event.kind, EventKind::Create(_) | EventKind::Remove(_));
+            // 结构变化 = 影响文件树拓扑的事件:创建、删除,以及**重命名**。macOS(FSEvents)
+            // 的重命名既不是 Create 也不是 Remove,而是 Modify(Name(...)) —— 漏掉它,外部
+            // 重命名(Finder / git / 另一编辑器)就不会触发 reload_tree,树显示旧名。
+            let structural = matches!(
+                event.kind,
+                EventKind::Create(_) | EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(_))
+            );
             if !structural && !matches!(event.kind, EventKind::Modify(_)) {
                 return; // 只关心 创建/删除/修改
             }

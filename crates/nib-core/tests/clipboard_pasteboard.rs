@@ -12,6 +12,7 @@
 use nib_core::clipboard::{copy_files_to_clipboard, copy_text_to_clipboard};
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 // 系统剪贴板是全局共享状态:cargo test 默认并行,三个测试互相覆盖对方刚写入的
 // 内容,产生随机失败。串行化「写入→读回」整段;锁中毒(别的测试断言失败)不影响
@@ -35,6 +36,43 @@ fn make_temp_file(name: &str) -> String {
         .into_owned()
 }
 
+/// 跑 `osascript -e <script>`,但**绝不阻塞整个测试套件**:spawn 后轮询退出,超过
+/// `timeout` 就 kill。headless / 无 Apple Events 授权的环境(CI、未登录 GUI)在
+/// `the clipboard as «class furl»` 上会无限挂起,没有上界时这一个进程能把整轮
+/// `cargo test` 卡死好几分钟。超时返回 None,调用方据此跳过(而非挂死或误判失败)。
+/// 返回 (退出码 success, stdout)。osascript 输出仅一行路径,远小于管道缓冲,退出后再读安全。
+fn osascript_bounded(script: &str, timeout: Duration) -> Option<(bool, String)> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new("osascript")
+        .args(["-e", script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = String::new();
+                if let Some(mut so) = child.stdout.take() {
+                    let _ = so.read_to_string(&mut out);
+                }
+                return Some((status.success(), out));
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 #[test]
 fn single_file_lands_as_a_readable_file_url() {
     let _pb = pasteboard_guard();
@@ -43,17 +81,20 @@ fn single_file_lands_as_a_readable_file_url() {
 
     // Read it back the way an app would: the clipboard must coerce to a file
     // reference («class furl») and resolve to exactly the file we copied.
-    let out = Command::new("osascript")
-        .args(["-e", "POSIX path of (the clipboard as «class furl»)"])
-        .output()
-        .expect("run osascript");
-    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // Bounded so headless/Apple-Events-restricted environments skip instead of hanging.
+    let Some((success, stdout)) = osascript_bounded(
+        "POSIX path of (the clipboard as «class furl»)",
+        Duration::from_secs(10),
+    ) else {
+        eprintln!(
+            "跳过 single_file_lands_as_a_readable_file_url: osascript 在本环境无法完成\
+             (headless / 无 Apple Events 授权),已超时"
+        );
+        return;
+    };
+    let got = stdout.trim().to_string();
 
-    assert!(
-        out.status.success(),
-        "clipboard did not hold a file reference: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(success, "clipboard did not hold a file reference (osascript failed)");
     // osascript reports the path with a trailing slash stripped; compare basenames
     // plus full path to be robust against any trailing-slash normalization.
     assert_eq!(got, path, "pasteboard file-url did not round-trip the path");
