@@ -25,6 +25,36 @@ fn rel_of(root: &str, abs: &str) -> String {
         .unwrap_or_else(|| abs.to_string())
 }
 
+/// 模糊匹配:对预计算的相对路径打分,Top-K(部分选择 + 只排前 MAX_RESULTS,不全排序)返回
+/// 命中的下标。纯计算、无 IO/无 self,可丢到后台线程跑。空查询 = 按路径长度取最浅的一批。
+fn match_files(query: &str, rels: &[String]) -> Vec<usize> {
+    if query.trim().is_empty() {
+        let mut ixs: Vec<usize> = (0..rels.len()).collect();
+        if ixs.len() > MAX_RESULTS {
+            ixs.select_nth_unstable_by_key(MAX_RESULTS - 1, |&i| rels[i].len());
+            ixs.truncate(MAX_RESULTS);
+        }
+        ixs.sort_by_key(|&i| rels[i].len());
+        return ixs;
+    }
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    let mut scored: Vec<(u32, usize)> = Vec::new();
+    let mut buf = Vec::new();
+    for (ix, rel) in rels.iter().enumerate() {
+        let haystack = nucleo_matcher::Utf32Str::new(rel, &mut buf);
+        if let Some(score) = pattern.score(haystack, &mut matcher) {
+            scored.push((score, ix));
+        }
+    }
+    if scored.len() > MAX_RESULTS {
+        scored.select_nth_unstable_by(MAX_RESULTS - 1, |a, b| b.0.cmp(&a.0));
+        scored.truncate(MAX_RESULTS);
+    }
+    scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
+    scored.into_iter().map(|(_, ix)| ix).collect()
+}
+
 pub enum QuickOpenEvent {
     Open(PathBuf),
 }
@@ -39,7 +69,6 @@ pub struct QuickOpen {
     /// 命中的 files 下标,按 nucleo 得分降序
     matches: Vec<usize>,
     selected: usize,
-    matcher: Matcher,
     /// 输入防抖序号:连续击键只让最后一次过滤生效。
     filter_seq: u64,
     _subscription: Subscription,
@@ -67,18 +96,18 @@ impl QuickOpen {
         let rels: Vec<String> = files.iter().map(|p| rel_of(&root, p)).collect();
         drop(root);
 
-        let mut this = Self {
+        let rels = Arc::new(rels);
+        // 初始(空查询)立即出一批,无需上后台/防抖(空查询只按长度选,廉价)
+        let matches = match_files("", &rels);
+        Self {
             input,
             files,
-            rels: Arc::new(rels),
-            matches: Vec::new(),
+            rels,
+            matches,
             selected: 0,
-            matcher: Matcher::new(Config::DEFAULT.match_paths()),
             filter_seq: 0,
             _subscription: subscription,
-        };
-        this.refilter(cx);
-        this
+        }
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -86,56 +115,45 @@ impl QuickOpen {
         window.focus(&handle, cx);
     }
 
-    /// 输入防抖:连续击键 +seq,~40ms 静默后只有 seq 未变才真正过滤(大项目逐键全量匹配很贵)。
+    /// 输入防抖 + 后台匹配:连续击键 +seq,40ms 静默后读 query,把模糊匹配放到**后台执行器线程**
+    /// 跑(大项目逐键全量匹配很贵,绝不占主线程),结果回主线程更新;两端都按 seq 丢弃过期结果。
     fn schedule_refilter(&mut self, cx: &mut Context<Self>) {
         self.filter_seq += 1;
         let seq = self.filter_seq;
+        let rels = self.rels.clone();
         cx.spawn(async move |weak, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(40))
                 .await;
+            // 读最新 query(主线程)+ 校验防抖序号
+            let query = weak
+                .update(cx, |this, cx| {
+                    if this.filter_seq != seq {
+                        None
+                    } else {
+                        Some(this.input.read(cx).value().to_string())
+                    }
+                })
+                .ok()
+                .flatten();
+            let Some(query) = query else {
+                return;
+            };
+            // 后台线程做匹配
+            let matches = cx
+                .background_executor()
+                .spawn(async move { match_files(&query, &rels) })
+                .await;
             let _ = weak.update(cx, |this, cx| {
-                if this.filter_seq == seq {
-                    this.refilter(cx);
+                if this.filter_seq != seq {
+                    return; // 期间又敲了 → 丢弃这次结果
                 }
+                this.matches = matches;
+                this.selected = 0;
+                cx.notify();
             });
         })
         .detach();
-    }
-
-    fn refilter(&mut self, cx: &mut Context<Self>) {
-        let query = self.input.read(cx).value().to_string();
-        if query.trim().is_empty() {
-            // 空查询:取最浅的一批文件。用 select_nth 部分选择 + 只排前 K,不全排序所有文件。
-            let rels = self.rels.clone();
-            let mut ixs: Vec<usize> = (0..self.files.len()).collect();
-            if ixs.len() > MAX_RESULTS {
-                ixs.select_nth_unstable_by_key(MAX_RESULTS - 1, |&i| rels[i].len());
-                ixs.truncate(MAX_RESULTS);
-            }
-            ixs.sort_by_key(|&i| rels[i].len());
-            self.matches = ixs;
-        } else {
-            let pattern = Pattern::parse(&query, CaseMatching::Smart, Normalization::Smart);
-            let mut scored: Vec<(u32, usize)> = Vec::new();
-            let mut buf = Vec::new();
-            // 用预计算的 rels,不在循环里重复生成相对路径
-            for (ix, rel) in self.rels.iter().enumerate() {
-                let haystack = nucleo_matcher::Utf32Str::new(rel, &mut buf);
-                if let Some(score) = pattern.score(haystack, &mut self.matcher) {
-                    scored.push((score, ix));
-                }
-            }
-            // Top-K:部分选择出得分最高的 MAX_RESULTS 个,只排这 K 个,不对全部命中全排序
-            if scored.len() > MAX_RESULTS {
-                scored.select_nth_unstable_by(MAX_RESULTS - 1, |a, b| b.0.cmp(&a.0));
-                scored.truncate(MAX_RESULTS);
-            }
-            scored.sort_by_key(|&(score, _)| std::cmp::Reverse(score));
-            self.matches = scored.into_iter().map(|(_, ix)| ix).collect();
-        }
-        self.selected = 0;
-        cx.notify();
     }
 
     pub fn move_selection(&mut self, delta: i32, cx: &mut Context<Self>) {

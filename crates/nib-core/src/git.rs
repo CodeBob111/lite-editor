@@ -623,7 +623,7 @@ pub async fn git_new_branch_at_commit(
     on_worker(move || run_git(&cwd, &["checkout", "-b", &branch, &hash])).await
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct GitChange {
     pub path: String,
     pub old_path: Option<String>,

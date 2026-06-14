@@ -17,6 +17,9 @@ use nib_core::git::{GitBranch, GitChange, GitCommit};
 pub enum GitPanelEvent {
     OpenDiff { rel_path: String, abs_path: PathBuf },
     OpenMerge { rel_path: String },
+    /// 刷新拿到的 git status 结果(供 Workbench 据此建编辑器/树的改动标记,
+    /// 不必再单独跑一次 git status——合并重复查询)。
+    StatusUpdated(Vec<GitChange>),
 }
 
 /// 对齐旧版:Commit(变更+提交框)与 Git(分支+历史)是活动栏里两个独立视图,
@@ -132,6 +135,8 @@ impl GitPanel {
                 this.conflicts = conflicts.unwrap_or_default();
                 this.branches = branches.unwrap_or_default();
                 this.log = log.unwrap_or_default();
+                // 把刚拿到的 status 结果递给宿主建改动标记,免得 Workbench 再单独跑一次 git status
+                cx.emit(GitPanelEvent::StatusUpdated(this.changes.clone()));
                 cx.notify();
             });
         })

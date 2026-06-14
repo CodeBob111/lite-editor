@@ -185,6 +185,21 @@ enum NameOp {
 /// Maven 未配置提醒通知的去重类型 id(同类只留一条,切项目不叠多条)
 struct MavenConfigPrompt;
 
+/// render 耗时守卫:在 Workbench::render 开头创建,作用域结束(元素树构建完)时把这次构建耗时
+/// 写进共享原子量,供卡顿哨兵读取——区分卡顿是「render 构建树」还是「GPUI 内部布局/塑形/paint」。
+struct RenderTimer {
+    t0: Instant,
+    out: Arc<std::sync::atomic::AtomicU64>,
+}
+impl Drop for RenderTimer {
+    fn drop(&mut self) {
+        self.out.store(
+            self.t0.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 /// 标签上限(LRU 淘汰,脏标签豁免)
 const MAX_TABS: usize = 30;
 
@@ -385,6 +400,9 @@ struct Workbench {
     lsp_change_seq: u64,
     /// Markdown 预览防抖序号:每次击键 +1,输入停 150ms 才刷新预览(避免每键重渲染重解析)。
     md_seq: u64,
+    /// 上一次 Workbench::render 构建元素树的耗时(微秒),由 RenderTimer 守卫在 render 末尾写入,
+    /// 卡顿哨兵读它写进 jank.log——区分「卡在 render 构建」还是「卡在 GPUI 布局/塑形/paint」。
+    render_us: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// 欢迎页「最近项目」一行的展示数据(路径 + 派生的名称/缩写/类型标签/首字母色)。
@@ -485,6 +503,8 @@ impl Workbench {
                 GitPanelEvent::OpenMerge { rel_path } => {
                     this.open_merge(rel_path.clone(), cx)
                 }
+                // git_panel 刷新已经跑过 git status,直接据此建改动标记,不再单独跑一次。
+                GitPanelEvent::StatusUpdated(changes) => this.apply_git_marks(changes, cx),
             },
         );
 
@@ -563,6 +583,7 @@ impl Workbench {
             last_mouse: Point::default(),
             lsp_change_seq: 0,
             md_seq: 0,
+            render_us: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         let lsp_for_quit = this.lsp.clone();
         cx.on_app_quit(move |_, _| {
@@ -825,8 +846,9 @@ impl Workbench {
         if has_structural {
             self.reload_tree(cx);
         }
+        // git_panel.refresh 内部跑 git status 后会经 StatusUpdated 事件回传,Workbench 据此
+        // 建改动标记——所以这里不再单独 refresh_git_marks(原来每次文件变更跑两次 git status)。
         self.git_panel.update(cx, |panel, cx| panel.refresh(cx));
-        self.refresh_git_marks(cx);
         // 磁盘文件被外部改动 → 只重载本次突发里实际变更、且正打开的标签(定向,不再把所有
         // 已打开文件全读一遍)。git checkout / 另一编辑器 / 格式化工具改盘都走这。
         let changed: std::collections::HashSet<String> = paths.into_iter().collect();
@@ -970,7 +992,7 @@ impl Workbench {
                                     return false;
                                 }
                                 let editor = tab.editor.clone();
-                                if editor.read(cx).value().to_string() == disk {
+                                if editor.read(cx).value() == disk {
                                     return false; // 内容没变 → 不重置光标
                                 }
                                 // 只对活动标签恢复光标:set_cursor_position 末尾会聚焦,
@@ -1546,8 +1568,12 @@ impl Workbench {
                                 ),
                                 None => ("?".to_string(), -1),
                             };
+                            // 上一次 render 构建树的耗时:render_us≈drift → 卡在 render 构建;
+                            // render_us≪drift → 卡在 GPUI 内部布局/文本塑形/paint(render 之外)。
+                            let render_us =
+                                this.render_us.load(std::sync::atomic::Ordering::Relaxed);
                             let line = format!(
-                                "{{\"ts_ms\":{ts_ms},\"drift_ms\":{},\"op\":{op_label:?},\"op_age_ms\":{op_age},\"count\":{}}}\n",
+                                "{{\"ts_ms\":{ts_ms},\"drift_ms\":{},\"op\":{op_label:?},\"op_age_ms\":{op_age},\"render_us\":{render_us},\"count\":{}}}\n",
                                 drift.as_millis(),
                                 this.stall_count
                             );
@@ -2407,7 +2433,7 @@ impl Workbench {
         let panel = match &self.arthas {
             Some(panel) => panel.clone(),
             None => {
-                let panel = cx.new(|cx| ArthasPanel::new(cx));
+                let panel = cx.new(ArthasPanel::new);
                 self.arthas = Some(panel.clone());
                 panel
             }
@@ -2420,7 +2446,7 @@ impl Workbench {
     fn on_toggle_arthas(&mut self, _: &ToggleArthas, _: &mut Window, cx: &mut Context<Self>) {
         self.arthas_visible = !self.arthas_visible;
         if self.arthas_visible && self.arthas.is_none() {
-            self.arthas = Some(cx.new(|cx| ArthasPanel::new(cx)));
+            self.arthas = Some(cx.new(ArthasPanel::new));
         }
         cx.notify();
     }
@@ -3831,25 +3857,32 @@ impl Workbench {
     }
 
     /// 拉一次 git status 喂给树着色(项目装载 + watcher 变更时;陈旧守卫同款)
+    /// 从已有 git status 结果(同步,无 IO)建编辑器/树的改动标记。git_panel 刷新后经
+    /// StatusUpdated 事件调用(合并查询),以及下面 refresh_git_marks(自跑一次 status 的版本)复用。
+    fn apply_git_marks(&mut self, changes: &[nib_core::git::GitChange], cx: &mut Context<Self>) {
+        let mut marks = std::collections::HashMap::new();
+        for c in changes {
+            let abs = self.project_root.join(&c.path).to_string_lossy().to_string();
+            let ch = c.status.chars().next().unwrap_or(' ');
+            // 同文件 staged+unstaged 两条:改动类标记优先于已暂存覆盖
+            marks.entry(abs).or_insert(ch);
+        }
+        self.git_marks = Arc::new(marks);
+        cx.notify();
+    }
+
+    /// 单独跑一次 git status 建改动标记——给「不刷 git_panel 但要更新标记」的场景用
+    /// (如保存当前文件)。FileChanged 等会刷 git_panel 的场景不调它,走 StatusUpdated 合并。
     fn refresh_git_marks(&mut self, cx: &mut Context<Self>) {
         let cwd = self.project_root.to_string_lossy().to_string();
         let guard_root = self.project_root.clone();
-        let root = self.project_root.clone();
         cx.spawn(async move |weak, cx| {
             let Ok(changes) = nib_core::git::git_status(cwd).await else {
                 return;
             };
-            let mut marks = std::collections::HashMap::new();
-            for c in changes {
-                let abs = root.join(&c.path).to_string_lossy().to_string();
-                let ch = c.status.chars().next().unwrap_or(' ');
-                // 同文件 staged+unstaged 两条:改动类标记优先于已暂存覆盖
-                marks.entry(abs).or_insert(ch);
-            }
             let _ = weak.update(cx, |this: &mut Workbench, cx| {
                 if this.project_root == guard_root {
-                    this.git_marks = Arc::new(marks);
-                    cx.notify();
+                    this.apply_git_marks(&changes, cx);
                 }
             });
         })
@@ -3859,6 +3892,11 @@ impl Workbench {
 
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 量这次构建元素树的耗时(守卫在本函数返回后 drop 时写入)
+        let _render_timer = RenderTimer {
+            t0: Instant::now(),
+            out: self.render_us.clone(),
+        };
         if !self.first_frame_logged {
             self.first_frame_logged = true;
             if let Some(t0) = APP_START.get() {
