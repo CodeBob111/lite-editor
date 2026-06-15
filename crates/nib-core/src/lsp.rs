@@ -102,6 +102,27 @@ pub struct LspUsage {
     pub text: String,
 }
 
+/// Find-Usages 浮层的初始选中项:把高亮定位到 `origin`(触发查引用时光标所在的
+/// 文件路径/line/character)所指的那处引用——只在同文件内取候选,先按行距、再按列距取最近。
+/// 光标在声明上(声明被 references 排除,无同文件候选)或无 `origin` 时回退到 0(第一项)。
+/// UI 无关纯逻辑,放 core 便于单测(nib-app 是巨型 binary crate,加 `#[test]` 触发宏展开递归上限)。
+pub fn initial_usage_selection(usages: &[LspUsage], origin: Option<&(String, u32, u32)>) -> usize {
+    origin
+        .and_then(|(path, line, ch)| {
+            usages
+                .iter()
+                .enumerate()
+                .filter(|(_, u)| &path_from_file_uri(&u.uri) == path)
+                .min_by_key(|(_, u)| {
+                    let line_d = (u.line as i64 - *line as i64).unsigned_abs();
+                    let ch_d = (u.character as i64 - *ch as i64).unsigned_abs();
+                    (line_d, ch_d)
+                })
+                .map(|(ix, _)| ix)
+        })
+        .unwrap_or(0)
+}
+
 // ---- Tauri commands ----
 
 pub async fn start_lsp(
@@ -1874,6 +1895,62 @@ fn decompile_class(jar_path: &str, fqn: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn usage(uri: &str, line: u32, character: u32) -> LspUsage {
+        LspUsage {
+            uri: uri.to_string(),
+            line,
+            character,
+            text: String::new(),
+        }
+    }
+
+    #[test]
+    fn usage_selection_no_origin_picks_first() {
+        let us = vec![usage("file:///p/A.java", 5, 0), usage("file:///p/B.java", 9, 0)];
+        assert_eq!(initial_usage_selection(&us, None), 0);
+    }
+
+    #[test]
+    fn usage_selection_picks_cursor_line_not_first() {
+        // 光标停在 B.java:620 那处引用 → 选中它(索引 2),而不是恒选第一项(这就是要修的 bug)
+        let us = vec![
+            usage("file:///p/A.java", 18, 4),
+            usage("file:///p/B.java", 610, 8),
+            usage("file:///p/B.java", 620, 8),
+            usage("file:///p/B.java", 625, 8),
+        ];
+        let origin = ("/p/B.java".to_string(), 620, 8);
+        assert_eq!(initial_usage_selection(&us, Some(&origin)), 2);
+    }
+
+    #[test]
+    fn usage_selection_same_line_picks_nearest_column() {
+        let us = vec![
+            usage("file:///p/B.java", 30, 4),
+            usage("file:///p/B.java", 30, 40),
+        ];
+        let origin = ("/p/B.java".to_string(), 30, 36);
+        assert_eq!(initial_usage_selection(&us, Some(&origin)), 1);
+    }
+
+    #[test]
+    fn usage_selection_other_file_falls_back_to_first() {
+        // 光标所在文件不在引用列表里(如停在声明上,声明被排除)→ 回退 0
+        let us = vec![usage("file:///p/A.java", 5, 0), usage("file:///p/A.java", 9, 0)];
+        let origin = ("/p/Decl.java".to_string(), 12, 0);
+        assert_eq!(initial_usage_selection(&us, Some(&origin)), 0);
+    }
+
+    #[test]
+    fn usage_selection_same_file_no_exact_line_picks_nearest_line() {
+        let us = vec![
+            usage("file:///p/B.java", 100, 0),
+            usage("file:///p/B.java", 200, 0),
+        ];
+        let origin = ("/p/B.java".to_string(), 180, 0);
+        assert_eq!(initial_usage_selection(&us, Some(&origin)), 1);
+    }
 
     // 普通 ASCII 路径编码后必须字节不变(否则会把 file:///a/b 这种全网址搞坏,
     // goto-def 全线崩 —— 这是"修 bug 反引入灾难性回归"的雷区,务必守住)。

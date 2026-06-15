@@ -2230,7 +2230,10 @@ impl Workbench {
                             this.status = path.display().to_string().into();
                             this.open_file_at(path, line, character, window, cx);
                         }
-                        Goto::Usages(usages) => this.show_usages(title, usages, window, cx),
+                        // 光标在声明上 → 看用法:声明被 references 排除,无"当前用法",选 0
+                        Goto::Usages(usages) => {
+                            this.show_usages(title, usages, None, window, cx)
+                        }
                         Goto::Status(msg) => this.status = msg.into(),
                         Goto::NotFound => this.status = "未找到定义".into(),
                     }
@@ -2277,11 +2280,12 @@ impl Workbench {
         &mut self,
         title: String,
         usages: Vec<nib_core::lsp::LspUsage>,
+        origin: Option<(String, u32, u32)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.status = format!("{} 处引用", usages.len()).into();
-        let view = cx.new(|cx| UsagesView::new(title, usages, cx));
+        let view = cx.new(|cx| UsagesView::new(title, usages, origin, cx));
         let sub = cx.subscribe_in(
             &view,
             window,
@@ -2321,6 +2325,8 @@ impl Workbench {
         let window_handle = self.window_handle;
         self.status = "查找引用…".into();
         cx.notify();
+        // 光标当前所在的(文件, line, character):交给浮层把初始高亮定位到光标所在的引用
+        let origin = Some((file.clone(), pos.line, pos.character));
         cx.spawn(async move |weak, cx| {
             let result =
                 nib_core::lsp::lsp_find_references(file, pos.line, pos.character, &lsp).await;
@@ -2328,7 +2334,7 @@ impl Workbench {
                 let _ = weak.update(cx, |this: &mut Workbench, cx| {
                     match result {
                         Ok(usages) if !usages.is_empty() => {
-                            this.show_usages(title.clone(), usages, window, cx);
+                            this.show_usages(title.clone(), usages, origin.clone(), window, cx);
                         }
                         Ok(_) => this.status = "未找到引用".into(),
                         Err(err) => this.status = format!("查找失败: {}", err).into(),

@@ -42,11 +42,20 @@ pub struct UsagesView {
 impl EventEmitter<UsagesEvent> for UsagesView {}
 
 impl UsagesView {
-    pub fn new(symbol_file: String, usages: Vec<LspUsage>, cx: &mut Context<Self>) -> Self {
+    /// `origin` = 触发查引用时光标所在的(文件路径, line, character)。用它把初始选中项定位到
+    /// 光标当前所在的那处引用(同文件内按行距、再列距取最近),而不是恒选第一项。光标在声明上
+    /// (声明被 references 排除,无同文件匹配)或拿不到 origin 时,回退到 0。
+    pub fn new(
+        symbol_file: String,
+        usages: Vec<LspUsage>,
+        origin: Option<(String, u32, u32)>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let selected = nib_core::lsp::initial_usage_selection(&usages, origin.as_ref());
         let mut this = Self {
             symbol_file,
             usages,
-            selected: 0,
+            selected,
             preview: None,
             preview_seq: 0,
             preview_scroll: UniformListScrollHandle::default(),
