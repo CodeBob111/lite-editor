@@ -376,6 +376,8 @@ struct Workbench {
     md_preview: bool,
     /// md 预览左右分栏的可拖动状态(记住拖动后的比例)
     md_split_state: Entity<ResizableState>,
+    /// md 预览滚动句柄:预览按标题分段渲染为子元素,点锚点 → scroll_to_top_of_item 滚到该段
+    md_scroll: ScrollHandle,
     terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
     /// 底部面板当前 tab(问题/终端/输出)
@@ -568,6 +570,7 @@ impl Workbench {
             settings: session::EditorSettings::default(),
             md_preview: false,
             md_split_state: cx.new(|_| ResizableState::default()),
+            md_scroll: ScrollHandle::new(),
             terminal: None,
             terminal_visible: false,
             panel_tab: PanelTab::Terminal,
@@ -2500,6 +2503,25 @@ impl Workbench {
         cx.notify();
     }
 
+    /// 预览里点 `#章节` 锚点 → 把对应章节段滚到顶部(由 main 的 URL 轮询回灌调用)。slug 与各段
+    /// 标题都归一化后比对(跨 GitHub/GitLab/手写 slug 差异)。段序与渲染时 split_into_sections 一致。
+    fn scroll_md_to_anchor(&mut self, slug: &str, cx: &mut Context<Self>) {
+        let Some(tab) = self.active() else { return };
+        if tab.lang != "markdown" {
+            return;
+        }
+        let raw = tab.editor.read(cx).value();
+        let key = nib_core::markdown::normalize_anchor(slug);
+        let sections = nib_core::markdown::split_into_sections(&raw);
+        if let Some(ix) = sections
+            .iter()
+            .position(|s| s.anchor_key.as_deref() == Some(key.as_str()))
+        {
+            self.md_scroll.scroll_to_top_of_item(ix);
+            cx.notify();
+        }
+    }
+
     /// 底部终端开/关。首次打开才起 shell;关闭只藏不杀(再开即回)。
     fn on_toggle_terminal(
         &mut self,
@@ -4300,14 +4322,31 @@ impl Render for Workbench {
                                             );
                                         if self.md_preview && tab.lang == "markdown" {
                                             let raw = tab.editor.read(cx).value();
-                                            // 把相对文件链接改写成 nibfile://,预览里点击经
-                                            // on_open_urls 在 Nib 新标签打开(见 main 的 on_open_urls)。
                                             let base = tab
                                                 .path
                                                 .parent()
-                                                .unwrap_or_else(|| std::path::Path::new("/"));
-                                            let text =
-                                                nib_core::markdown::resolve_relative_links(&raw, base);
+                                                .unwrap_or_else(|| std::path::Path::new("/"))
+                                                .to_path_buf();
+                                            // 按标题分段:每段一个 TextView 作为滚动容器的直接子元素,
+                                            // 点锚点 → md_scroll.scroll_to_top_of_item(段序) 滚到该段
+                                            // (段序与 split_into_sections 一致,见 scroll_md_to_anchor)。
+                                            // 每段内再把相对文件/锚点链接改写成 nibfile://(经 on_open_urls 路由)。
+                                            let section_els: Vec<_> =
+                                                nib_core::markdown::split_into_sections(&raw)
+                                                    .iter()
+                                                    .enumerate()
+                                                    .map(|(ix, sec)| {
+                                                        let text =
+                                                            nib_core::markdown::resolve_relative_links(
+                                                                &sec.text, &base,
+                                                            );
+                                                        gpui_component::text::TextView::markdown(
+                                                            ("md-sec", ix),
+                                                            text,
+                                                        )
+                                                        .into_any_element()
+                                                    })
+                                                    .collect();
                                             // 左右两栏可拖动分隔(h_resizable + 持久状态)
                                             this.child(
                                                 h_resizable("md-split")
@@ -4329,15 +4368,11 @@ impl Render for Workbench {
                                                                 .size_full()
                                                                 .min_w_0()
                                                                 .overflow_y_scroll()
+                                                                .track_scroll(&self.md_scroll)
                                                                 .border_l_1()
                                                                 .border_color(cx.theme().border)
                                                                 .p_4()
-                                                                .child(
-                                                                    gpui_component::text::TextView::markdown(
-                                                                        "md-preview-view",
-                                                                        text,
-                                                                    ),
-                                                                ),
+                                                                .children(section_els),
                                                         ),
                                                     ),
                                             )
@@ -4760,9 +4795,17 @@ fn main() {
                     _ => continue,
                 };
                 for url in urls {
-                    if let Some(path) = nib_core::markdown::path_from_nibfile_url(&url) {
-                        if workbench.update(cx, |wb, cx| wb.open_file(path, cx)).is_err() {
+                    // 先判文档内锚点(滚动预览到章节),再判文件链接(新标签打开)
+                    if let Some(slug) = nib_core::markdown::anchor_slug_from_nibfile_url(&url) {
+                        if workbench
+                            .update(cx, |wb, cx| wb.scroll_md_to_anchor(&slug, cx))
+                            .is_err()
+                        {
                             return; // 窗口/Workbench 已销毁 → 退出循环
+                        }
+                    } else if let Some(path) = nib_core::markdown::path_from_nibfile_url(&url) {
+                        if workbench.update(cx, |wb, cx| wb.open_file(path, cx)).is_err() {
+                            return;
                         }
                     }
                 }
