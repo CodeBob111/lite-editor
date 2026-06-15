@@ -4696,6 +4696,16 @@ fn main() {
             }
         }
     });
+    // 首启自动注册 CC 完成通知 Stop hook(幂等,marker 防重复;只首次写一次 settings.json)。
+    // 纯文件 IO,off 主线程,失败只打日志不影响启动。
+    std::thread::spawn(|| match nib_core::cc_hook::ensure_registered_once() {
+        Ok(nib_core::cc_hook::RegisterOutcome::Registered) => {
+            eprintln!("[nib] 已注册 CC 完成通知 hook 到 ~/.claude/settings.json(已备份原文件)");
+        }
+        Err(e) => eprintln!("[nib] CC hook 注册跳过: {e}"),
+        _ => {}
+    });
+
     app.run(move |cx| {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);

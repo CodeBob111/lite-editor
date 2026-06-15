@@ -108,6 +108,42 @@ pub fn watch_project_turns(
     Some(CcTurnWatcher { _watcher: watcher })
 }
 
+/// 监控 CC Stop hook 的事件目录(精确路):hook(gated on NIB_TERMINAL)每次写一个事件文件,
+/// 新文件出现即一个「Nib 里的 CC 回合结束」→ 回调。文件随即删除(消费 + 防堆积)。启动时先清掉
+/// 堆积的陈旧事件(Nib 没开时写的,补报无意义)。回调在 notify 线程,只做非阻塞投递。
+pub fn watch_event_dir(
+    dir: &Path,
+    on_event: Arc<dyn Fn() + Send + Sync>,
+) -> Option<CcTurnWatcher> {
+    std::fs::create_dir_all(dir).ok()?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        let Ok(event) = res else {
+            return;
+        };
+        if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+            return;
+        }
+        let mut fired = false;
+        for path in event.paths {
+            if path.extension().is_some_and(|x| x == "json") {
+                let _ = std::fs::remove_file(&path); // 消费掉,防重复触发 + 防堆积
+                fired = true;
+            }
+        }
+        if fired {
+            on_event();
+        }
+    })
+    .ok()?;
+    watcher.watch(dir, RecursiveMode::NonRecursive).ok()?;
+    Some(CcTurnWatcher { _watcher: watcher })
+}
+
 /// tail 文件 `[已消费偏移, 当前EOF)` 的新增字节,推进偏移(只跨过完整行,半行留到下次),
 /// 其中是否出现「回合结束」行。按字节读 + 完整行才解析,避免读到半个多字节字符。
 fn tail_has_turn_end(path: &Path, offsets: &Mutex<HashMap<PathBuf, u64>>) -> bool {

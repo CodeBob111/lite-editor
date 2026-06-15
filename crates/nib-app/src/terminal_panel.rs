@@ -145,8 +145,12 @@ pub struct TerminalPanel {
     ime_marked: String,
     /// CC 在本项目跑完一个回合、用户还没回看终端 → 终端 tab 显红点。聚焦终端即清。
     cc_done: bool,
-    /// CC 回合监控句柄(drop 即停);项目变更时重建。
+    /// 最近一次 CC 完成时刻:文件监控与 hook 两路会为同一回合各报一次,据此 ~5s 内去重防角标 +2。
+    cc_done_at: Option<Instant>,
+    /// CC 回合监控句柄(jsonl 文件监控,per-project,drop 即停;项目变更时重建)。
     _cc_watch: Option<nib_core::cc_watch::CcTurnWatcher>,
+    /// CC Stop hook 事件目录监控句柄(全局,new 时起一次,不随项目重建)。
+    _cc_event_watch: Option<nib_core::cc_watch::CcTurnWatcher>,
 }
 
 impl TerminalPanel {
@@ -164,11 +168,53 @@ impl TerminalPanel {
             last_op: None,
             ime_marked: String::new(),
             cc_done: false,
+            cc_done_at: None,
             _cc_watch: None,
+            _cc_event_watch: None,
         };
         this.spawn_session(cx);
         this.start_cc_watch(cx);
+        this.start_cc_event_watch(cx);
         this
+    }
+
+    /// CC 一个回合结束(文件监控 或 hook 任一路触发)→ 红点 + dock 角标。两路会为同一回合各报
+    /// 一次,~5s 内去重(只第一次 bump 角标),但红点幂等可重复设。
+    fn on_cc_done(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let dup = self
+            .cc_done_at
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(5));
+        self.cc_done_at = Some(now);
+        self.cc_done = true;
+        if !dup {
+            // 后台时亮 dock 角标(在 Nib 里时靠红点;bump 内部判前台会 no-op)
+            nib_core::dock::bump_badge();
+        }
+        cx.notify();
+    }
+
+    /// 起 CC Stop hook 事件目录监控(精确路,全局):hook 写事件 → on_cc_done。
+    fn start_cc_event_watch(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = nib_core::cc_hook::cc_events_dir() else {
+            return;
+        };
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
+        let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = tx.unbounded_send(());
+        });
+        self._cc_event_watch = nib_core::cc_watch::watch_event_dir(&dir, waker);
+        cx.spawn(async move |weak, cx| {
+            while rx.next().await.is_some() {
+                if weak
+                    .update(cx, |this: &mut TerminalPanel, cx| this.on_cc_done(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// 起 CC 回合监控(零配置兜底):watch 项目的 CC 会话目录,回合结束 → cc_done 红点 + dock 角标。
@@ -181,15 +227,10 @@ impl TerminalPanel {
         self._cc_watch = nib_core::cc_watch::watch_project_turns(&self.project_root, waker);
         cx.spawn(async move |weak, cx| {
             while rx.next().await.is_some() {
-                let alive = weak
-                    .update(cx, |this: &mut TerminalPanel, cx| {
-                        this.cc_done = true;
-                        // 后台时亮 dock 角标(在 Nib 里时靠 cc_done 红点;bump 内部判前台会 no-op)
-                        nib_core::dock::bump_badge();
-                        cx.notify();
-                    })
-                    .is_ok();
-                if !alive {
+                if weak
+                    .update(cx, |this: &mut TerminalPanel, cx| this.on_cc_done(cx))
+                    .is_err()
+                {
                     break; // 面板已销毁
                 }
             }

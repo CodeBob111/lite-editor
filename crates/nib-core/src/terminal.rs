@@ -137,6 +137,10 @@ impl TerminalSession {
         let mut env = HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
+        // 标记「这个会话起自 Nib 终端」:沿进程继承链传到 shell → claude → CC 的 hook,
+        // CC Stop hook 据此只对 Nib 里跑的会话生效(见 cc_hook),与全局其它 CC 会话隔离,
+        // 且不依赖 cwd 猜测(cd 进子目录也认得)。
+        env.insert("NIB_TERMINAL".to_string(), "1".to_string());
         let options = tty::Options {
             shell: None,
             working_directory: Some(cwd.into()),

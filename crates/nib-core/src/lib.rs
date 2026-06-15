@@ -7,6 +7,7 @@
 pub mod arthas;
 pub mod arthas_run;
 pub mod astore;
+pub mod cc_hook;
 pub mod cc_watch;
 pub mod clipboard;
 pub mod diff;
