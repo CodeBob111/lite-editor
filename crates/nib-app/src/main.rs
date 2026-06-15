@@ -2076,10 +2076,26 @@ impl Workbench {
     fn select_line_on_empty_double_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active() else { return };
         let editor = tab.editor.clone();
-        if !editor.read(cx).selected_range().is_empty() {
+        let sel = editor.read(cx).selected_range();
+        if sel.start != sel.end {
             return; // 双击在词上,保持选词
         }
-        let line = editor.read(cx).cursor_position().line;
+        // 不能直接用 cursor_position().line:过界双击行末时,光标 offset 被规整到了「下一行行首」,
+        // 那样会选成下一行。改用光标 byte offset + 边界字符,统一定位到「用户实际点的那一行」:
+        // - 光标处是 \n / 文末 → 就在该行末尾 → 选该行;
+        // - 光标在非空行行首(前一字符是 \n)→ 是规整到了下一行、点的是上一行 → 选上一行;
+        // - 其它(行内空白)→ 选该行。
+        let offset = sel.start;
+        let text = editor.read(cx).value();
+        let bytes = text.as_bytes();
+        let anchor = if bytes.get(offset).copied() == Some(b'\n') || offset >= bytes.len() {
+            offset
+        } else if offset > 0 && bytes.get(offset - 1).copied() == Some(b'\n') {
+            offset - 1
+        } else {
+            offset
+        };
+        let line = bytes[..anchor].iter().filter(|&&b| b == b'\n').count() as u32;
         editor.update(cx, |s, cx| {
             s.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
         });
