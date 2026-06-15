@@ -2511,13 +2511,13 @@ impl Workbench {
             return;
         }
         let raw = tab.editor.read(cx).value();
-        let key = nib_core::markdown::normalize_anchor(slug);
         let sections = nib_core::markdown::split_into_sections(&raw);
-        if let Some(ix) = sections
-            .iter()
-            .position(|s| s.anchor_key.as_deref() == Some(key.as_str()))
-        {
+        if let Some(ix) = nib_core::markdown::find_section_for_anchor(&sections, slug) {
             self.md_scroll.scroll_to_top_of_item(ix);
+            cx.notify();
+        } else {
+            // 锚点没匹配到任何章节(目标不存在 / slug 风格差异过大)→ 状态栏提示,不静默
+            self.status = format!("未找到章节: #{slug}").into();
             cx.notify();
         }
     }

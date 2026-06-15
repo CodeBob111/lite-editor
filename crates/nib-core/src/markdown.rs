@@ -159,6 +159,38 @@ pub fn split_into_sections(md: &str) -> Vec<MdSection> {
     sections
 }
 
+/// 为锚点 slug 找对应章节段的下标。分级匹配,容忍手写锚点与标题的 slug 风格差异:
+/// ① 精确(归一化相等);② 标题归一化「以」slug 归一化「为前缀」——兜住作者省掉标题尾部的
+/// 括注/代码片段(如标题「…配置(`.claude/`)」归一含尾部 `claude`,而锚点只写「…配置」);
+/// ③ 反向(slug 以标题为前缀)。多段命中取分最高、同分取第一个。slug / 标题归一化 <2 字不做
+/// 前缀匹配(避免太短乱跳)。str::starts_with 对 &str 天然按字符边界,多字节安全。
+pub fn find_section_for_anchor(sections: &[MdSection], slug: &str) -> Option<usize> {
+    let key = normalize_anchor(slug);
+    if key.is_empty() {
+        return None;
+    }
+    let key_ok = key.chars().count() >= 2;
+    let mut best: Option<(u8, usize)> = None;
+    for (ix, sec) in sections.iter().enumerate() {
+        let Some(hk) = sec.anchor_key.as_deref() else {
+            continue;
+        };
+        let tier = if hk == key {
+            3
+        } else if key_ok && hk.starts_with(&key) {
+            2
+        } else if key_ok && hk.chars().count() >= 2 && key.starts_with(hk) {
+            1
+        } else {
+            0
+        };
+        if tier > 0 && best.is_none_or(|(b, _)| tier > b) {
+            best = Some((tier, ix));
+        }
+    }
+    best.map(|(_, ix)| ix)
+}
+
 /// 若 `line` 是 ATX 标题(行首 1-6 个 `#` 后跟空白),返回标题文本(去 `#` 与首尾空白)。
 fn atx_heading_title(line: &str) -> Option<&str> {
     let s = line.trim_start();
@@ -243,6 +275,25 @@ mod tests {
         let from_heading = normalize_anchor("内置 Claude Code 配置(.claude/)");
         assert_eq!(from_href, from_heading);
         assert_eq!(from_href, "内置claudecode配置claude");
+    }
+
+    #[test]
+    fn anchor_matches_handwritten_slug_dropping_paren_suffix() {
+        // rate-native README 真实数据:锚点 `#内置-claude-code-配置`,标题
+        // 「内置 Claude Code 配置(`.claude/`)」。标题归一化含尾部 `.claude/` 的 "claude",
+        // 锚点没有 → 精确不中,靠前缀匹配(标题以 slug 为前缀)兜住。
+        let md = "前言\n\n## 配置详解（按需看）\nx\n### 内置 Claude Code 配置（`.claude/`）\n内容\n";
+        let secs = split_into_sections(md);
+        assert_eq!(find_section_for_anchor(&secs, "内置-claude-code-配置"), Some(2));
+        // 作者写全的锚点 → 精确命中,且不被前缀误配到别的段
+        let md2 = "## 推荐的个人 Claude Code 设置（可选）\na\n## 别的\nb\n";
+        let secs2 = split_into_sections(md2);
+        assert_eq!(
+            find_section_for_anchor(&secs2, "推荐的个人-claude-code-设置可选"),
+            Some(0)
+        );
+        // 不存在的锚点 → None
+        assert_eq!(find_section_for_anchor(&secs2, "根本没有这个章节"), None);
     }
 
     #[test]
