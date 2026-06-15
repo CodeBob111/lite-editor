@@ -1536,6 +1536,11 @@ impl Workbench {
                 let active_after = cx
                     .update_window(window_handle, |_, window, _| window.is_window_active())
                     .unwrap_or(false);
+                // 回到 Nib 前台 → 清掉终端响铃累积的 Dock 角标(幂等:计数为 0 时不碰 OS,
+                // 故每拍安全调用,无需做上升沿判定)。哨兵循环在前台执行器=主线程,符合 AppKit 约束。
+                if active_after {
+                    nib_core::dock::clear_badge();
+                }
                 let active = active_before && active_after;
                 active_before = active_after;
                 let alive = this.update(cx, |this, cx| {

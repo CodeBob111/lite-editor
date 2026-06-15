@@ -74,6 +74,8 @@ fn map_color(color: AnsiColor) -> TermColor {
 struct EventProxy {
     dirty: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
+    /// 终端响铃(BEL 0x07):CLI 任务跑完/等输入时常发(如 Claude Code)。UI 据此弹 Dock 角标。
+    bell: Arc<AtomicBool>,
     waker: Arc<dyn Fn() + Send + Sync>,
     loop_tx: Arc<FairMutex<Option<EventLoopSender>>>,
 }
@@ -99,6 +101,11 @@ impl EventListener for EventProxy {
                 self.exited.store(true, Ordering::Release);
                 self.mark_dirty();
             }
+            // BEL:置铃标志,并经 mark_dirty 唤醒 UI 一帧去取(take_bell)
+            Event::Bell => {
+                self.bell.store(true, Ordering::Release);
+                self.mark_dirty();
+            }
             // ColorRequest/TextAreaSizeRequest/Clipboard*:v1 不应答(罕见查询,
             // 不应答仅查询方收不到回报,不影响正常输出)
             _ => self.mark_dirty(),
@@ -111,6 +118,7 @@ pub struct TerminalSession {
     notifier: Notifier,
     dirty: Arc<AtomicBool>,
     exited: Arc<AtomicBool>,
+    bell: Arc<AtomicBool>,
     waker: Arc<dyn Fn() + Send + Sync>,
     size: FairMutex<(u16, u16)>, // (cols, rows)
 }
@@ -145,11 +153,13 @@ impl TerminalSession {
 
         let dirty = Arc::new(AtomicBool::new(false));
         let exited = Arc::new(AtomicBool::new(false));
+        let bell = Arc::new(AtomicBool::new(false));
         let loop_tx = Arc::new(FairMutex::new(None));
         let proxy_waker = waker.clone();
         let proxy = EventProxy {
             dirty: dirty.clone(),
             exited: exited.clone(),
+            bell: bell.clone(),
             waker,
             loop_tx: loop_tx.clone(),
         };
@@ -172,6 +182,7 @@ impl TerminalSession {
             notifier: Notifier(sender),
             dirty,
             exited,
+            bell,
             waker: proxy_waker,
             size: FairMutex::new((cols, rows)),
         })
@@ -246,6 +257,11 @@ impl TerminalSession {
     /// UI 帧首调:有脏才值得 snapshot
     pub fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::AcqRel)
+    }
+
+    /// 取走「自上次取走后是否响过铃」(BEL)。UI 据此弹 Dock 角标。读取即清零。
+    pub fn take_bell(&self) -> bool {
+        self.bell.swap(false, Ordering::AcqRel)
     }
 
     pub fn is_exited(&self) -> bool {
@@ -396,6 +412,33 @@ mod tests {
         assert_eq!(session.snapshot().rows.len(), 24);
         session.resize(60, 10);
         assert_eq!(session.snapshot().rows.len(), 10);
+        session.shutdown();
+    }
+
+    /// shell 输出 BEL(0x07)→ alacritty 解析为 Event::Bell → 置铃标志,take_bell 兑现一次后复位。
+    /// 这是 Dock 角标功能的关键接线(Claude Code 跑完响铃即走此路)。
+    #[test]
+    fn bel_byte_sets_bell_flag() {
+        let session = TerminalSession::spawn(
+            std::env::temp_dir().to_string_lossy().to_string(),
+            80,
+            24,
+            Arc::new(|| {}),
+        )
+        .expect("spawn shell");
+        // printf '\a' 输出一个裸 BEL 字节
+        session.write(b"printf '\\a'\r".to_vec());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut rang = false;
+        while Instant::now() < deadline {
+            if session.take_bell() {
+                rang = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert!(rang, "10s 内未捕获到 BEL → take_bell");
+        assert!(!session.take_bell(), "take_bell 取走后应复位为 false");
         session.shutdown();
     }
 }

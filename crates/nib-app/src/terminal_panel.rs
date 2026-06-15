@@ -232,6 +232,12 @@ impl TerminalPanel {
     fn pull(&mut self, id: u64, cx: &mut Context<Self>) {
         let mut dirtied = None;
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+            // 响铃(BEL):CLI 任务跑完/等输入(如 Claude Code)。独立于 take_dirty 取——
+            // Bell 虽也置脏,但即便该帧脏已被消费,铃标志仍要单独兑现。Nib 不在前台时
+            // bump_badge 才落 Dock 角标(前台判定在内部)。
+            if tab.session.take_bell() {
+                nib_core::dock::bump_badge();
+            }
             if tab.session.take_dirty() {
                 tab.snap = tab.session.snapshot();
                 tab.exited = tab.session.is_exited();
