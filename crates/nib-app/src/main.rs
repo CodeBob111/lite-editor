@@ -3646,6 +3646,10 @@ impl Workbench {
             .child(div().flex_1().min_h_0().map(|c| match self.panel_tab {
                 PanelTab::Terminal => {
                     if let Some(panel) = self.terminal.clone() {
+                        // 把内容区实际高(面板高 - 30 顶栏 - 1 边框)推给终端,让它按真实高算 grid 行数;
+                        // 否则恒按 const 220 → 拖高后网格仍 ~12 行,TUI(如 Claude Code)展示不全。
+                        let content_h = (self.terminal_height - 31.).max(60.);
+                        panel.update(cx, |p, _| p.set_height(content_h));
                         c.child(panel)
                     } else {
                         c.child(div().p_3().text_color(muted).child("终端未启动"))

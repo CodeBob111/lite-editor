@@ -134,6 +134,9 @@ pub struct TerminalPanel {
     cell_w: Option<Pixels>,
     /// 右侧占位宽(Astore 右侧栏开启时为其宽度),列数推算要扣掉
     right_inset: f32,
+    /// 终端内容区实际可用高(由 Workbench 按拖动后的面板高推入);grid 行数按它算,
+    /// 不再用固定 PANEL_HEIGHT——否则拖高面板时网格仍只 ~12 行,TUI(如 Claude Code)展示不全。
+    panel_height: f32,
     status: SharedString,
     /// 最近一次终端工作(收到 PTY 输出重建网格)的标签+时刻;卡顿哨兵据此归因
     last_op: Option<(SharedString, Instant)>,
@@ -152,6 +155,7 @@ impl TerminalPanel {
             next_id: 0,
             cell_w: None,
             right_inset: 0.,
+            panel_height: PANEL_HEIGHT,
             status: "".into(),
             last_op: None,
             ime_marked: String::new(),
@@ -175,6 +179,12 @@ impl TerminalPanel {
 
     pub fn set_right_inset(&mut self, inset: f32) {
         self.right_inset = inset;
+    }
+
+    /// Workbench 按拖动后的面板高推入内容区实际高;不 notify(本面板作为子元素随父重渲染,
+    /// 下一帧 render 即按新高算 grid 行数)。
+    pub fn set_height(&mut self, height: f32) {
+        self.panel_height = height;
     }
 
     /// 最近一次终端工作的标签+时刻(卡顿哨兵跨组件读取归因用)
@@ -363,7 +373,8 @@ impl Render for TerminalPanel {
             - self.right_inset
             - 10.;
         let cols = ((avail_w / f32::from(cell_w)).floor() as u16).clamp(2, 500);
-        let rows = (((PANEL_HEIGHT - HEADER_H - PAD_V) / LINE_H).floor() as u16).clamp(2, 100);
+        let rows =
+            (((self.panel_height - HEADER_H - PAD_V) / LINE_H).floor() as u16).clamp(2, 100);
         self.sync_grid(cols, rows);
 
         let active_ix = self.active;
