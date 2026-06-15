@@ -704,7 +704,7 @@ impl Workbench {
         self.expanded_paths.clear();
         session::remember_recent(root.to_string_lossy().to_string());
         if let Some(panel) = &self.terminal {
-            panel.update(cx, |panel, _| panel.set_project(root.clone()));
+            panel.update(cx, |panel, cx| panel.set_project(root.clone(), cx));
         }
 
         self.reload_tree(cx);
@@ -3624,6 +3624,21 @@ impl Workbench {
                         cx,
                     ))
                     .child(tab_btn("pt-terminal", "终端".into(), PanelTab::Terminal, cx))
+                    // CC 在本项目跑完一轮、还没回看终端 → 终端页签后红点(聚焦终端即清)
+                    .when(
+                        self.terminal
+                            .as_ref()
+                            .is_some_and(|t| t.read(cx).cc_done()),
+                        |s| {
+                            s.child(
+                                div()
+                                    .w(px(7.))
+                                    .h(px(7.))
+                                    .rounded_full()
+                                    .bg(cx.theme().danger),
+                            )
+                        },
+                    )
                     .child(tab_btn("pt-output", "输出".into(), PanelTab::Output, cx))
                     .child(div().flex_1())
                     .child(

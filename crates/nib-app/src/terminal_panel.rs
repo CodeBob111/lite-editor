@@ -143,6 +143,10 @@ pub struct TerminalPanel {
     /// 输入法预编辑串(合成中的未提交文字,如拼音/候选)。提交后清空、写入 PTY。
     /// 全局单一合成(IME 一次只在聚焦控件上合成),故放面板而非每标签。
     ime_marked: String,
+    /// CC 在本项目跑完一个回合、用户还没回看终端 → 终端 tab 显红点。聚焦终端即清。
+    cc_done: bool,
+    /// CC 回合监控句柄(drop 即停);项目变更时重建。
+    _cc_watch: Option<nib_core::cc_watch::CcTurnWatcher>,
 }
 
 impl TerminalPanel {
@@ -159,9 +163,43 @@ impl TerminalPanel {
             status: "".into(),
             last_op: None,
             ime_marked: String::new(),
+            cc_done: false,
+            _cc_watch: None,
         };
         this.spawn_session(cx);
+        this.start_cc_watch(cx);
         this
+    }
+
+    /// 起 CC 回合监控(零配置兜底):watch 项目的 CC 会话目录,回合结束 → cc_done 红点 + dock 角标。
+    /// 回调在 notify 线程,经 unbounded channel 投递到 gpui spawn 循环(主线程)再更新 UI。
+    fn start_cc_watch(&mut self, cx: &mut Context<Self>) {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
+        let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = tx.unbounded_send(());
+        });
+        self._cc_watch = nib_core::cc_watch::watch_project_turns(&self.project_root, waker);
+        cx.spawn(async move |weak, cx| {
+            while rx.next().await.is_some() {
+                let alive = weak
+                    .update(cx, |this: &mut TerminalPanel, cx| {
+                        this.cc_done = true;
+                        // 后台时亮 dock 角标(在 Nib 里时靠 cc_done 红点;bump 内部判前台会 no-op)
+                        nib_core::dock::bump_badge();
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    break; // 面板已销毁
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// CC 回合完成、未回看 → 终端 tab 显红点(Workbench 读取)。
+    pub fn cc_done(&self) -> bool {
+        self.cc_done
     }
 
     fn active_tab(&self) -> Option<&TermTab> {
@@ -172,9 +210,12 @@ impl TerminalPanel {
         self.focus_handle.clone()
     }
 
-    pub fn set_project(&mut self, root: PathBuf) {
+    pub fn set_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
         // 当前 shell 不动(它有自己的 cwd);只影响之后的重启
         self.project_root = root;
+        // 换项目 → CC 会话目录也换:重建监控、清掉旧项目的红点
+        self.cc_done = false;
+        self.start_cc_watch(cx);
     }
 
     pub fn set_right_inset(&mut self, inset: f32) {
@@ -284,6 +325,11 @@ impl TerminalPanel {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        // 在终端里敲键 = 已回看 → 清 CC 完成红点
+        if self.cc_done {
+            self.cc_done = false;
+            cx.notify();
+        }
         let Some(tab) = self.active_tab() else {
             return;
         };
@@ -544,6 +590,7 @@ impl Render for TerminalPanel {
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
                             window.focus(&this.focus_handle, cx);
+                            this.cc_done = false; // 点开终端 = 已回看,清红点
                         }),
                     )
                     .child(v_flex().children(rows_el))
