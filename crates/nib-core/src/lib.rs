@@ -21,6 +21,7 @@ pub mod paths;
 pub mod rt;
 pub mod search;
 pub mod terminal;
+pub mod text;
 pub mod session;
 pub mod usage_index;
 pub mod watch;

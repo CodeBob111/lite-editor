@@ -3,6 +3,7 @@
 // take_dirty()→snapshot() 拉一帧已合并 run 的网格,8ms 节流,主线程零阻塞。
 // 配色对齐旧版 xterm theme(bg #0d1017 / cursor #3b82f6 / ANSI 8 色)。
 
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -111,6 +112,8 @@ fn keystroke_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
     Some(seq)
 }
 
+use nib_core::text::{byte_range_to_utf16, utf16_len, utf16_to_byte};
+
 /// 单个终端会话(对齐旧版 terminal-tabs:每会话一个标签,可多开)
 struct TermTab {
     id: u64,
@@ -134,6 +137,9 @@ pub struct TerminalPanel {
     status: SharedString,
     /// 最近一次终端工作(收到 PTY 输出重建网格)的标签+时刻;卡顿哨兵据此归因
     last_op: Option<(SharedString, Instant)>,
+    /// 输入法预编辑串(合成中的未提交文字,如拼音/候选)。提交后清空、写入 PTY。
+    /// 全局单一合成(IME 一次只在聚焦控件上合成),故放面板而非每标签。
+    ime_marked: String,
 }
 
 impl TerminalPanel {
@@ -148,6 +154,7 @@ impl TerminalPanel {
             right_inset: 0.,
             status: "".into(),
             last_op: None,
+            ime_marked: String::new(),
         };
         this.spawn_session(cx);
         this
@@ -541,7 +548,158 @@ impl Render for TerminalPanel {
                                 .bg(hex(TERM_CURSOR))
                                 .opacity(0.55),
                         )
+                    })
+                    .child({
+                        // paint 阶段注册输入法处理器(仅聚焦时生效),让 IME 能在终端里合成。
+                        // canvas 不画东西,只借 paint 钩子调 window.handle_input;absolute+size_full
+                        // 覆盖网格,其 bounds 即候选窗定位用的 element_bounds。无鼠标监听=不挡点击。
+                        let entity = cx.entity();
+                        let focus = self.focus_handle.clone();
+                        canvas(
+                            |_, _, _| {},
+                            move |bounds, _, window, cx| {
+                                window.handle_input(
+                                    &focus,
+                                    ElementInputHandler::new(bounds, entity),
+                                    cx,
+                                );
+                            },
+                        )
+                        .absolute()
+                        .size_full()
                     }),
             )
+    }
+}
+
+// 终端的输入法接入(EntityInputHandler):让 CJK 输入法在终端里也能合成中文。
+// 由 render 里的 canvas 在 paint 时 window.handle_input(ElementInputHandler) 注册。
+// ElementInputHandler 的 prefers_ime_for_printable_keys = accepts_text_input(true):
+// 中文输入源激活时,可打印键先进 IME 合成(本 impl);纯英文键盘布局(ASCII-capable)
+// 由 gpui 的 is_ime_input_source_active() 判定为非 IME,键照旧走 on_key_down/keystroke_bytes
+// 原始直达 PTY——故 ASCII 路径不变,只新增 CJK。文档=当前预编辑串(无可编辑缓冲)。
+impl EntityInputHandler for TerminalPanel {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let len = self.ime_marked.len();
+        let s = utf16_to_byte(&self.ime_marked, range_utf16.start).min(len);
+        let e = utf16_to_byte(&self.ime_marked, range_utf16.end).min(len);
+        if s > e {
+            return None;
+        }
+        adjusted_range.replace(byte_range_to_utf16(&self.ime_marked, s..e));
+        Some(self.ime_marked[s..e].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        // 无可编辑文档,插入点落在预编辑串末尾(零宽)
+        let end = utf16_len(&self.ime_marked);
+        Some(UTF16Selection {
+            range: end..end,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        if self.ime_marked.is_empty() {
+            None
+        } else {
+            Some(0..utf16_len(&self.ime_marked))
+        }
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.ime_marked.is_empty() {
+            self.ime_marked.clear();
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // IME 提交(或直接插入):原始字节写入 PTY,不能用 paste(避免 bracketed-paste 包裹);
+        // 不本地累积——shell 会回显,留着会双重渲染。
+        let sess = self
+            .active_tab()
+            .filter(|t| !t.exited)
+            .map(|t| t.session.clone());
+        if let Some(sess) = sess {
+            sess.write(text.as_bytes().to_vec());
+            sess.scroll_to_bottom();
+        }
+        self.ime_marked.clear();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 合成中:在预编辑串内按 UTF-16 范围替换;无范围则整体替换(首次合成 / 整串改写)
+        let len = self.ime_marked.len();
+        let byte_range = match range_utf16 {
+            Some(r) => {
+                utf16_to_byte(&self.ime_marked, r.start).min(len)
+                    ..utf16_to_byte(&self.ime_marked, r.end).min(len)
+            }
+            None => 0..len,
+        };
+        self.ime_marked.replace_range(byte_range, new_text);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        // 候选窗定位到终端光标所在单元格(element_bounds = 网格 canvas 的屏幕矩形)
+        let (row, col) = self.active_tab().and_then(|t| t.snap.cursor)?;
+        let cell_w = self.cell_w?;
+        let x = element_bounds.origin.x + px(5.) + cell_w * col as f32;
+        let y = element_bounds.origin.y + px(4.) + px(LINE_H) * row as f32;
+        Some(Bounds {
+            origin: point(x, y),
+            size: size(cell_w, px(LINE_H)),
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        // 有活动会话且未退出才收文本——也驱动 prefers_ime,退出的 shell 自然停掉 IME
+        self.active_tab().is_some_and(|t| !t.exited)
     }
 }
