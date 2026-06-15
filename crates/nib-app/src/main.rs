@@ -2066,6 +2066,23 @@ impl Workbench {
     }
 
     /// F12 跳定义(旧版主路径):跨文件由宿主完成,绕开组件只支持同文件的限制
+    /// 双击落在行末 / 行内空白(无单词)→ 整行选中。判据:gpui-component 的 select_word 在无词处
+    /// 直接早退、不改选区,故双击后 selected_range 为空即「没选中词」→ 改成选整行;双击单词时选区
+    /// 非空 → 保持选词,不动。机制:InputState 无公开「设选区」API,故 set_cursor_position 到行首
+    /// (公开、同步、且会聚焦编辑器),再派发 SelectToEndOfLine 扩到行尾。
+    fn select_line_on_empty_double_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active() else { return };
+        let editor = tab.editor.clone();
+        if !editor.read(cx).selected_range().is_empty() {
+            return; // 双击在词上,保持选词
+        }
+        let line = editor.read(cx).cursor_position().line;
+        editor.update(cx, |s, cx| {
+            s.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
+        });
+        window.dispatch_action(Box::new(gpui_component::input::SelectToEndOfLine), cx);
+    }
+
     fn on_goto_definition(
         &mut self,
         _: &GotoDefinition,
@@ -4254,6 +4271,11 @@ impl Render for Workbench {
                                                                 &GotoDefinition,
                                                                 window,
                                                                 cx,
+                                                            );
+                                                        } else if event.click_count == 2 {
+                                                            // 双击行末/空白(无词)→ 整行选中
+                                                            this.select_line_on_empty_double_click(
+                                                                window, cx,
                                                             );
                                                         }
                                                     },
