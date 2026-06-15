@@ -2077,25 +2077,20 @@ impl Workbench {
         let Some(tab) = self.active() else { return };
         let editor = tab.editor.clone();
         let sel = editor.read(cx).selected_range();
-        if sel.start != sel.end {
-            return; // 双击在词上,保持选词
-        }
-        // 不能直接用 cursor_position().line:过界双击行末时,光标 offset 被规整到了「下一行行首」,
-        // 那样会选成下一行。改用光标 byte offset + 边界字符,统一定位到「用户实际点的那一行」:
-        // - 光标处是 \n / 文末 → 就在该行末尾 → 选该行;
-        // - 光标在非空行行首(前一字符是 \n)→ 是规整到了下一行、点的是上一行 → 选上一行;
-        // - 其它(行内空白)→ 选该行。
-        let offset = sel.start;
         let text = editor.read(cx).value();
-        let bytes = text.as_bytes();
-        let anchor = if bytes.get(offset).copied() == Some(b'\n') || offset >= bytes.len() {
-            offset
-        } else if offset > 0 && bytes.get(offset - 1).copied() == Some(b'\n') {
-            offset - 1
-        } else {
-            offset
-        };
-        let line = bytes[..anchor].iter().filter(|&&b| b == b'\n').count() as u32;
+        // 实证(诊断日志):双击行末时 gpui 的 select_word 选中的是行尾的 `\n`(1 字符,非空选区),
+        // 行内空白双击选中的是空格。所以判据不能是「选区为空」,而是「选区为空 或 只选到空白/换行」
+        // → 没选到真正的词 → 选整行;选到词(trim 后非空)→ 保持选词。
+        let selected = text.get(sel.start..sel.end).unwrap_or("");
+        if !selected.trim().is_empty() {
+            return;
+        }
+        // 行号 = 选区起点之前的换行数。选行末 `\n` 时起点正是该 `\n`(它是该行的终止符)→ 用户点的那行;
+        // 行内空白时起点在该行内 → 同一行。
+        let line = text.as_bytes()[..sel.start]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count() as u32;
         editor.update(cx, |s, cx| {
             s.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
         });
