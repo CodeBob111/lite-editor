@@ -35,18 +35,53 @@ pub fn cc_project_dir(cwd: &Path) -> Option<PathBuf> {
     )
 }
 
-/// 一行 jsonl 是否「一个主回合结束」:assistant 消息、非子 agent(sidechain)、stop_reason=end_turn。
-/// 中途调工具的 assistant 是 `tool_use`,子 agent 回合是 sidechain,都不算。
+/// 一行 jsonl 是否「一个主回合结束」:assistant 消息、非子 agent(sidechain)、stop_reason=end_turn,
+/// 且含至少一个**非 thinking** 内容块。中途调工具的 assistant 是 `tool_use`、子 agent 是 sidechain,
+/// 都不算。
+///
+/// 关键:CC 一个回合会写**两条** end_turn 行——先 thinking 块、再 text 块(同 msg_id,但可能差几十秒)。
+/// 若两条都触发,5s 去重窗兜不住 → 一回合弹好几次。故只认含用户可见消息(text 等)的那条,跳过
+/// thinking-only 行;它紧挨 Stop hook,两路信号才能被 ~5s 去重合并成一次。
 pub fn line_is_turn_end(line: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
-    };
-    v.get("type").and_then(|t| t.as_str()) == Some("assistant")
-        && v.get("isSidechain").and_then(|b| b.as_bool()) != Some(true)
-        && v.get("message")
+    turn_end_msg_id(line).is_some()
+}
+
+/// 若该行是「主回合结束」,返回其 assistant 消息 id(无 id 字段则空串),否则 None。
+/// 用来按 msg_id 去重:CC 一个回合可能写多条 end_turn 行(thinking + 多个 text 块),同一 msg_id,
+/// 只该触发一次。
+pub fn turn_end_msg_id(line: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("assistant")
+        || v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true)
+        || v.get("message")
             .and_then(|m| m.get("stop_reason"))
             .and_then(|s| s.as_str())
-            == Some("end_turn")
+            != Some("end_turn")
+    {
+        return None;
+    }
+    // content 是数组时:必须有非 thinking 块(跳过 thinking-only 行,它比最终 text 早写);
+    // 异常无数组 → 保守当回合结束
+    let is_end = match v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        Some(blocks) => blocks
+            .iter()
+            .any(|b| b.get("type").and_then(|t| t.as_str()) != Some("thinking")),
+        None => true,
+    };
+    if !is_end {
+        return None;
+    }
+    Some(
+        v.get("message")
+            .and_then(|m| m.get("id"))
+            .and_then(|i| i.as_str())
+            .unwrap_or("")
+            .to_string(),
+    )
 }
 
 /// CC 回合监控句柄:持有 notify watcher,drop 即停。
@@ -81,8 +116,11 @@ pub fn watch_project_turns(
         }
     }
 
+    // 上次已触发的 msg_id:一个回合可能写多条 end_turn 行(同 msg_id),只触发一次。
+    let last_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let cb_offsets = offsets.clone();
     let cb_target = target_dir.clone();
+    let cb_last = last_id.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         let Ok(event) = res else {
             return;
@@ -94,7 +132,7 @@ pub fn watch_project_turns(
             // 只看目标项目目录下的 *.jsonl(recursive watch 会带来全机器其它会话的事件)
             if path.starts_with(&cb_target)
                 && path.extension().is_some_and(|x| x == "jsonl")
-                && tail_has_turn_end(&path, &cb_offsets)
+                && tail_has_turn_end(&path, &cb_offsets, &cb_last)
             {
                 on_turn_done();
             }
@@ -145,8 +183,13 @@ pub fn watch_event_dir(
 }
 
 /// tail 文件 `[已消费偏移, 当前EOF)` 的新增字节,推进偏移(只跨过完整行,半行留到下次),
-/// 其中是否出现「回合结束」行。按字节读 + 完整行才解析,避免读到半个多字节字符。
-fn tail_has_turn_end(path: &Path, offsets: &Mutex<HashMap<PathBuf, u64>>) -> bool {
+/// 其中是否出现**新的**「回合结束」行(按 msg_id 去重:同回合多条 end_turn 行只算一次)。
+/// 按字节读 + 完整行才解析,避免读到半个多字节字符。
+fn tail_has_turn_end(
+    path: &Path,
+    offsets: &Mutex<HashMap<PathBuf, u64>>,
+    last_id: &Mutex<Option<String>>,
+) -> bool {
     let mut map = offsets.lock().unwrap();
     let start = *map.get(path).unwrap_or(&0);
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -175,8 +218,20 @@ fn tail_has_turn_end(path: &Path, offsets: &Mutex<HashMap<PathBuf, u64>>) -> boo
         return false; // 还没有完整行,不推进偏移
     };
     map.insert(path.to_path_buf(), start + last_nl as u64 + 1);
+    drop(map); // 解析阶段不用持有偏移锁
     let complete = String::from_utf8_lossy(&bytes[..=last_nl]);
-    complete.lines().any(line_is_turn_end)
+    let mut last = last_id.lock().unwrap();
+    let mut fired = false;
+    for line in complete.lines() {
+        if let Some(id) = turn_end_msg_id(line) {
+            // 同一 msg_id 的多条 end_turn 行(thinking + 多个 text)只触发一次
+            if last.as_deref() != Some(id.as_str()) {
+                *last = Some(id);
+                fired = true;
+            }
+        }
+    }
+    fired
 }
 
 #[cfg(test)]
@@ -198,20 +253,25 @@ mod tests {
 
     #[test]
     fn turn_end_only_for_assistant_end_turn_non_sidechain() {
+        // 含 text 块(用户可见的最终消息)→ 算
         assert!(line_is_turn_end(
-            r#"{"type":"assistant","isSidechain":false,"message":{"role":"assistant","stop_reason":"end_turn"}}"#
+            r#"{"type":"assistant","isSidechain":false,"message":{"stop_reason":"end_turn","content":[{"type":"text"}]}}"#
         ));
-        // isSidechain 缺省视为非 sidechain
+        // 无 content 数组(异常)→ 保守当回合结束
         assert!(line_is_turn_end(
             r#"{"type":"assistant","message":{"stop_reason":"end_turn"}}"#
         ));
+        // thinking-only 的 end_turn → 不算(它比最终 text 早写,会重复触发)
+        assert!(!line_is_turn_end(
+            r#"{"type":"assistant","message":{"stop_reason":"end_turn","content":[{"type":"thinking"}]}}"#
+        ));
         // 中途调工具 = tool_use,不算
         assert!(!line_is_turn_end(
-            r#"{"type":"assistant","message":{"stop_reason":"tool_use"}}"#
+            r#"{"type":"assistant","message":{"stop_reason":"tool_use","content":[{"type":"text"}]}}"#
         ));
         // 子 agent 回合 = sidechain,不算
         assert!(!line_is_turn_end(
-            r#"{"type":"assistant","isSidechain":true,"message":{"stop_reason":"end_turn"}}"#
+            r#"{"type":"assistant","isSidechain":true,"message":{"stop_reason":"end_turn","content":[{"type":"text"}]}}"#
         ));
         // 用户/系统行不算;坏 JSON 不 panic
         assert!(!line_is_turn_end(r#"{"type":"user","message":{}}"#));
