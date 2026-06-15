@@ -37,6 +37,12 @@ pub fn file_uri(path: &str) -> String {
     format!("file://{}", utf8_percent_encode(path, URI_PATH))
 }
 
+/// 路径 percent-encode 用的字符集(保留 `/`),供别处构造自定义 scheme URL 复用(如
+/// markdown 的 nibfile://)。
+pub fn uri_path_set() -> &'static AsciiSet {
+    URI_PATH
+}
+
 /// file:// URI → 文件系统路径(strip 前缀 + percent-decode),与 [`file_uri`] 对称。
 /// jdtls 返回编码过的 URI(如 `file:///a/Foo%20copy.java`)时还原回真实路径。
 pub fn path_from_file_uri(uri: &str) -> String {
@@ -859,7 +865,9 @@ pub async fn lsp_find_references(
     let params = serde_json::json!({
         "textDocument": { "uri": file_uri(&file_path) },
         "position": { "line": line, "character": character },
-        "context": { "includeDeclaration": true }
+        // false:find usages 只列调用点,不把声明/定义本身当一条引用(对齐 IDEA;否则站在
+        // 声明上查引用会把声明自己列出来)。
+        "context": { "includeDeclaration": false }
     });
 
     let response = request_and_wait_on_worker(
@@ -1017,8 +1025,10 @@ async fn lsp_request_at_jdt_uri(
         "textDocument": { "uri": jdt_uri },
         "position": { "line": line, "character": character }
     });
-    if with_decl {
-        params["context"] = serde_json::json!({ "includeDeclaration": true });
+    // references 必须带 context;definition 不需要。with_decl 控制是否把声明本身计入
+    // (find usages 传 false,只列调用点不列声明)。
+    if method == "textDocument/references" {
+        params["context"] = serde_json::json!({ "includeDeclaration": with_decl });
     }
     let response =
         request_and_wait_on_worker(server, id, method, params, Duration::from_secs(5)).await?;
@@ -1061,7 +1071,7 @@ pub async fn lsp_references_via_jdt(
 ) -> Result<Vec<LspUsage>, String> {
     lsp_request_at_jdt_uri(
         "textDocument/references",
-        true,
+        false, // find usages 不把声明本身列为一条引用
         jdt_uri,
         local_file,
         line,

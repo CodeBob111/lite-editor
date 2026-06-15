@@ -4274,7 +4274,15 @@ impl Render for Workbench {
                                                     .size_full(),
                                             );
                                         if self.md_preview && tab.lang == "markdown" {
-                                            let text = tab.editor.read(cx).value();
+                                            let raw = tab.editor.read(cx).value();
+                                            // 把相对文件链接改写成 nibfile://,预览里点击经
+                                            // on_open_urls 在 Nib 新标签打开(见 main 的 on_open_urls)。
+                                            let base = tab
+                                                .path
+                                                .parent()
+                                                .unwrap_or_else(|| std::path::Path::new("/"));
+                                            let text =
+                                                nib_core::markdown::resolve_relative_links(&raw, base);
                                             // 左右两栏可拖动分隔(h_resizable + 持久状态)
                                             this.child(
                                                 h_resizable("md-split")
@@ -4596,6 +4604,19 @@ fn main() {
     // 注册 gpui-component 内置图标资源(嵌入二进制),否则 IconName::* 的 svg 图标
     // (活动栏 文件/源码/Git/Maven、设置齿轮、定位准星)无 AssetSource → 渲染空白。
     let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    // markdown 预览里点 nibfile:// 链接 → cx.open_url → OS(LaunchServices)把该 scheme 路由回
+    // 本 app。on_open_urls 在 Application(run 之前)上注册,回调签名无 cx,只能把 URL 攒进队列;
+    // run 里窗口起好后的轮询任务取出、在 Workbench 标签打开(Zed 同款 scheme 往返思路)。
+    let pending_urls: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    app.on_open_urls({
+        let p = pending_urls.clone();
+        move |urls| {
+            if let Ok(mut q) = p.lock() {
+                q.extend(urls);
+            }
+        }
+    });
     app.run(move |cx| {
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
@@ -4683,17 +4704,44 @@ fn main() {
         ]);
 
         cx.spawn(async move |cx| {
+            // 捕获 Workbench 弱引用,供下面 URL 处理循环用(open_file 自带 window_handle,无需窗口)。
+            let wb_cell: std::rc::Rc<std::cell::RefCell<Option<WeakEntity<Workbench>>>> =
+                std::rc::Rc::new(std::cell::RefCell::new(None));
             cx.open_window(
                 WindowOptions {
                     titlebar: Some(TitleBar::title_bar_options()),
                     ..Default::default()
                 },
-                |window, cx| {
-                    let view = cx.new(|cx| Workbench::new(window, cx));
-                    cx.new(|cx| Root::new(view, window, cx))
+                {
+                    let wb_cell = wb_cell.clone();
+                    move |window, cx| {
+                        let view = cx.new(|cx| Workbench::new(window, cx));
+                        *wb_cell.borrow_mut() = Some(view.downgrade());
+                        cx.new(|cx| Root::new(view, window, cx))
+                    }
                 },
             )
             .expect("Failed to open window");
+
+            let Some(workbench) = wb_cell.borrow().clone() else {
+                return;
+            };
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+                let urls: Vec<String> = match pending_urls.lock() {
+                    Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
+                    _ => continue,
+                };
+                for url in urls {
+                    if let Some(path) = nib_core::markdown::path_from_nibfile_url(&url) {
+                        if workbench.update(cx, |wb, cx| wb.open_file(path, cx)).is_err() {
+                            return; // 窗口/Workbench 已销毁 → 退出循环
+                        }
+                    }
+                }
+            }
         })
         .detach();
     });
