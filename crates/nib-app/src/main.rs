@@ -5,7 +5,6 @@
 mod astore_panel;
 mod diff_view;
 mod file_icons;
-mod arthas_panel;
 mod git_panel;
 mod maven_panel;
 mod merge_view;
@@ -38,7 +37,6 @@ use gpui_component::{
 
 use futures::StreamExt as _;
 use diff_view::{DiffView, DiffViewEvent};
-use arthas_panel::ArthasPanel;
 use astore_panel::AstorePanel;
 use git_panel::{GitPanel, GitPanelEvent, GitPanelMode};
 use maven_panel::MavenPanel;
@@ -73,7 +71,6 @@ actions!(
         ArthasStack,
         ArthasMonitor,
         ArthasTt,
-        ToggleArthas,
         // 导航历史 cmd+[ / cmd+]
         NavBack,
         NavForward,
@@ -382,8 +379,6 @@ struct Workbench {
     terminal_visible: bool,
     /// 底部面板当前 tab(问题/终端/输出)
     panel_tab: PanelTab,
-    arthas: Option<Entity<ArthasPanel>>,
-    arthas_visible: bool,
     expanded_paths: std::collections::HashSet<String>,
     /// 库源码临时文件(nib-jdt-sources)→ (真实 jdt:// URI, 来源项目根)。
     /// goto-def 进库时记下;之后在库源码里继续 goto-def / find-usages 时,用真实 jdt:// URI
@@ -574,8 +569,6 @@ impl Workbench {
             terminal: None,
             terminal_visible: false,
             panel_tab: PanelTab::Terminal,
-            arthas: None,
-            arthas_visible: false,
             expanded_paths: std::collections::HashSet::new(),
             jdt_sources: std::collections::HashMap::new(),
             git_marks: Arc::new(std::collections::HashMap::new()),
@@ -2430,41 +2423,10 @@ impl Workbench {
                     Ok(()) => format!("已复制: {}", command).into(),
                     Err(err) => format!("复制失败: {}", err).into(),
                 };
-                // 同步打开底部 Arthas 诊断面板并定位目标(命令构造器与剪贴板同源)
-                this.show_arthas(fqn, method, cmd, cx);
                 cx.notify();
             });
         })
         .detach();
-    }
-
-    /// 打开/复用底部 Arthas 面板,并把光标解析出的目标方法注入(供 arthas_command 调用)。
-    fn show_arthas(
-        &mut self,
-        fqn: String,
-        method: Option<String>,
-        cmd: nib_core::arthas::ArthasCommand,
-        cx: &mut Context<Self>,
-    ) {
-        let panel = match &self.arthas {
-            Some(panel) => panel.clone(),
-            None => {
-                let panel = cx.new(ArthasPanel::new);
-                self.arthas = Some(panel.clone());
-                panel
-            }
-        };
-        self.arthas_visible = true;
-        panel.update(cx, |p, cx| p.set_target(fqn, method, cmd, cx));
-    }
-
-    /// 底部 Arthas 面板开/关(菜单 Arthas → 诊断面板 / Ctrl+Shift+A)。
-    fn on_toggle_arthas(&mut self, _: &ToggleArthas, _: &mut Window, cx: &mut Context<Self>) {
-        self.arthas_visible = !self.arthas_visible;
-        if self.arthas_visible && self.arthas.is_none() {
-            self.arthas = Some(cx.new(ArthasPanel::new));
-        }
-        cx.notify();
     }
 
     /// 活动栏切视图(对齐旧版 activity-bar):Commit/Git 共用 GitPanel 按 mode 渲染
@@ -3503,7 +3465,7 @@ impl Workbench {
                             .mb(px(40.))
                             .text_size(px(14.5))
                             .text_color(muted)
-                            .child("Java-first 原生代码编辑器,Rust + GPUI 构建。内置 jdtls 语言服务、完整 Git 客户端、Maven 依赖面板、集成终端,以及 Arthas 在线诊断与 Astore 内网仓库直连。"),
+                            .child("Java-first 原生代码编辑器,Rust + GPUI 构建。内置 jdtls 语言服务、完整 Git 客户端、Maven 依赖面板、集成终端,以及 Arthas 命令一键复制与 Astore 内网仓库直连。"),
                     )
                     // 两栏:开始 + 最近
                     .child(
@@ -4024,7 +3986,6 @@ impl Render for Workbench {
             .on_action(cx.listener(|this: &mut Self, _: &ArthasTt, _, cx| {
                 this.arthas_command(nib_core::arthas::ArthasCommand::Tt, cx)
             }))
-            .on_action(cx.listener(Self::on_toggle_arthas))
             .on_action(cx.listener(Self::on_new_file))
             .on_action(cx.listener(Self::on_new_folder))
             .on_action(cx.listener(Self::on_rename_item))
@@ -4306,8 +4267,6 @@ impl Render for Workbench {
                                                         Box::new(ArthasTt),
                                                     )
                                                     .separator()
-                                                    .menu("诊断面板", Box::new(ToggleArthas))
-                                                    .separator()
                                                     .menu("跳转定义", Box::new(GotoDefinition))
                                                     .menu(
                                                         "复制",
@@ -4404,17 +4363,6 @@ impl Render for Workbench {
                             }))
                             .when(self.terminal_visible, |this| {
                                 this.child(self.render_bottom_panel(cx))
-                            })
-                            .when(self.arthas_visible, |this| {
-                                this.when_some(self.arthas.clone(), |this, panel| {
-                                    this.child(
-                                        div()
-                                            .h(px(arthas_panel::PANEL_HEIGHT))
-                                            .border_t_1()
-                                            .border_color(cx.theme().border)
-                                            .child(panel),
-                                    )
-                                })
                             }),
                     )
                     .when(self.astore_visible, |row| {
@@ -4761,7 +4709,6 @@ fn main() {
             KeyBinding::new("shift-f12", FindUsages, Some("Workbench")),
             KeyBinding::new("cmd-shift-v", ToggleMdPreview, Some("Workbench")),
             KeyBinding::new("ctrl-`", ToggleTerminal, Some("Workbench")),
-            KeyBinding::new("ctrl-shift-a", ToggleArthas, Some("Workbench")),
             KeyBinding::new("cmd-,", OpenSettings, Some("Workbench")),
             KeyBinding::new("enter", PaletteConfirm, Some("QuickOpen")),
             KeyBinding::new("cmd-s", SaveFile, Some("Workbench")),
