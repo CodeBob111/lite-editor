@@ -4232,6 +4232,8 @@ impl Render for Workbench {
                                     Some(tab) => {
                                         // markdown 文件:右键菜单加"预览"项(标签随当前预览开关变化)
                                         let is_md = tab.lang == "markdown";
+                                        // Java 文件才显示 Arthas 命令项
+                                        let is_java = tab.lang == "java";
                                         let preview_on = self.md_preview;
                                         // 外层包一层捕获 cmd+click:编辑器点击会把光标移到点击处,
                                         // 我们在 mouse_up 时(光标已定)复用 F12 的跳转定义链路(支持跨文件开标签)。
@@ -4252,10 +4254,14 @@ impl Render for Workbench {
                                                     },
                                                 ),
                                             )
-                                            // 右键菜单:(markdown)预览 + Arthas 命令 + 跳转/复制粘贴
+                                            // 右键菜单:(Java)Arthas 命令 + 复制粘贴 +(markdown)预览
                                             .context_menu(move |menu, _window, _cx| {
-                                                let menu = menu
-                                                    .menu("Watch 光标方法", Box::new(ArthasWatch))
+                                                // Java 文件才显示 Arthas 命令(生成命令复制到剪贴板)
+                                                let menu = if is_java {
+                                                    menu.menu(
+                                                        "Watch 光标方法",
+                                                        Box::new(ArthasWatch),
+                                                    )
                                                     .menu("Trace 光标方法", Box::new(ArthasTrace))
                                                     .menu("Stack 光标方法", Box::new(ArthasStack))
                                                     .menu(
@@ -4267,7 +4273,10 @@ impl Render for Workbench {
                                                         Box::new(ArthasTt),
                                                     )
                                                     .separator()
-                                                    .menu("跳转定义", Box::new(GotoDefinition))
+                                                } else {
+                                                    menu
+                                                };
+                                                let menu = menu
                                                     .menu(
                                                         "复制",
                                                         Box::new(gpui_component::input::Copy),
