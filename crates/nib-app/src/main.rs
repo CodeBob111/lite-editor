@@ -2092,7 +2092,12 @@ impl Workbench {
             .filter(|&&b| b == b'\n')
             .count() as u32;
         editor.update(cx, |s, cx| {
+            // 双击选的行本就可见,不该让视图上下跳:set_cursor_position 会触发 scroll_to(尤其叠加
+            // 了「光标居中」的 cursor_surrounding_lines 设置时更明显)。先存滚动位置,移完光标再还原
+            // ——两者都写同一个 deferred_scroll_offset,后写覆盖;SelectToEndOfLine 走 select_to 不滚。
+            let keep = s.scroll_offset();
             s.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
+            s.set_scroll_offset(keep, cx);
         });
         window.dispatch_action(Box::new(gpui_component::input::SelectToEndOfLine), cx);
     }
