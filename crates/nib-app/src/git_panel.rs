@@ -2,7 +2,9 @@
 // commit message + Commit / Commit&Push。数据全走 nib-core git 模块
 // (core runtime 上跑),刷新带序号守卫;watcher 的 FileChanged 也会触发刷新。
 
+use std::cell::RefCell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -10,6 +12,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
+    menu::ContextMenuExt as _,
     v_flex, ActiveTheme, Disableable as _, Sizable as _,
 };
 use nib_core::git::{GitBranch, GitChange, GitCommit};
@@ -50,6 +53,10 @@ pub struct GitPanel {
     /// refresh_light(watcher 文件事件)不 bump 它——否则 jdtls 导入写 .project/.classpath
     /// 触发的 refresh_light 风暴会把全量 refresh 的 branches+log 结果丢弃,分支列表与历史变空。
     log_seq: u64,
+    /// 右键菜单的目标分支:右键某行时 context_menu 闭包把该行分支名写进来,菜单的
+    /// 「checkout」action(走 Workbench 的 on_action)再读它去切换。元素级 on_mouse_down(Right)
+    /// 对本机不触发,改用 gpui-component 的 .context_menu(window 级,与文件树同款,可靠)。
+    ctx_branch: Rc<RefCell<Option<String>>>,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -76,6 +83,7 @@ impl GitPanel {
             status: "".into(),
             refresh_seq: 0,
             log_seq: 0,
+            ctx_branch: Rc::new(RefCell::new(None)),
         };
         this.refresh(cx);
         this
@@ -289,6 +297,15 @@ impl GitPanel {
         .detach();
     }
 
+    /// 右键菜单「checkout 切换分支」触发:切到右键的那个分支(render_branches 的 context_menu
+    /// 闭包已把该行分支名写进 ctx_branch)。由 Workbench 的 on_action(CheckoutBranch) 调用。
+    pub fn checkout_context(&mut self, cx: &mut Context<Self>) {
+        let branch = self.ctx_branch.borrow_mut().take();
+        if let Some(branch) = branch {
+            self.checkout(branch, cx);
+        }
+    }
+
     /// 左键点分支:只把该分支的提交历史加载到「历史」区,**不切换分支**(切换用右键)。
     /// 复用 refresh_seq 守卫:期间发生 refresh / 又点别的分支则丢弃本次慢结果。
     fn select_branch(&mut self, branch: String, cx: &mut Context<Self>) {
@@ -311,9 +328,10 @@ impl GitPanel {
         .detach();
     }
 
-    fn render_branches(&self, cx: &mut Context<Self>) -> Vec<Div> {
+    fn render_branches(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         // 「正在看历史」的分支(左键选中);空=看当前分支。供高亮用,先取出避免在 map 里借 self。
         let selected = self.selected_branch.clone();
+        let ctx_branch = self.ctx_branch.clone();
         self.branches
             .iter()
             .filter(|b| !b.remote)
@@ -342,30 +360,41 @@ impl GitPanel {
                     row = row.bg(cx.theme().list_active);
                 }
                 let to_select = name.clone();
-                let to_switch = name.clone();
-                row.on_mouse_down(
+                let cb = ctx_branch.clone();
+                let menu_branch = name.clone();
+                row
                     // 左键:只看该分支提交历史,不切换
-                    MouseButton::Left,
-                    cx.listener(move |this: &mut GitPanel, _, _, cx| {
-                        this.select_branch(to_select.clone(), cx)
-                    }),
-                )
-                .on_mouse_down(
-                    // 右键:checkout 切换到该分支(有未提交改动时 git 会安全失败并提示)
-                    MouseButton::Right,
-                    cx.listener(move |this: &mut GitPanel, _, _, cx| {
-                        this.checkout(to_switch.clone(), cx)
-                    }),
-                )
-                .child(div().flex_1().min_w_0().overflow_hidden().child(name))
-                .when(b.ahead > 0 || b.behind > 0, |s| {
-                    s.child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!("↑{} ↓{}", b.ahead, b.behind)),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this: &mut GitPanel, _, _, cx| {
+                            this.select_branch(to_select.clone(), cx)
+                        }),
                     )
-                })
+                    // 长分支名单行截断(末尾溢出隐藏),不再换行成多行
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(name),
+                    )
+                    .when(b.ahead > 0 || b.behind > 0, |s| {
+                        s.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("↑{} ↓{}", b.ahead, b.behind)),
+                        )
+                    })
+                    // 右键菜单:checkout 切换到该分支(元素级 on_mouse_down(Right) 本机不触发,
+                    // 改用 window 级的 .context_menu)。闭包先把该行分支名写进 ctx_branch,菜单的
+                    // CheckoutBranch action 经 Workbench 的 on_action 读它去切换。
+                    .context_menu(move |menu, _window, _cx| {
+                        *cb.borrow_mut() = Some(menu_branch.to_string());
+                        menu.menu("checkout 切换分支", Box::new(crate::CheckoutBranch))
+                    })
+                    .into_any_element()
             })
             .collect()
     }

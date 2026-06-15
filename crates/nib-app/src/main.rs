@@ -88,6 +88,8 @@ actions!(
         UndoFileOp,
         CopyPath,
         PaletteConfirm,
+        // Git 分支右键菜单:checkout 切换到右键的那个分支(目标分支存在 GitPanel.ctx_branch)
+        CheckoutBranch,
         Quit
     ]
 );
@@ -1301,6 +1303,12 @@ impl Workbench {
             });
         })
         .detach();
+    }
+
+    /// Git 分支行右键菜单「checkout 切换分支」:目标分支由 GitPanel 的 context_menu 闭包写在
+    /// ctx_branch,这里转交给 GitPanel 切换。context menu 的 action 经此 Workbench on_action 接住。
+    fn on_checkout_branch(&mut self, _: &CheckoutBranch, _: &mut Window, cx: &mut Context<Self>) {
+        self.git_panel.update(cx, |p, cx| p.checkout_context(cx));
     }
 
     fn on_copy_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
@@ -3969,6 +3977,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_paste_item))
             .on_action(cx.listener(Self::on_undo_file_op))
             .on_action(cx.listener(Self::on_copy_path))
+            .on_action(cx.listener(Self::on_checkout_branch))
             .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .child(TitleBar::new().child(div().text_sm().child(title)))
             .when(self.projects.len() > 1, |this| {
