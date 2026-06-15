@@ -1092,6 +1092,9 @@ impl Workbench {
                     } else if !this.tabs.is_empty() {
                         this.activate_tab(this.tabs.len() - 1, window, cx);
                     }
+                    // 标签已填回 → 落盘正确的 open_files / active_project_index(switch_project 不再
+                    // 提前 persist,空标签也覆盖到:见那里的注释)。
+                    this.persist_session(cx);
                     cx.notify();
                 });
             });
@@ -3835,9 +3838,13 @@ impl Workbench {
         let root = PathBuf::from(&target.path);
         if root.exists() {
             self.load_project(root, cx);
+            // 不在这里 persist:此刻 tabs 刚 clear、restore_tabs 还没异步填回,persist 会把目标项目
+            // 已存的 open_files 清成空(下次回来文件全丢)。改由 restore_tabs 恢复完成后再 persist。
             self.restore_tabs(target.open_files.clone(), target.active_file.clone(), cx);
+        } else {
+            // 目标路径已不存在:仍需把 active_project_index 落盘
+            self.persist_session(cx);
         }
-        self.persist_session(cx);
         cx.notify();
     }
 
