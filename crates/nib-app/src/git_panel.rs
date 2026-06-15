@@ -44,7 +44,12 @@ pub struct GitPanel {
     message_input: Entity<InputState>,
     busy: bool,
     status: SharedString,
+    /// branch/status/conflicts(轻量字段)的序号:refresh 与 refresh_light 共用,最新一次生效。
     refresh_seq: u64,
+    /// 分支列表 + 历史(重量字段)的独立序号:**只** refresh / select_branch 动它。
+    /// refresh_light(watcher 文件事件)不 bump 它——否则 jdtls 导入写 .project/.classpath
+    /// 触发的 refresh_light 风暴会把全量 refresh 的 branches+log 结果丢弃,分支列表与历史变空。
+    log_seq: u64,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -70,6 +75,7 @@ impl GitPanel {
             busy: false,
             status: "".into(),
             refresh_seq: 0,
+            log_seq: 0,
         };
         this.refresh(cx);
         this
@@ -116,7 +122,9 @@ impl GitPanel {
         // 不动 selected_branch,这样浏览别的分支历史时文件变更不会把视图跳回当前分支。
         self.selected_branch = "".into();
         self.refresh_seq += 1;
-        let seq = self.refresh_seq;
+        self.log_seq += 1;
+        let rseq = self.refresh_seq;
+        let lseq = self.log_seq;
         let cwd = self.project_root.to_string_lossy().to_string();
         cx.spawn(async move |weak, cx| {
             // 四个独立 git 查询并行(core runtime 各占一个 worker),刷新延迟≈最慢单项
@@ -133,16 +141,19 @@ impl GitPanel {
                 nib_core::git::git_log(cwd, branch.clone(), Some(50)).await
             };
             let _ = weak.update(cx, |this, cx| {
-                if this.refresh_seq != seq {
-                    return;
+                // 轻量字段:与 refresh_light 共用 refresh_seq(最新一次生效)。
+                if this.refresh_seq == rseq {
+                    this.branch = branch.into();
+                    this.changes = changes.unwrap_or_default();
+                    this.conflicts = conflicts.unwrap_or_default();
+                    // 把刚拿到的 status 结果递给宿主建改动标记,免 Workbench 再跑一次 git status
+                    cx.emit(GitPanelEvent::StatusUpdated(this.changes.clone()));
                 }
-                this.branch = branch.into();
-                this.changes = changes.unwrap_or_default();
-                this.conflicts = conflicts.unwrap_or_default();
-                this.branches = branches.unwrap_or_default();
-                this.log = log.unwrap_or_default();
-                // 把刚拿到的 status 结果递给宿主建改动标记,免得 Workbench 再单独跑一次 git status
-                cx.emit(GitPanelEvent::StatusUpdated(this.changes.clone()));
+                // 重量字段:独立 log_seq,refresh_light 不动 → 文件变更风暴冲不掉分支列表/历史。
+                if this.log_seq == lseq {
+                    this.branches = branches.unwrap_or_default();
+                    this.log = log.unwrap_or_default();
+                }
                 cx.notify();
             });
         })
@@ -282,14 +293,15 @@ impl GitPanel {
     /// 复用 refresh_seq 守卫:期间发生 refresh / 又点别的分支则丢弃本次慢结果。
     fn select_branch(&mut self, branch: String, cx: &mut Context<Self>) {
         self.selected_branch = branch.clone().into();
-        self.refresh_seq += 1;
-        let seq = self.refresh_seq;
+        // 只动历史 → 用 log_seq(与 refresh / 别的 select 互不覆盖,且不受 refresh_light 影响)。
+        self.log_seq += 1;
+        let seq = self.log_seq;
         let cwd = self.project_root.to_string_lossy().to_string();
         cx.notify();
         cx.spawn(async move |weak, cx| {
             let log = nib_core::git::git_log(cwd, branch, Some(50)).await;
             let _ = weak.update(cx, |this: &mut GitPanel, cx| {
-                if this.refresh_seq != seq {
+                if this.log_seq != seq {
                     return;
                 }
                 this.log = log.unwrap_or_default();
