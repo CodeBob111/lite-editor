@@ -1660,6 +1660,7 @@ impl Workbench {
             // 把用户配的 settings.xml 喂给 jdtls(空=jdtls 回退默认 ~/.m2/settings.xml),
             // 让 Java 索引/跳转与依赖树面板走同一套 Maven 私服配置。
             let maven_settings = settings.maven_settings.clone();
+            let maven_offline = settings.maven_offline;
             cx.spawn(async move |weak, cx| {
                 let jdtls_root = session::data_dirs().jdtls_workspaces();
                 if let Err(err) = nib_core::lsp::start_lsp(
@@ -1668,6 +1669,7 @@ impl Workbench {
                     sink as Arc<dyn nib_core::EventSink>,
                     jdtls_root,
                     maven_settings,
+                    maven_offline,
                     &lsp,
                 )
                 .await

@@ -2,11 +2,11 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTRO
 use serde::Serialize;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::events::{CoreEvent, EventSink};
 
@@ -104,6 +104,9 @@ pub async fn start_lsp(
     events: Arc<dyn EventSink>,
     jdtls_root: PathBuf,
     maven_user_settings: String,
+    // jdtls 离线导入(只用本地 ~/.m2 仓库,跳过网络/SNAPSHOT 检查)。大工程秒开的关键;
+    // 未构建项目缺依赖时关掉以联机解析。用户设置 maven.offline 控制,默认开。
+    maven_offline: bool,
     state: &LspState,
 ) -> Result<(), String> {
     let key = (language.clone(), root_path.clone());
@@ -141,7 +144,7 @@ pub async fn start_lsp(
     let lang = language.clone();
     let rp = root_path.clone();
     let result = crate::rt::spawn_blocking(move || {
-        start_lsp_blocking(lang, rp, events, jdtls_root, maven_user_settings)
+        start_lsp_blocking(lang, rp, events, jdtls_root, maven_user_settings, maven_offline)
     })
     .await
     .map_err(|e| format!("Task failed: {}", e))?;
@@ -264,6 +267,43 @@ fn jdtls_java_home() -> Option<String> {
         .clone()
 }
 
+fn jdtls_workspace_dir(jdtls_root: &Path, root_path: &str) -> PathBuf {
+    jdtls_root.join(root_path.replace('/', "_"))
+}
+
+fn jdtls_workspace_needs_recovery(data_dir: &Path) -> bool {
+    let Ok(log) = std::fs::read_to_string(data_dir.join(".metadata/.log")) else {
+        return false;
+    };
+    let latest_session = log.rsplit("!SESSION").next().unwrap_or(&log);
+    latest_session.contains("workspace exited with unsaved changes")
+        && latest_session.contains(">> initialize")
+        && !latest_session.contains(">> initialized")
+}
+
+fn quarantine_jdtls_workspace(data_dir: &Path) -> Result<Option<PathBuf>, String> {
+    if !data_dir.exists() {
+        return Ok(None);
+    }
+    let name = data_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("Invalid jdtls workspace path: {}", data_dir.display()))?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let quarantined = data_dir.with_file_name(format!("{name}.stale-{suffix}"));
+    std::fs::rename(data_dir, &quarantined).map_err(|e| {
+        format!(
+            "Failed to reset jdtls workspace {}: {}",
+            data_dir.display(),
+            e
+        )
+    })?;
+    Ok(Some(quarantined))
+}
+
 fn start_lsp_blocking(
     language: String,
     root_path: String,
@@ -272,23 +312,84 @@ fn start_lsp_blocking(
     // 用户在设置里配的 settings.xml 路径(空=回退默认 ~/.m2/settings.xml)。
     // 喂给 jdtls 的 maven.userSettings,让 Java 索引/跳转也走内网私服,与依赖树面板一致。
     maven_user_settings: String,
+    maven_offline: bool,
+) -> Result<LspServer, String> {
+    if language != "java" {
+        return start_lsp_blocking_once(
+            language,
+            root_path,
+            events,
+            jdtls_root,
+            maven_user_settings,
+            maven_offline,
+        );
+    }
+
+    let data_dir = jdtls_workspace_dir(&jdtls_root, &root_path);
+    // initialize 超时后强杀会留下 Eclipse 的未保存恢复状态。若上次会话卡在
+    // initialize 中，继续复用同一 workspace 只会反复进入恢复并再次超时。
+    if jdtls_workspace_needs_recovery(&data_dir) {
+        quarantine_jdtls_workspace(&data_dir)?;
+    }
+
+    let first = start_lsp_blocking_once(
+        language.clone(),
+        root_path.clone(),
+        events.clone(),
+        jdtls_root.clone(),
+        maven_user_settings.clone(),
+        maven_offline,
+    );
+    match first {
+        Err(e) if e.contains("LSP initialize timed out") => {
+            // 非典型损坏可能没有写出 recovery 日志；首次超时后再用全新缓存重试一次。
+            quarantine_jdtls_workspace(&data_dir)?;
+            start_lsp_blocking_once(
+                language,
+                root_path,
+                events,
+                jdtls_root,
+                maven_user_settings,
+                maven_offline,
+            )
+        }
+        result => result,
+    }
+}
+
+fn start_lsp_blocking_once(
+    language: String,
+    root_path: String,
+    events: Arc<dyn EventSink>,
+    jdtls_root: PathBuf,
+    maven_user_settings: String,
+    maven_offline: bool,
 ) -> Result<LspServer, String> {
     let jdtls_data_dir;
     let (cmd, args): (&str, Vec<String>) = match language.as_str() {
         "python" => ("pyright-langserver", vec!["--stdio".into()]),
         "typescript" | "javascript" => ("typescript-language-server", vec!["--stdio".into()]),
         "java" => {
-            let hash = root_path.replace('/', "_");
-            jdtls_data_dir = jdtls_root.join(hash).to_string_lossy().to_string();
+            jdtls_data_dir = jdtls_workspace_dir(&jdtls_root, &root_path)
+                .to_string_lossy()
+                .to_string();
             let _ = std::fs::create_dir_all(&jdtls_data_dir);
-            // 堆对大型多模块工程(如 rateplatform2,215 文件 + 全套内网依赖)要够,否则
-            // jdtls 在 import/build 阶段 OutOfMemoryError(实测 4g 仍 "Java heap space" ×3)
-            // → GC 死亡螺旋(284% CPU)→ 应答不了 initialize → 超时被杀 → 永远导不完。给到 8g。
-            ("jdtls", vec![
-                "--jvm-arg=-Xmx8g".into(),
-                "-data".into(),
-                jdtls_data_dir.clone(),
-            ])
+            // 大型多模块工程(rateplatform2:160 文件 + amaven 级巨型依赖图)导入慢/卡的两个
+            // 实测真因 + 修法(2026-06-15 用手动 LSP 探针定位):
+            //   ① 堆不够 → 导入时 G1 GC 死亡螺旋(8g 下 CPU 250%、卡 26% 不动)。给到 16g。
+            //   ② m2e 默认 df(深度优先)aether 依赖收集器在巨型图上指数级慢。maven-resolver
+            //      1.9.x 支持 bf(广度优先)收集器——正是 amaven 的 aether.collector.impl=bf 干的事。
+            //      系统属性名是 aether.dependencyCollector.impl(旧名 aether.collector.impl 1.9.x 不认)。
+            // 实测:rateplatform2 从「8 分钟卡 26% 导不完」→「~20s 导完 ServiceReady」。
+            (
+                "jdtls",
+                vec![
+                    "--jvm-arg=-Xmx16g".into(),
+                    "--jvm-arg=-Daether.dependencyCollector.impl=bf".into(),
+                    "-data".into(),
+                    jdtls_data_dir.clone(),
+                ],
+            )
         }
         _ => return Err(format!("Unsupported language: {}", language)),
     };
@@ -370,151 +471,148 @@ fn start_lsp_blocking(
         let mut reader = BufReader::new(stdout);
         while let Ok(msg) = read_next_message(&mut reader) {
             {
-                    let has_id = msg.get("id").is_some();
-                    let method = msg.get("method").and_then(|m| m.as_str()).map(String::from);
+                let has_id = msg.get("id").is_some();
+                let method = msg.get("method").and_then(|m| m.as_str()).map(String::from);
 
-                    if has_id && method.is_some() {
-                        if let Some(id) = msg.get("id") {
-                            let method_str = method.as_deref().unwrap_or("");
-                            let result = match method_str {
-                                "workspace/configuration" => {
-                                    let items_arr = msg
-                                        .get("params")
-                                        .and_then(|p| p.get("items"))
-                                        .and_then(|i| i.as_array());
-                                    let home =
-                                        std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-                                    let maven_settings = if maven_cfg_for_reader.trim().is_empty() {
-                                        format!("{}/.m2/settings.xml", home)
-                                    } else {
-                                        maven_cfg_for_reader.clone()
-                                    };
-                                    let java_settings = serde_json::json!({
-                                        "import": {
-                                            "maven": { "enabled": true },
-                                            "gradle": { "enabled": true }
-                                        },
-                                        "autobuild": { "enabled": true },
-                                        "configuration": {
-                                            "updateBuildConfiguration": "automatic",
-                                            "maven": {
-                                                "userSettings": maven_settings
-                                            }
-                                        },
+                if has_id && method.is_some() {
+                    if let Some(id) = msg.get("id") {
+                        let method_str = method.as_deref().unwrap_or("");
+                        let result = match method_str {
+                            "workspace/configuration" => {
+                                let items_arr = msg
+                                    .get("params")
+                                    .and_then(|p| p.get("items"))
+                                    .and_then(|i| i.as_array());
+                                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+                                let maven_settings = if maven_cfg_for_reader.trim().is_empty() {
+                                    format!("{}/.m2/settings.xml", home)
+                                } else {
+                                    maven_cfg_for_reader.clone()
+                                };
+                                // 与 initialize 的 initializationOptions 保持一致:jdtls 启动后会经
+                                // workspace/configuration 二次拉 maven 配置,这里不带上 offline 等会被
+                                // 覆盖回在线 → 大工程又卡。离线/跳测试依赖/不查 SNAPSHOT 详见上方 init。
+                                let java_settings = serde_json::json!({
+                                    "import": {
                                         "maven": {
-                                            "downloadSources": false
+                                            "enabled": true,
+                                            "offline": { "enabled": maven_offline },
+                                            "disableTestClasspathFlag": maven_offline
                                         },
-                                        "referencesCodeLens": { "enabled": false },
-                                        "implementationsCodeLens": { "enabled": false }
-                                    });
-                                    let items: Vec<serde_json::Value> = if let Some(arr) = items_arr
-                                    {
-                                        arr.iter()
-                                            .map(|item| {
-                                                let section = item
-                                                    .get("section")
-                                                    .and_then(|s| s.as_str())
-                                                    .unwrap_or("");
-                                                if section == "java" || section.starts_with("java.")
-                                                {
-                                                    java_settings.clone()
-                                                } else {
-                                                    serde_json::json!({})
-                                                }
-                                            })
-                                            .collect()
-                                    } else {
-                                        vec![java_settings]
-                                    };
-                                    serde_json::Value::Array(items)
-                                }
-                                _ => serde_json::Value::Null,
-                            };
-                            let resp = serde_json::json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": result
-                            });
-                            let body = serde_json::to_string(&resp).unwrap_or_default();
-                            let header = format!("Content-Length: {}\r\n\r\n", body.len());
-                            if let Ok(mut w) = stdin_for_reader.lock() {
-                                use std::io::Write;
-                                let _ = w.write_all(header.as_bytes());
-                                let _ = w.write_all(body.as_bytes());
-                                let _ = w.flush();
+                                        "gradle": { "enabled": true }
+                                    },
+                                    "autobuild": { "enabled": true },
+                                    "configuration": {
+                                        "updateBuildConfiguration": "automatic",
+                                        "maven": {
+                                            "userSettings": maven_settings
+                                        }
+                                    },
+                                    "maven": {
+                                        "downloadSources": false,
+                                        "updateSnapshots": false
+                                    },
+                                    "referencesCodeLens": { "enabled": false },
+                                    "implementationsCodeLens": { "enabled": false }
+                                });
+                                let items: Vec<serde_json::Value> = if let Some(arr) = items_arr {
+                                    arr.iter()
+                                        .map(|item| {
+                                            let section = item
+                                                .get("section")
+                                                .and_then(|s| s.as_str())
+                                                .unwrap_or("");
+                                            if section == "java" || section.starts_with("java.") {
+                                                java_settings.clone()
+                                            } else {
+                                                serde_json::json!({})
+                                            }
+                                        })
+                                        .collect()
+                                } else {
+                                    vec![java_settings]
+                                };
+                                serde_json::Value::Array(items)
                             }
-                        }
-                    } else if has_id {
-                        if tx.send(msg).is_err() {
-                            break;
-                        }
-                    } else if let Some(method) = method {
-                        match method.as_str() {
-                            "textDocument/publishDiagnostics" => {
-                                if let Some(params) = msg.get("params") {
-                                    events_for_reader
-                                        .emit(CoreEvent::LspDiagnostics(params.clone()));
-                                }
-                            }
-                            "$/progress" => {
-                                if let Some(params) = msg.get("params") {
-                                    let value = params.get("value").cloned().unwrap_or_default();
-                                    let kind =
-                                        value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
-                                    let message =
-                                        value.get("message").and_then(|m| m.as_str()).unwrap_or("");
-                                    let percentage =
-                                        value.get("percentage").and_then(|p| p.as_u64());
-
-                                    events_for_reader.emit(CoreEvent::LspProgress {
-                                        language: lang_clone.clone(),
-                                        kind: kind.to_string(),
-                                        message: message.to_string(),
-                                        percentage,
-                                    });
-
-                                    if kind == "end" {
-                                        ready_clone.store(true, Ordering::Relaxed);
-                                    }
-                                }
-                            }
-                            // jdtls 完全就绪(工作区导入/构建完成)才发 language/status
-                            // type=ServiceReady——用它驱动状态灯"就绪",比首个 $/progress
-                            // end 准(后者只是某个早期工作项结束,此时还在导入)。
-                            "language/status" => {
-                                if let Some(params) = msg.get("params") {
-                                    let st = params
-                                        .get("type")
-                                        .and_then(|t| t.as_str())
-                                        .unwrap_or("");
-                                    let smsg = params
-                                        .get("message")
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("");
-                                    // 只有 ServiceReady 才算真就绪(实测 jdtls 导入期间发的是
-                                    // type=Starting 带百分比,完成才发 ServiceReady)。
-                                    if st == "ServiceReady" {
-                                        ready_clone.store(true, Ordering::Relaxed);
-                                        events_for_reader.emit(CoreEvent::LspProgress {
-                                            language: lang_clone.clone(),
-                                            kind: "serviceReady".to_string(),
-                                            message: String::new(),
-                                            percentage: None,
-                                        });
-                                    } else if st == "Starting" && !smsg.is_empty() {
-                                        // 把 "27% ... Importing project" 喂给状态灯显示真实进度
-                                        events_for_reader.emit(CoreEvent::LspProgress {
-                                            language: lang_clone.clone(),
-                                            kind: "report".to_string(),
-                                            message: smsg.to_string(),
-                                            percentage: None,
-                                        });
-                                    }
-                                }
-                            }
-                            _ => {}
+                            _ => serde_json::Value::Null,
+                        };
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": result
+                        });
+                        let body = serde_json::to_string(&resp).unwrap_or_default();
+                        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+                        if let Ok(mut w) = stdin_for_reader.lock() {
+                            use std::io::Write;
+                            let _ = w.write_all(header.as_bytes());
+                            let _ = w.write_all(body.as_bytes());
+                            let _ = w.flush();
                         }
                     }
+                } else if has_id {
+                    if tx.send(msg).is_err() {
+                        break;
+                    }
+                } else if let Some(method) = method {
+                    match method.as_str() {
+                        "textDocument/publishDiagnostics" => {
+                            if let Some(params) = msg.get("params") {
+                                events_for_reader.emit(CoreEvent::LspDiagnostics(params.clone()));
+                            }
+                        }
+                        "$/progress" => {
+                            if let Some(params) = msg.get("params") {
+                                let value = params.get("value").cloned().unwrap_or_default();
+                                let kind = value.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                                let message =
+                                    value.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                                let percentage = value.get("percentage").and_then(|p| p.as_u64());
+
+                                events_for_reader.emit(CoreEvent::LspProgress {
+                                    language: lang_clone.clone(),
+                                    kind: kind.to_string(),
+                                    message: message.to_string(),
+                                    percentage,
+                                });
+
+                                if kind == "end" {
+                                    ready_clone.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        // jdtls 完全就绪(工作区导入/构建完成)才发 language/status
+                        // type=ServiceReady——用它驱动状态灯"就绪",比首个 $/progress
+                        // end 准(后者只是某个早期工作项结束,此时还在导入)。
+                        "language/status" => {
+                            if let Some(params) = msg.get("params") {
+                                let st = params.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                let smsg =
+                                    params.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                                // 只有 ServiceReady 才算真就绪(实测 jdtls 导入期间发的是
+                                // type=Starting 带百分比,完成才发 ServiceReady)。
+                                if st == "ServiceReady" {
+                                    ready_clone.store(true, Ordering::Relaxed);
+                                    events_for_reader.emit(CoreEvent::LspProgress {
+                                        language: lang_clone.clone(),
+                                        kind: "serviceReady".to_string(),
+                                        message: String::new(),
+                                        percentage: None,
+                                    });
+                                } else if st == "Starting" && !smsg.is_empty() {
+                                    // 把 "27% ... Importing project" 喂给状态灯显示真实进度
+                                    events_for_reader.emit(CoreEvent::LspProgress {
+                                        language: lang_clone.clone(),
+                                        kind: "report".to_string(),
+                                        message: smsg.to_string(),
+                                        percentage: None,
+                                    });
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     });
@@ -566,7 +664,19 @@ fn start_lsp_blocking(
                 "settings": {
                     "java": {
                         "import": {
-                            "maven": { "enabled": true },
+                            "maven": {
+                                "enabled": true,
+                                // 离线导入(用户设置 maven.offline 控制,默认开):只用本地 ~/.m2 仓库
+                                // 解析,跳过所有网络 + SNAPSHOT 元数据检查。amaven 构建过的内网工程
+                                // 本地仓库是全的;这避免 m2e 对漏出镜像的外网仓库(settings.xml 里的
+                                // oss.sonatype 经 CloudFront)查 SNAPSHOT 卡死——实测是 rateplatform2
+                                // 导入卡 27% 的网络层真因。设计上对齐内网:amaven 下依赖、jdtls 只读
+                                // 本地索引。关掉则联机解析(未构建项目可下缺失依赖,但大工程可能慢)。
+                                "offline": { "enabled": maven_offline },
+                                // 离线时一并跳测试 classpath:少解析一大块依赖(测试依赖图对跳转/索引
+                                // 非必需)。联机模式(offline 关)则保留,保证测试文件内的跳转也能解析。
+                                "disableTestClasspathFlag": maven_offline
+                            },
                             "gradle": { "enabled": true }
                         },
                         "autobuild": { "enabled": true },
@@ -577,7 +687,9 @@ fn start_lsp_blocking(
                             }
                         },
                         "maven": {
-                            "downloadSources": false
+                            "downloadSources": false,
+                            // 不去远端查 SNAPSHOT 更新(本地有就用,别为"可能有新版"卡网络)。
+                            "updateSnapshots": false
                         }
                     }
                 },
@@ -632,11 +744,7 @@ fn start_lsp_blocking(
     Ok(server)
 }
 
-pub async fn stop_lsp(
-    language: String,
-    root_path: String,
-    state: &LspState,
-) -> Result<(), String> {
+pub async fn stop_lsp(language: String, root_path: String, state: &LspState) -> Result<(), String> {
     let server = {
         let mut servers = state.servers.lock().map_err(|e| e.to_string())?;
         servers.remove(&(language, root_path))
@@ -1110,7 +1218,11 @@ fn snap_to_identifier(file_path: &str, line: u32, character: u32) -> u32 {
     let chars: Vec<char> = line_text.chars().collect();
     let at = character as usize;
     let cur_is_ident = chars.get(at).copied().map(is_ident_char).unwrap_or(false);
-    let prev_is_ident = chars.get(at - 1).copied().map(is_ident_char).unwrap_or(false);
+    let prev_is_ident = chars
+        .get(at - 1)
+        .copied()
+        .map(is_ident_char)
+        .unwrap_or(false);
     if !cur_is_ident && prev_is_ident {
         character - 1
     } else {
@@ -1225,8 +1337,11 @@ fn word_and_receiver(line_text: &str, col: usize) -> Option<(Option<String>, Str
 
 /// 找局部变量声明 `Type var` 推断变量类型(大写开头的类型名)。
 fn resolve_var_type(content: &str, var: &str) -> Option<String> {
-    let re =
-        regex::Regex::new(&format!(r"\b([A-Z]\w*)(?:<[^>]*>)?\s+{}\b", regex::escape(var))).ok()?;
+    let re = regex::Regex::new(&format!(
+        r"\b([A-Z]\w*)(?:<[^>]*>)?\s+{}\b",
+        regex::escape(var)
+    ))
+    .ok()?;
     content
         .lines()
         .find_map(|l| re.captures(l).map(|c| c[1].to_string()))
@@ -1457,11 +1572,9 @@ async fn request_and_wait_on_worker(
     params: serde_json::Value,
     timeout: Duration,
 ) -> Result<serde_json::Value, String> {
-    crate::rt::spawn_blocking(move || {
-        request_and_wait(&server, id, method, params, timeout)
-    })
-    .await
-    .map_err(|e| format!("LSP worker failed: {}", e))?
+    crate::rt::spawn_blocking(move || request_and_wait(&server, id, method, params, timeout))
+        .await
+        .map_err(|e| format!("LSP worker failed: {}", e))?
 }
 
 fn parse_locations(result: serde_json::Value) -> Result<Vec<LspUsage>, String> {
@@ -1589,7 +1702,11 @@ fn find_java_home() -> Option<String> {
     let output = Command::new("/usr/libexec/java_home").output().ok()?;
     if output.status.success() {
         let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !s.is_empty() { Some(s) } else { None }
+        if !s.is_empty() {
+            Some(s)
+        } else {
+            None
+        }
     } else {
         None
     }
@@ -1774,6 +1891,60 @@ mod tests {
     #[test]
     fn path_from_uri_plain() {
         assert_eq!(path_from_file_uri("file:///a/b/Foo.java"), "/a/b/Foo.java");
+    }
+
+    #[test]
+    fn detects_only_incomplete_dirty_jdtls_session() {
+        let base = std::env::temp_dir().join(format!(
+            "nib-jdtls-recovery-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let metadata = base.join(".metadata");
+        std::fs::create_dir_all(&metadata).unwrap();
+
+        std::fs::write(
+            metadata.join(".log"),
+            "!SESSION old\n!MESSAGE >> initialized\n\
+             !SESSION latest\n!MESSAGE The workspace exited with unsaved changes in the previous session; refreshing workspace to recover changes.\n\
+             !MESSAGE >> initialize\n",
+        )
+        .unwrap();
+        assert!(jdtls_workspace_needs_recovery(&base));
+
+        std::fs::write(
+            metadata.join(".log"),
+            "!SESSION latest\n!MESSAGE The workspace exited with unsaved changes in the previous session; refreshing workspace to recover changes.\n\
+             !MESSAGE >> initialize\n!MESSAGE >> initialized\n",
+        )
+        .unwrap();
+        assert!(!jdtls_workspace_needs_recovery(&base));
+
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn quarantines_jdtls_workspace_without_touching_contents() {
+        let base = std::env::temp_dir().join(format!(
+            "nib-jdtls-quarantine-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("marker"), "keep").unwrap();
+
+        let quarantined = quarantine_jdtls_workspace(&base).unwrap().unwrap();
+        assert!(!base.exists());
+        assert_eq!(
+            std::fs::read_to_string(quarantined.join("marker")).unwrap(),
+            "keep"
+        );
+
+        std::fs::remove_dir_all(quarantined).unwrap();
     }
 
     // 验证 kill_all 真正杀死并回收子进程(应用退出路径 RunEvent::Exit 依赖它,

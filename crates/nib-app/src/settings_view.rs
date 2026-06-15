@@ -34,6 +34,7 @@ pub struct SettingsView {
     maven_home: Entity<InputState>,
     maven_settings: Entity<InputState>,
     maven_repo: Entity<InputState>,
+    maven_offline: bool,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -77,6 +78,7 @@ impl SettingsView {
             maven_home,
             maven_settings,
             maven_repo,
+            maven_offline: settings.maven_offline,
         }
     }
 
@@ -97,6 +99,7 @@ impl SettingsView {
             maven_home: self.maven_home.read(cx).value().to_string(),
             maven_settings: self.maven_settings.read(cx).value().to_string(),
             maven_repo: self.maven_repo.read(cx).value().to_string(),
+            maven_offline: self.maven_offline,
         }));
     }
 }
@@ -380,6 +383,12 @@ impl Render for SettingsView {
                     .child(header(
                         "Maven",
                         "像 IDEA 一样指定 Maven home / settings.xml / 本地仓库。留空则用 PATH 里的 mvn 与默认 ~/.m2。改动即时生效,Maven 面板会按新配置重新解析。",
+                    ))
+                    .child(field(
+                        "离线导入(大工程秒开)",
+                        "maven.offline",
+                        "jdtls 只用本地 ~/.m2 仓库解析依赖,跳过网络与 SNAPSHOT 检查。amaven 构建过的内网大工程(如 rateplatform2)由此从「卡几分钟导不完」变「~20s 导完」。关掉则联机解析:可下缺失依赖,但未构建过的项目会标红、且未配镜像时大工程会慢。下次打开 Java 项目/重启生效。",
+                        switch_ctrl("set-mvn-offline", self.maven_offline, |s, v| s.maven_offline = v),
                     ))
                     .child(mfield(
                         "Maven home",

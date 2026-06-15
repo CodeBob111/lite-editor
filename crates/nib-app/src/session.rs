@@ -98,6 +98,11 @@ pub struct EditorSettings {
     /// 本地仓库目录。空=mvn 默认(~/.m2/repository)。
     #[serde(rename = "maven.repo", default)]
     pub maven_repo: String,
+    /// jdtls 离线导入:只用本地 ~/.m2 仓库解析,跳过网络 + SNAPSHOT 检查。默认开——内网
+    /// 大工程(amaven 构建过、本地仓库全)秒开,且避免对漏出镜像的外网仓库查 SNAPSHOT 卡死。
+    /// 关掉则联机解析(可下缺失依赖,但未配 `*` 镜像时大工程可能慢)。
+    #[serde(rename = "maven.offline", default = "default_true")]
+    pub maven_offline: bool,
 }
 
 fn default_font_size() -> f32 {
@@ -120,6 +125,7 @@ impl Default for EditorSettings {
             maven_home: String::new(),
             maven_settings: String::new(),
             maven_repo: String::new(),
+            maven_offline: true,
         }
     }
 }
