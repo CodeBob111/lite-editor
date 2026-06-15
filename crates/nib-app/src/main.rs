@@ -1626,6 +1626,11 @@ impl Workbench {
                 })
                 .soft_wrap(settings.word_wrap)
                 .folding(settings.folding)
+                // 搜索匹配 / 上下方向键导航时,光标垂直居中(打字机式)。组件把
+                // cursor_surrounding_padding 饱和到半视口(raw.min(viewport_half)),故大
+                // 值即「恒至少半视口留白」= 始终居中;编辑路径(scroll_to direction=None)
+                // 留白恒为一行,打字不受影响。无法只对搜索生效(组件未暴露查找态)。
+                .cursor_surrounding_lines(Some(9999))
                 .default_value(text)
         });
         // 编辑即脏:订阅 Change 给标签点脏标记
