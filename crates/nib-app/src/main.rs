@@ -798,6 +798,11 @@ impl Workbench {
                         state.set_selected_item(Some(&item), cx);
                     }
                 });
+                // tree(&tree_state) 是「读 tree_state 的元素」(非子视图),只有 Workbench 重渲才会
+                // 读到新节点。set_items 仅 notify tree_state,其 observe 回调只处理选中变化、set_items
+                // 后选中为空 → 不会 notify Workbench。切项目时这条链断了 → 树「完全没变」。这里显式
+                // notify Workbench 触发重渲(初次加载是靠启动期别的 notify 顺带刷到,才一直没暴露)。
+                let _ = weak.update(cx, |_, cx| cx.notify());
             }
         })
         .detach();
