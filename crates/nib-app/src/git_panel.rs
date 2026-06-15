@@ -39,6 +39,8 @@ pub struct GitPanel {
     conflicts: Vec<String>,
     branches: Vec<GitBranch>,
     log: Vec<GitCommit>,
+    /// 「历史」区当前展示的是哪个分支的提交(左键点分支只看历史、不切换)。空=当前分支。
+    selected_branch: SharedString,
     message_input: Entity<InputState>,
     busy: bool,
     status: SharedString,
@@ -63,6 +65,7 @@ impl GitPanel {
             conflicts: Vec::new(),
             branches: Vec::new(),
             log: Vec::new(),
+            selected_branch: "".into(),
             message_input,
             busy: false,
             status: "".into(),
@@ -109,6 +112,9 @@ impl GitPanel {
 
     /// 拉取分支与变更(序号守卫:慢结果不覆盖新查询)
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        // 全量刷新(开面板/手动/提交/切换后)回到「看当前分支历史」。watcher 的 refresh_light
+        // 不动 selected_branch,这样浏览别的分支历史时文件变更不会把视图跳回当前分支。
+        self.selected_branch = "".into();
         self.refresh_seq += 1;
         let seq = self.refresh_seq;
         let cwd = self.project_root.to_string_lossy().to_string();
@@ -272,13 +278,42 @@ impl GitPanel {
         .detach();
     }
 
+    /// 左键点分支:只把该分支的提交历史加载到「历史」区,**不切换分支**(切换用右键)。
+    /// 复用 refresh_seq 守卫:期间发生 refresh / 又点别的分支则丢弃本次慢结果。
+    fn select_branch(&mut self, branch: String, cx: &mut Context<Self>) {
+        self.selected_branch = branch.clone().into();
+        self.refresh_seq += 1;
+        let seq = self.refresh_seq;
+        let cwd = self.project_root.to_string_lossy().to_string();
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let log = nib_core::git::git_log(cwd, branch, Some(50)).await;
+            let _ = weak.update(cx, |this: &mut GitPanel, cx| {
+                if this.refresh_seq != seq {
+                    return;
+                }
+                this.log = log.unwrap_or_default();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_branches(&self, cx: &mut Context<Self>) -> Vec<Div> {
+        // 「正在看历史」的分支(左键选中);空=看当前分支。供高亮用,先取出避免在 map 里借 self。
+        let selected = self.selected_branch.clone();
         self.branches
             .iter()
             .filter(|b| !b.remote)
             .map(|b| {
                 let name = b.name.clone();
                 let current = b.current;
+                // 当前在看其历史的分支(左键点的那个)。current 分支默认即在看(selected 为空时)。
+                let viewing = if selected.is_empty() {
+                    current
+                } else {
+                    selected.as_ref() == name.as_str()
+                };
                 let mut row = h_flex()
                     .px_2()
                     .py_0p5()
@@ -287,14 +322,25 @@ impl GitPanel {
                     .rounded(cx.theme().radius)
                     .text_size(px(12.))
                     .hover(|s| s.bg(cx.theme().accent));
+                // 当前分支加粗;正在看历史的分支(含当前)给底色高亮。
                 if current {
-                    row = row
-                        .bg(cx.theme().list_active)
-                        .font_weight(FontWeight::BOLD);
+                    row = row.font_weight(FontWeight::BOLD);
                 }
+                if viewing {
+                    row = row.bg(cx.theme().list_active);
+                }
+                let to_select = name.clone();
                 let to_switch = name.clone();
                 row.on_mouse_down(
+                    // 左键:只看该分支提交历史,不切换
                     MouseButton::Left,
+                    cx.listener(move |this: &mut GitPanel, _, _, cx| {
+                        this.select_branch(to_select.clone(), cx)
+                    }),
+                )
+                .on_mouse_down(
+                    // 右键:checkout 切换到该分支(有未提交改动时 git 会安全失败并提示)
+                    MouseButton::Right,
                     cx.listener(move |this: &mut GitPanel, _, _, cx| {
                         this.checkout(to_switch.clone(), cx)
                     }),
@@ -513,7 +559,14 @@ impl Render for GitPanel {
                                     .border_color(cx.theme().border)
                                     .text_size(px(11.))
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("历史"),
+                                    .child(format!(
+                                        "历史 · {}",
+                                        if self.selected_branch.is_empty() {
+                                            self.branch.clone()
+                                        } else {
+                                            self.selected_branch.clone()
+                                        }
+                                    )),
                             )
                             .children(self.render_log(cx)),
                     }),
