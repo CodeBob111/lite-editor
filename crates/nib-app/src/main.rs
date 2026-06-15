@@ -2073,35 +2073,6 @@ impl Workbench {
     /// 直接早退、不改选区,故双击后 selected_range 为空即「没选中词」→ 改成选整行;双击单词时选区
     /// 非空 → 保持选词,不动。机制:InputState 无公开「设选区」API,故 set_cursor_position 到行首
     /// (公开、同步、且会聚焦编辑器),再派发 SelectToEndOfLine 扩到行尾。
-    fn select_line_on_empty_double_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(tab) = self.active() else { return };
-        let editor = tab.editor.clone();
-        let sel = editor.read(cx).selected_range();
-        let text = editor.read(cx).value();
-        // 实证(诊断日志):双击行末时 gpui 的 select_word 选中的是行尾的 `\n`(1 字符,非空选区),
-        // 行内空白双击选中的是空格。所以判据不能是「选区为空」,而是「选区为空 或 只选到空白/换行」
-        // → 没选到真正的词 → 选整行;选到词(trim 后非空)→ 保持选词。
-        let selected = text.get(sel.start..sel.end).unwrap_or("");
-        if !selected.trim().is_empty() {
-            return;
-        }
-        // 行号 = 选区起点之前的换行数。选行末 `\n` 时起点正是该 `\n`(它是该行的终止符)→ 用户点的那行;
-        // 行内空白时起点在该行内 → 同一行。
-        let line = text.as_bytes()[..sel.start]
-            .iter()
-            .filter(|&&b| b == b'\n')
-            .count() as u32;
-        editor.update(cx, |s, cx| {
-            // 双击选的行本就可见,不该让视图上下跳:set_cursor_position 会触发 scroll_to(尤其叠加
-            // 了「光标居中」的 cursor_surrounding_lines 设置时更明显)。先存滚动位置,移完光标再还原
-            // ——两者都写同一个 deferred_scroll_offset,后写覆盖;SelectToEndOfLine 走 select_to 不滚。
-            let keep = s.scroll_offset();
-            s.set_cursor_position(gpui_component::input::Position::new(line, 0), window, cx);
-            s.set_scroll_offset(keep, cx);
-        });
-        window.dispatch_action(Box::new(gpui_component::input::SelectToEndOfLine), cx);
-    }
-
     fn on_goto_definition(
         &mut self,
         _: &GotoDefinition,
@@ -4294,11 +4265,6 @@ impl Render for Workbench {
                                                                 &GotoDefinition,
                                                                 window,
                                                                 cx,
-                                                            );
-                                                        } else if event.click_count == 2 {
-                                                            // 双击行末/空白(无词)→ 整行选中
-                                                            this.select_line_on_empty_double_click(
-                                                                window, cx,
                                                             );
                                                         }
                                                     },
