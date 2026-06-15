@@ -132,6 +132,16 @@ impl UsagesView {
         self.selected = ix;
         self.confirm(cx);
     }
+
+    /// 鼠标悬停某行 → 把它设为选中(醒目高亮 + 下半预览都跟随鼠标)。带 != 守卫避免
+    /// 同一行重复触发时反复 load_preview。
+    fn hover_select(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.selected != ix {
+            self.selected = ix;
+            self.load_preview(cx);
+            cx.notify();
+        }
+    }
 }
 
 impl Render for UsagesView {
@@ -159,7 +169,12 @@ impl Render for UsagesView {
                     .items_center()
                     .rounded(cx.theme().radius)
                     .when(selected, |s| s.bg(cx.theme().list_active))
-                    .hover(|s| s.bg(cx.theme().accent))
+                    // 悬停即选中:让醒目高亮(及预览)跟随鼠标,而非停在初始/第一项
+                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                        if *hovered {
+                            this.hover_select(ix, cx);
+                        }
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| this.select_and_open(ix, cx)),
