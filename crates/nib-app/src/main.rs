@@ -1635,11 +1635,9 @@ impl Workbench {
                 })
                 .soft_wrap(settings.word_wrap)
                 .folding(settings.folding)
-                // 搜索匹配 / 上下方向键导航时,光标垂直居中(打字机式)。组件把
-                // cursor_surrounding_padding 饱和到半视口(raw.min(viewport_half)),故大
-                // 值即「恒至少半视口留白」= 始终居中;编辑路径(scroll_to direction=None)
-                // 留白恒为一行,打字不受影响。无法只对搜索生效(组件未暴露查找态)。
-                .cursor_surrounding_lines(Some(9999))
+                // 光标居中(cursor_surrounding_lines)默认关:开着会让 layout_cursor 每帧把光标往
+                // 半视口安全区赶,点击任意位置都把视图滚去居中(very annoying)。改成动态:cmd-f
+                // 打开查找时才调高(搜索结果居中,见 on_editor_search),点击编辑器即调回(见 on_mouse_up)。
                 .default_value(text)
         });
         // 编辑即脏:订阅 Change 给标签点脏标记
@@ -2073,6 +2071,23 @@ impl Workbench {
     /// 直接早退、不改选区,故双击后 selected_range 为空即「没选中词」→ 改成选整行;双击单词时选区
     /// 非空 → 保持选词,不动。机制:InputState 无公开「设选区」API,故 set_cursor_position 到行首
     /// (公开、同步、且会聚焦编辑器),再派发 SelectToEndOfLine 扩到行尾。
+    /// cmd-f 打开编辑器内查找 → 把当前编辑器的光标居中打开,让搜索匹配跳到屏幕中间。
+    /// Search action 先派发到聚焦的编辑器(开查找面板)、再冒泡到 Workbench 这里,故此时查找已打开;
+    /// 点击编辑器时由 on_mouse_up 关掉(离开搜索语境,避免点击都滚去居中)。
+    fn on_editor_search(
+        &mut self,
+        _: &gpui_component::input::Search,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.active() {
+            let editor = tab.editor.clone();
+            editor.update(cx, |s, cx| {
+                s.set_cursor_surrounding_lines(Some(9999), window, cx)
+            });
+        }
+    }
+
     fn on_goto_definition(
         &mut self,
         _: &GotoDefinition,
@@ -3980,6 +3995,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_open_folder))
             .on_action(cx.listener(Self::on_goto_definition))
             .on_action(cx.listener(Self::on_find_usages))
+            .on_action(cx.listener(Self::on_editor_search))
             .on_action(cx.listener(Self::on_nav_back))
             .on_action(cx.listener(Self::on_nav_forward))
             .on_action(cx.listener(Self::on_toggle_md_preview))
@@ -4260,6 +4276,15 @@ impl Render for Workbench {
                                                 MouseButton::Left,
                                                 cx.listener(
                                                     |this, event: &MouseUpEvent, window, cx| {
+                                                        // 点击编辑器 = 离开搜索语境 → 关掉光标居中,
+                                                        // 之后点击/导航不再把视图滚去居中(见构造处注释)。
+                                                        if let Some(tab) = this.active() {
+                                                            tab.editor.update(cx, |s, cx| {
+                                                                s.set_cursor_surrounding_lines(
+                                                                    None, window, cx,
+                                                                )
+                                                            });
+                                                        }
                                                         if event.modifiers.platform {
                                                             this.on_goto_definition(
                                                                 &GotoDefinition,
