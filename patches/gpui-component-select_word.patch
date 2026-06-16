@@ -1,0 +1,30 @@
+diff --git a/crates/ui/src/input/selection.rs b/crates/ui/src/input/selection.rs
+index 4fe1a46a..2a5174c4 100644
+--- a/crates/ui/src/input/selection.rs
++++ b/crates/ui/src/input/selection.rs
+@@ -11,10 +11,24 @@ impl InputState {
+     ///
+     /// The offset is the UTF-8 offset.
+     pub(super) fn select_word(&mut self, offset: usize, _: &mut Window, cx: &mut Context<Self>) {
+-        let Some(range) = TextSelector::word_range(&self.text, offset) else {
++        let Some(mut range) = TextSelector::word_range(&self.text, offset) else {
+             return;
+         };
+ 
++        // [nib patch] 行尾双击修正:点击落在行末时 word_range 取到的"词"是行尾换行符,选中它会
++        // 让光标落到下一行、整行高亮(非 IDEA 行为,且因在 mouse-down 选中、无法靠 mouse-up
++        // 消除而产生闪烁)。换行符不是词——改从它左侧一格取词,选中本行最后一个 token(与 IDEA
++        // 双击行尾一致);左侧是行首/空行则收起光标不选,绝不牵连下一行。dep 升级见 scripts/apply-dep-patches.sh。
++        if self.text.char_at(range.start) == Some('\n') {
++            if range.start == 0 {
++                return;
++            }
++            match TextSelector::word_range(&self.text, range.start - 1) {
++                Some(left) if self.text.char_at(left.start) != Some('\n') => range = left,
++                _ => return,
++            }
++        }
++
+         self.selected_range = (range.start..range.end).into();
+         self.selected_word_range = Some(self.selected_range);
+         cx.notify()
