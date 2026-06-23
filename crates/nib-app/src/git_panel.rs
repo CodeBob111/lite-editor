@@ -522,6 +522,46 @@ impl GitPanel {
         }
     }
 
+    /// 点仓库选择器:切换「分支/历史/Pull/Push/checkout」针对的活跃仓。**只**重取该仓的
+    /// branch/branches/log(轻量,不重走所有仓 status——Commit 聚合视图不随活跃仓变,故无需
+    /// 重刷改动)。用 log_seq 守卫;先清空旧分支/历史 + notify 让 chip 立即高亮(消除「点了没反应」)。
+    fn select_repo(&mut self, i: usize, cx: &mut Context<Self>) {
+        if i >= self.repos.len() || i == self.active_repo {
+            return;
+        }
+        self.active_repo = i;
+        self.selected_branch = "".into();
+        self.branch = "".into();
+        self.branches.clear();
+        self.log.clear();
+        self.log_seq += 1;
+        let lseq = self.log_seq;
+        let path = self.repos[i].path.clone();
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let (branch, branches) = futures::join!(
+                nib_core::git::git_current_branch(path.clone()),
+                nib_core::git::git_list_branches(path.clone()),
+            );
+            let branch = branch.unwrap_or_default();
+            let log = if branch.is_empty() {
+                Ok(Vec::new())
+            } else {
+                nib_core::git::git_log(path, branch.clone(), Some(50)).await
+            };
+            let _ = weak.update(cx, |this: &mut GitPanel, cx| {
+                if this.log_seq != lseq {
+                    return;
+                }
+                this.branch = branch.into();
+                this.branches = branches.unwrap_or_default();
+                this.log = log.unwrap_or_default();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// 左键点分支:只把该分支的提交历史加载到「历史」区,**不切换分支**(切换用右键)。
     /// 复用 refresh_seq 守卫:期间发生 refresh / 又点别的分支则丢弃本次慢结果。
     fn select_branch(&mut self, branch: String, cx: &mut Context<Self>) {
@@ -941,10 +981,7 @@ impl Render for GitPanel {
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this: &mut GitPanel, _, _, cx| {
-                                        if this.active_repo != i {
-                                            this.active_repo = i;
-                                            this.refresh(cx);
-                                        }
+                                        this.select_repo(i, cx);
                                     }),
                                 )
                         })),
