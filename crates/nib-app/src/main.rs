@@ -145,6 +145,20 @@ fn file_node_to_tree_item(
     }
 }
 
+/// 目录树根节点 → 树控件 items(根本身不显示,显示其 children;无 children 则把根当单项)。
+fn tree_items_from_node(
+    node: &nib_core::fs::FileNode,
+    expanded: &std::collections::HashSet<String>,
+) -> Vec<TreeItem> {
+    match &node.children {
+        Some(children) => children
+            .iter()
+            .map(|c| file_node_to_tree_item(c, expanded))
+            .collect(),
+        None => vec![file_node_to_tree_item(node, expanded)],
+    }
+}
+
 /// notify 线程 → gpui 主线程的事件桥(EventSink 的 nib-app 实现)
 struct ChannelSink(futures::channel::mpsc::UnboundedSender<nib_core::CoreEvent>);
 
@@ -340,6 +354,8 @@ struct Workbench {
     project_root: PathBuf,
     project_name: SharedString,
     tree_state: Entity<TreeState>,
+    /// per-project 目录树缓存(FileNode),切项目时命中即时出树、避免大仓每次重 walk。
+    tree_cache: std::collections::HashMap<PathBuf, nib_core::fs::FileNode>,
     /// 资源管理器内部文件剪贴板:(路径列表, is_cut)。复制/剪切→存,粘贴→读。
     /// 与系统剪贴板分开:cmd+C 同时写系统剪贴板(跨应用),内部这份供 cmd+V 在树内粘贴。
     file_clipboard: Option<(Vec<PathBuf>, bool)>,
@@ -353,10 +369,17 @@ struct Workbench {
     nav_history: Vec<NavLoc>,
     nav_index: i32,
     nav_restoring: bool,
+    /// 导航历史按项目各自保留(内存级,App 重启丢弃):切项目时把当前项目的
+    /// (nav_history, nav_index) 存进来、取出目标项目的。不存绝对路径跨项目串台
+    /// (切到 B 按 cmd+[ 跳回 A 的文件),又不像清空那样丢掉来回切换时的历史。
+    nav_histories: std::collections::HashMap<PathBuf, (Vec<NavLoc>, i32)>,
     /// 资源管理器文件操作撤销栈(cmd+Z 时焦点在树上)
     undo_stack: Vec<UndoOp>,
     tabs: Vec<OpenTab>,
     active_tab: Option<usize>,
+    /// 切项目/恢复会话时标签在异步读盘中。此时 active_tab 短暂为空,不能渲染欢迎页,
+    /// 否则项目切换会闪一下 welcome。
+    restoring_tabs: bool,
     /// 全项目文件清单缓存(quick-open 用;core runtime 预载)
     all_files: Arc<Vec<String>>,
     /// 最近项目(欢迎页用;启动异步加载 + 廉价类型探测)
@@ -545,15 +568,18 @@ impl Workbench {
             project_root: root.clone(),
             project_name: "".into(),
             tree_state,
+            tree_cache: std::collections::HashMap::new(),
             file_clipboard: None,
             selected_paths: std::collections::HashSet::new(),
             lsp_phase: LspPhase::Off,
             nav_history: Vec::new(),
             nav_index: -1,
             nav_restoring: false,
+            nav_histories: std::collections::HashMap::new(),
             undo_stack: Vec::new(),
             tabs: Vec::new(),
             active_tab: None,
+            restoring_tabs: false,
             all_files: Arc::new(Vec::new()),
             recents: Vec::new(),
             overlay: None,
@@ -680,6 +706,13 @@ impl Workbench {
             .detach();
         }
         self.lsp_phase = LspPhase::Off;
+        // 切项目前把当前项目的导航历史存档(按项目各自保留;project_root 下面才会被改写)
+        if !self.project_root.as_os_str().is_empty() {
+            self.nav_histories.insert(
+                self.project_root.clone(),
+                (std::mem::take(&mut self.nav_history), self.nav_index),
+            );
+        }
         if let Err(err) = nib_core::watch::start_file_watcher(
             root.to_string_lossy().to_string(),
             self.events_sink.clone(),
@@ -695,6 +728,22 @@ impl Workbench {
             .into();
         self.status = root.display().to_string().into();
         self.expanded_paths.clear();
+        // 取出目标项目的导航历史(无则空;index=-1 表示无当前位置,与初始化一致)
+        let (hist, ix) = self
+            .nav_histories
+            .remove(&root)
+            .unwrap_or_else(|| (Vec::new(), -1));
+        self.nav_history = hist;
+        self.nav_index = ix;
+        self.nav_restoring = false;
+        // 资源管理器多选集 / 文件操作撤销栈都绑定旧项目的绝对路径,切项目必须清空,
+        // 否则在新项目里 复制/剪切/删除 会作用到旧项目、cmd+Z 会撤销旧项目的文件操作。
+        self.selected_paths.clear();
+        self.undo_stack.clear();
+        // 浮层都持有旧项目上下文(搜索面板绑旧 root、Usages 是旧项目的结果、重命名框针对旧
+        // 项目文件),切项目一律关掉,避免在新项目里对旧项目搜索/操作。
+        self.overlay = None;
+        self._overlay_sub = None;
         session::remember_recent(root.to_string_lossy().to_string());
         if let Some(panel) = &self.terminal {
             panel.update(cx, |panel, cx| panel.set_project(root.clone(), cx));
@@ -757,53 +806,72 @@ impl Workbench {
     }
 
     /// 重读目录树(项目加载/外部结构变化共用;core runtime 上跑,带陈旧守卫)。
-    /// 重建后回放展开态 + 恢复当前标签的选中(set_items 会清掉两者)。
+    /// per-project 缓存:大仓 depth-64 全量遍历要数秒,切走再回若每次重 walk、慢结果又被
+    /// 陈旧守卫丢弃 → 树永不更新成该项目(实测 rateplatform 25k 文件即此症)。命中缓存即时
+    /// 出树;后台重 walk 完成时**无条件**写缓存(即便已切走),下次切回即时。重建后回放展开态
+    /// + 当前标签选中(set_items 会清掉两者)。
     fn reload_tree(&mut self, cx: &mut Context<Self>) {
-        let tree_for_load = self.tree_state.clone();
-        let root_str = self.project_root.to_string_lossy().to_string();
-        let guard_root = self.project_root.clone();
-        cx.spawn(async move |weak, cx| {
-            // 深度上限 64:原来的 12 会把深 Java 包(com/alibaba/.../xxx 常超 12 层)截断成空目录。
-            // 64 远超任何真实包深度,保留有限上限(非 None)防病态符号链/超深目录递归爆栈。
-            // should_skip 已剪掉 target/node_modules 等产物目录,加深上限不会显著放大遍历量。
-            // (真·最优是目录懒加载 + 按 watcher 路径增量改节点,属较大的树控件重构,另行处理。)
-            let result = nib_core::fs::read_dir_tree(root_str, Some(64)).await;
-            if let Ok(node) = result {
-                // 陈旧守卫:期间切了项目就丢弃;同帧取展开态与当前标签
-                let Ok((still_current, expanded, active_item)) = weak.read_with(cx, |this, _| {
-                    (
-                        this.project_root == guard_root,
-                        this.expanded_paths.clone(),
-                        this.active().map(|t| {
-                            (t.path.to_string_lossy().to_string(), t.title.clone())
-                        }),
-                    )
-                }) else {
-                    return;
-                };
-                if !still_current {
-                    return;
-                }
-                let items: Vec<TreeItem> = match &node.children {
-                    Some(children) => children
-                        .iter()
-                        .map(|c| file_node_to_tree_item(c, &expanded))
-                        .collect(),
-                    None => vec![file_node_to_tree_item(&node, &expanded)],
-                };
-                tree_for_load.update(cx, |state, cx| {
-                    state.set_items(items, cx);
-                    if let Some((id, title)) = active_item {
-                        let item = TreeItem::new(id, title);
-                        state.set_selected_item(Some(&item), cx);
-                    }
-                });
-                // tree(&tree_state) 是「读 tree_state 的元素」(非子视图),只有 Workbench 重渲才会
-                // 读到新节点。set_items 仅 notify tree_state,其 observe 回调只处理选中变化、set_items
-                // 后选中为空 → 不会 notify Workbench。切项目时这条链断了 → 树「完全没变」。这里显式
-                // notify Workbench 触发重渲(初次加载是靠启动期别的 notify 顺带刷到,才一直没暴露)。
-                let _ = weak.update(cx, |_, cx| cx.notify());
+        let root = self.project_root.clone();
+        let expanded = self.expanded_paths.clone();
+        let active_item = self
+            .active()
+            .map(|t| (t.path.to_string_lossy().to_string(), t.title.clone()));
+        // 命中缓存 → 立即出树(切项目瞬间不空窗/不陈旧);未命中(项目首开)→ 先清空,
+        // 避免显示上一个项目的陈旧树。两种情况下面都会后台 walk 刷新。
+        let cached = self.tree_cache.get(&root).cloned();
+        let items = match &cached {
+            Some(node) => tree_items_from_node(node, &expanded),
+            None => Vec::new(),
+        };
+        self.tree_state.update(cx, |state, cx| {
+            state.set_items(items, cx);
+            if let Some((id, title)) = &active_item {
+                state.set_selected_item(Some(&TreeItem::new(id.clone(), title.clone())), cx);
             }
+        });
+        cx.notify();
+
+        let tree_for_load = self.tree_state.clone();
+        let root_str = root.to_string_lossy().to_string();
+        let guard_root = root;
+        cx.spawn(async move |weak, cx| {
+            // 深度上限 64:12 会把深 Java 包(com/alibaba/.../xxx 常超 12 层)截断成空目录。
+            // should_skip 已剪掉 target/node_modules 等产物目录。(真·最优是目录懒加载,属较大重构,另议。)
+            let Ok(node) = nib_core::fs::read_dir_tree(root_str, Some(64)).await else {
+                return;
+            };
+            // 无条件写缓存(即便期间已切走):下次切回即时命中。
+            if weak
+                .update(cx, |this, _| {
+                    this.tree_cache.insert(guard_root.clone(), node.clone());
+                })
+                .is_err()
+            {
+                return;
+            }
+            // 陈旧守卫:期间切了项目就不再设 items(缓存已写,切回时即时显示)。
+            let Ok((still_current, expanded, active_item)) = weak.read_with(cx, |this, _| {
+                (
+                    this.project_root == guard_root,
+                    this.expanded_paths.clone(),
+                    this.active()
+                        .map(|t| (t.path.to_string_lossy().to_string(), t.title.clone())),
+                )
+            }) else {
+                return;
+            };
+            if !still_current {
+                return;
+            }
+            let items = tree_items_from_node(&node, &expanded);
+            tree_for_load.update(cx, |state, cx| {
+                state.set_items(items, cx);
+                if let Some((id, title)) = active_item {
+                    state.set_selected_item(Some(&TreeItem::new(id, title)), cx);
+                }
+            });
+            // set_items 只 notify tree_state(其 observe 仅处理选中变化)→ 显式 notify Workbench 重渲读新节点。
+            let _ = weak.update(cx, |_, cx| cx.notify());
         })
         .detach();
     }
@@ -1094,6 +1162,7 @@ impl Workbench {
                     }
                     // 标签已填回 → 落盘正确的 open_files / active_project_index(switch_project 不再
                     // 提前 persist,空标签也覆盖到:见那里的注释)。
+                    this.restoring_tabs = false;
                     this.persist_session(cx);
                     cx.notify();
                 });
@@ -1931,24 +2000,66 @@ impl Workbench {
         cx.notify();
     }
 
-    /// 打开文件并定位到行列(全局搜索跳转用)
-    /// 跳转后把目标行滚到编辑器视口垂直居中(IDEA 式)。line_height / 可见行数要等
-    /// 布局后才有(新开文件首帧前为 None)→ 延到下一帧再算并 set_scroll_offset
-    /// (deferred + 自动 clamp 到合法范围)。
-    fn center_editor_line(editor: Entity<InputState>, line: u32, window: &mut Window) {
-        window.on_next_frame(move |_, cx| {
+    /// 跳转定位时让目标行一次性落到视口中部附近。不能先 set_cursor_position 再下一帧
+    /// 手动 set_scroll_offset:编辑器自身会先 reveal 光标,随后我们再居中,视觉上就会"跳一下"。
+    fn set_jump_cursor(
+        editor: Entity<InputState>,
+        line: u32,
+        column: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::input::Position;
+
+        editor.update(cx, |state, cx| {
+            state.set_cursor_surrounding_lines(Some(9999), window, cx);
+            state.set_cursor_position(Position::new(line, column), window, cx);
+        });
+        window.on_next_frame(move |window, cx| {
             editor.update(cx, |state, cx| {
-                let Some(lh) = state.line_height() else {
-                    return;
-                };
-                let visible = state.visible_row_range().map(|r| r.len()).unwrap_or(20);
-                // 目标顶行 = 命中行 - 可见行数/2;offset.y 为负(内容上移=向下滚)
-                let target_top = (line as i64 - (visible as i64) / 2).max(0) as f32;
-                let mut off = state.scroll_offset();
-                off.y = px(-(target_top * f32::from(lh)));
-                state.set_scroll_offset(off, cx);
+                state.set_cursor_surrounding_lines(None, window, cx);
             });
         });
+    }
+
+    fn center_editor_line_now(editor: &Entity<InputState>, line: u32, cx: &mut App) -> bool {
+        editor.update(cx, |state, cx| {
+            let Some(line_height) = state.line_height() else {
+                return false;
+            };
+            let visible_rows = state.visible_row_range().map(|range| range.len()).unwrap_or(20);
+            let target_top = (line as i64 - visible_rows as i64 / 2).max(0) as f32;
+            let mut offset = state.scroll_offset();
+            offset.y = px(-(target_top * f32::from(line_height)));
+            state.set_scroll_offset(offset, cx);
+            true
+        })
+    }
+
+    fn center_editor_line(editor: Entity<InputState>, line: u32, window: &mut Window) {
+        window.on_next_frame(move |window, cx| {
+            if !Self::center_editor_line_now(&editor, line, cx) {
+                let editor = editor.clone();
+                window.on_next_frame(move |_, cx| {
+                    Self::center_editor_line_now(&editor, line, cx);
+                });
+            }
+        });
+    }
+
+    fn set_centered_jump_cursor(
+        editor: Entity<InputState>,
+        line: u32,
+        column: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use gpui_component::input::Position;
+
+        editor.update(cx, |state, cx| {
+            state.set_cursor_position(Position::new(line, column), window, cx);
+        });
+        Self::center_editor_line(editor, line, window);
     }
 
     fn open_file_at(
@@ -1959,7 +2070,29 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        use gpui_component::input::Position;
+        self.open_file_at_impl(path, line, column, false, window, cx);
+    }
+
+    fn open_file_at_centered(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_file_at_impl(path, line, column, true, window, cx);
+    }
+
+    fn open_file_at_impl(
+        &mut self,
+        path: PathBuf,
+        line: u32,
+        column: u32,
+        centered: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // 导航历史:记离开点(当前光标)+ 目标点(back/forward 触发时不记)
         self.nav_record_jump(
             NavLoc {
@@ -1971,11 +2104,11 @@ impl Workbench {
         if let Some(ix) = self.tabs.iter().position(|t| t.path == path) {
             self.activate_tab(ix, window, cx);
             if let Some(tab) = self.tabs.get(ix) {
-                let editor = tab.editor.clone();
-                editor.update(cx, |state, cx| {
-                    state.set_cursor_position(Position::new(line, column), window, cx);
-                });
-                Self::center_editor_line(editor, line, window);
+                if centered {
+                    Self::set_centered_jump_cursor(tab.editor.clone(), line, column, window, cx);
+                } else {
+                    Self::set_jump_cursor(tab.editor.clone(), line, column, window, cx);
+                }
             }
             return;
         }
@@ -1991,11 +2124,17 @@ impl Workbench {
                         let ix = this.insert_tab(path.clone(), text, window, cx);
                         this.activate_tab(ix, window, cx);
                         if let Some(tab) = this.tabs.get(ix) {
-                            let editor = tab.editor.clone();
-                            editor.update(cx, |state, cx| {
-                                state.set_cursor_position(Position::new(line, column), window, cx);
-                            });
-                            Self::center_editor_line(editor, line, window);
+                            if centered {
+                                Self::set_centered_jump_cursor(
+                                    tab.editor.clone(),
+                                    line,
+                                    column,
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                Self::set_jump_cursor(tab.editor.clone(), line, column, window, cx);
+                            }
                         }
                     }
                     cx.notify();
@@ -2723,12 +2862,17 @@ impl Workbench {
         let cwd = self.project_root.to_string_lossy().to_string();
         let window_handle = self.window_handle;
         cx.spawn(async move |weak, cx| {
-            let Ok(diff) = nib_core::diff::diff_file_against_head(cwd, rel_path.clone()).await
-            else {
-                return;
-            };
+            let diff = nib_core::diff::diff_file_against_head(cwd, rel_path.clone()).await;
             let _ = cx.update_window(window_handle, |_, window, cx| {
                 let _ = weak.update(cx, |this: &mut Workbench, cx| {
+                    let diff = match diff {
+                        Ok(diff) => diff,
+                        Err(err) => {
+                            this.status = err.into();
+                            cx.notify();
+                            return;
+                        }
+                    };
                     let view = cx.new(|_| DiffView::new(rel_path.clone(), abs_path.clone(), diff));
                     let sub = cx.subscribe_in(
                         &view,
@@ -2859,7 +3003,7 @@ impl Workbench {
                 SearchEvent::Open { path, line, column } => {
                     let (path, line, column) = (path.clone(), *line, *column);
                     this.close_palette(window, cx);
-                    this.open_file_at(path, line, column, window, cx);
+                    this.open_file_at_centered(path, line, column, window, cx);
                 }
             },
         );
@@ -3552,6 +3696,18 @@ impl Workbench {
             )
     }
 
+    fn render_project_loading(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().muted_foreground)
+            .text_size(px(12.))
+            .child(format!("正在切换到 {} …", self.project_name))
+    }
+
     /// 底部面板(对齐设计稿):问题/终端/输出 tab 栏 + 按 tab 切换内容。
     /// 问题=按文件的诊断计数(可点开;gpui-component 未开放逐条诊断 API,故只到文件级);
     /// 终端=既有终端面板;输出=占位(暂无构建/LSP 日志源)。
@@ -3839,11 +3995,13 @@ impl Workbench {
         self.active_tab = None;
         let root = PathBuf::from(&target.path);
         if root.exists() {
+            self.restoring_tabs = !target.open_files.is_empty();
             self.load_project(root, cx);
             // 不在这里 persist:此刻 tabs 刚 clear、restore_tabs 还没异步填回,persist 会把目标项目
             // 已存的 open_files 清成空(下次回来文件全丢)。改由 restore_tabs 恢复完成后再 persist。
             self.restore_tabs(target.open_files.clone(), target.active_file.clone(), cx);
         } else {
+            self.restoring_tabs = false;
             // 目标路径已不存在:仍需把 active_project_index 落盘
             self.persist_session(cx);
         }
@@ -3868,8 +4026,11 @@ impl Workbench {
             self.active_tab = None;
             let root = PathBuf::from(&target.path);
             if root.exists() {
+                self.restoring_tabs = !target.open_files.is_empty();
                 self.load_project(root, cx);
                 self.restore_tabs(target.open_files.clone(), target.active_file.clone(), cx);
+            } else {
+                self.restoring_tabs = false;
             }
         }
         let sess = session::PersistedSession {
@@ -4049,6 +4210,7 @@ impl Render for Workbench {
                             let active = ix == self.active_project;
                             h_flex()
                                 .id(("proj-tab", ix))
+                                .group(SharedString::from(format!("proj-tab-{ix}")))
                                 .h(px(30.))
                                 .px_3()
                                 .gap_2()
@@ -4078,7 +4240,7 @@ impl Render for Workbench {
                                         .text_center()
                                         .child(name),
                                 )
-                                .when(active && self.projects.len() > 1, |s| {
+                                .when(self.projects.len() > 1, |s| {
                                     s.child(
                                         div()
                                             .id(("proj-close", ix))
@@ -4090,6 +4252,14 @@ impl Render for Workbench {
                                             .rounded(cx.theme().radius)
                                             .text_size(px(12.))
                                             .text_color(cx.theme().muted_foreground)
+                                            // 非活动 tab:默认隐藏关闭叉,悬浮整个 tab(group)才显出;
+                                            // 活动 tab 一直显示。group 名与父级 .group() 一致(每 tab 唯一)。
+                                            .when(!active, |s| {
+                                                s.opacity(0.).group_hover(
+                                                    SharedString::from(format!("proj-tab-{ix}")),
+                                                    |s| s.opacity(1.),
+                                                )
+                                            })
                                             .hover(|s| s.bg(cx.theme().accent))
                                             .on_mouse_down(
                                                 MouseButton::Left,
@@ -4408,7 +4578,13 @@ impl Render for Workbench {
                                             this.child(editor_el)
                                         }
                                     }
-                                    None => this.child(self.render_welcome(cx)),
+                                    None => {
+                                        if self.restoring_tabs {
+                                            this.child(self.render_project_loading(cx))
+                                        } else {
+                                            this.child(self.render_welcome(cx))
+                                        }
+                                    }
                                 }
                             }))
                             .when(self.terminal_visible, |this| {
@@ -4489,9 +4665,21 @@ impl Render for Workbench {
                                 h_flex()
                                     .gap_1()
                                     .items_center()
+                                    .max_w(px(260.))
+                                    .min_w_0()
+                                    .overflow_hidden()
                                     .whitespace_nowrap()
-                                    .child(div().text_color(cx.theme().info).child("⎇"))
-                                    .child(branch),
+                                    .child(
+                                        div().flex_none().text_color(cx.theme().info).child("⎇"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .child(branch),
+                                    ),
                             )
                         })
                         .when(ahead > 0 || behind > 0, |s| {
