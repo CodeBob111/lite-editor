@@ -3,6 +3,7 @@
 // (core runtime 上跑),刷新带序号守卫;watcher 的 FileChanged 也会触发刷新。
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -11,11 +12,13 @@ use gpui::*;
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     menu::ContextMenuExt as _,
     v_flex, ActiveTheme, Disableable as _, Sizable as _,
 };
 use nib_core::git::{GitBranch, GitChange, GitCommit};
+
+const MAX_RENDERED_CHANGES: usize = 400;
 
 pub enum GitPanelEvent {
     OpenDiff { rel_path: String, abs_path: PathBuf },
@@ -40,11 +43,16 @@ pub struct GitPanel {
     branch: SharedString,
     changes: Vec<GitChange>,
     conflicts: Vec<String>,
+    selected_change: Option<String>,
     branches: Vec<GitBranch>,
     log: Vec<GitCommit>,
     /// 「历史」区当前展示的是哪个分支的提交(左键点分支只看历史、不切换)。空=当前分支。
     selected_branch: SharedString,
     message_input: Entity<InputState>,
+    branch_filter: Entity<InputState>,
+    /// 提交信息草稿按项目各自保留(内存级,App 重启丢弃):切项目时存当前项目、取目标项目的。
+    /// 否则在 A 写一半的提交信息会跟着串到 B(切回 A 又丢了)。键=项目根。
+    commit_drafts: HashMap<PathBuf, String>,
     busy: bool,
     status: SharedString,
     /// branch/status/conflicts(轻量字段)的序号:refresh 与 refresh_light 共用,最新一次生效。
@@ -57,6 +65,7 @@ pub struct GitPanel {
     /// 「checkout」action(走 Workbench 的 on_action)再读它去切换。元素级 on_mouse_down(Right)
     /// 对本机不触发,改用 gpui-component 的 .context_menu(window 级,与文件树同款,可靠)。
     ctx_branch: Rc<RefCell<Option<String>>>,
+    _branch_filter_sub: Subscription,
 }
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
@@ -68,6 +77,15 @@ impl GitPanel {
                 .multi_line(true)
                 .placeholder("Commit message…")
         });
+        let branch_filter = cx.new(|cx| InputState::new(window, cx).placeholder("搜索分支…"));
+        let branch_filter_sub = cx.subscribe(
+            &branch_filter,
+            |_: &mut Self, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    cx.notify();
+                }
+            },
+        );
         let mut this = Self {
             window_handle: window.window_handle(),
             project_root,
@@ -75,15 +93,19 @@ impl GitPanel {
             branch: "".into(),
             changes: Vec::new(),
             conflicts: Vec::new(),
+            selected_change: None,
             branches: Vec::new(),
             log: Vec::new(),
             selected_branch: "".into(),
             message_input,
+            branch_filter,
+            commit_drafts: HashMap::new(),
             busy: false,
             status: "".into(),
             refresh_seq: 0,
             log_seq: 0,
             ctx_branch: Rc::new(RefCell::new(None)),
+            _branch_filter_sub: branch_filter_sub,
         };
         this.refresh(cx);
         this
@@ -115,9 +137,33 @@ impl GitPanel {
     }
 
     pub fn set_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        self.project_root = root;
+        // 提交信息草稿按项目各自保留:存档当前项目的、取出目标项目的(无则空)。
+        let current = self.message_input.read(cx).value().to_string();
+        if !self.project_root.as_os_str().is_empty() {
+            if current.is_empty() {
+                self.commit_drafts.remove(&self.project_root);
+            } else {
+                self.commit_drafts.insert(self.project_root.clone(), current);
+            }
+        }
+        self.project_root = root.clone();
+        let draft = self.commit_drafts.get(&root).cloned().unwrap_or_default();
+        // set_value 需要 &mut Window(本方法无 window);切项目发生在 listener 的窗口更新里,
+        // 同步取窗口会重入 panic → 沿用 commit 后清空提交框的写法,经 window_handle 延后应用。
+        // 顺带清空分支搜索框(瞬态过滤,不跨项目保留)。
+        let msg = self.message_input.clone();
+        let filter = self.branch_filter.clone();
+        let wh = self.window_handle;
+        cx.spawn(async move |_, cx| {
+            let _ = cx.update_window(wh, |_, window, cx| {
+                msg.update(cx, |state, cx| state.set_value(draft, window, cx));
+                filter.update(cx, |state, cx| state.set_value("", window, cx));
+            });
+        })
+        .detach();
         self.changes.clear();
         self.conflicts.clear();
+        self.selected_change = None;
         self.branches.clear();
         self.log.clear();
         self.branch = "".into();
@@ -154,6 +200,11 @@ impl GitPanel {
                     this.branch = branch.into();
                     this.changes = changes.unwrap_or_default();
                     this.conflicts = conflicts.unwrap_or_default();
+                    if let Some(selected) = &this.selected_change {
+                        if !this.changes.iter().any(|c| c.path == *selected) {
+                            this.selected_change = None;
+                        }
+                    }
                     // 把刚拿到的 status 结果递给宿主建改动标记,免 Workbench 再跑一次 git status
                     cx.emit(GitPanelEvent::StatusUpdated(this.changes.clone()));
                 }
@@ -189,6 +240,11 @@ impl GitPanel {
                 this.branch = branch.unwrap_or_default().into();
                 this.changes = changes.unwrap_or_default();
                 this.conflicts = conflicts.unwrap_or_default();
+                if let Some(selected) = &this.selected_change {
+                    if !this.changes.iter().any(|c| c.path == *selected) {
+                        this.selected_change = None;
+                    }
+                }
                 cx.emit(GitPanelEvent::StatusUpdated(this.changes.clone()));
                 cx.notify();
             });
@@ -274,6 +330,46 @@ impl GitPanel {
         .detach();
     }
 
+    fn selected_change(&self) -> Option<GitChange> {
+        self.selected_change
+            .as_ref()
+            .and_then(|path| self.changes.iter().find(|c| c.path == *path))
+            .cloned()
+    }
+
+    fn rollback_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(change) = self.selected_change() else {
+            self.status = "先选择一个变更".into();
+            cx.notify();
+            return;
+        };
+        self.rollback_change(change, cx);
+    }
+
+    fn rollback_change(&mut self, change: GitChange, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.busy = true;
+        self.status = format!("Rollback {} …", change.path).into();
+        cx.notify();
+        let cwd = self.project_root.to_string_lossy().to_string();
+        cx.spawn(async move |weak, cx| {
+            let result =
+                nib_core::git::git_discard_changes(cwd, change.path.clone(), change.status).await;
+            let _ = weak.update(cx, |this: &mut GitPanel, cx| {
+                this.busy = false;
+                this.status = match &result {
+                    Ok(_) => format!("已 rollback {}", change.path).into(),
+                    Err(err) => format!("Rollback 失败: {}", err).into(),
+                };
+                this.refresh_light(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn checkout(&mut self, branch: String, cx: &mut Context<Self>) {
         if self.busy || branch == self.branch.as_ref() {
             return;
@@ -332,9 +428,10 @@ impl GitPanel {
         // 「正在看历史」的分支(左键选中);空=看当前分支。供高亮用,先取出避免在 map 里借 self。
         let selected = self.selected_branch.clone();
         let ctx_branch = self.ctx_branch.clone();
+        let query = self.branch_filter.read(cx).value().trim().to_lowercase();
         self.branches
             .iter()
-            .filter(|b| !b.remote)
+            .filter(|b| !b.remote && (query.is_empty() || b.name.to_lowercase().contains(&query)))
             .map(|b| {
                 let name = b.name.clone();
                 let current = b.current;
@@ -449,14 +546,49 @@ impl GitPanel {
 impl Render for GitPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let root = self.project_root.clone();
-        let rows: Vec<_> = self
-            .changes
-            .iter()
-            .enumerate()
-            .map(|(ix, change)| {
+        let render_group = |title: &'static str,
+                            total: usize,
+                            changes: Vec<GitChange>,
+                            cx: &mut Context<Self>|
+         -> Vec<AnyElement> {
+            if total == 0 {
+                return Vec::new();
+            }
+            let hidden = total.saturating_sub(changes.len());
+            let mut rows = vec![h_flex()
+                .px_2()
+                .py_1()
+                .gap_2()
+                .items_center()
+                .rounded(cx.theme().radius)
+                .bg(cx.theme().list_active)
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(title)
+                .child(
+                    div()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("{} files", total)),
+                )
+                .into_any_element()];
+            rows.extend(changes.into_iter().enumerate().map(|(ix, change)| {
                 let abs = root.join(&change.path);
                 let rel = change.path.clone();
+                // 两段式显示(对齐 IDEA):文件名(前景亮) + 相对目录(muted 灰)
+                let p = std::path::Path::new(&change.path);
+                let filename: SharedString = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| change.path.clone())
+                    .into();
+                let dir: SharedString = p
+                    .parent()
+                    .map(|d| d.to_string_lossy().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default()
+                    .into();
                 let conflicted = self.conflicts.contains(&change.path);
+                let selected = self.selected_change.as_ref() == Some(&change.path);
                 let color = if conflicted {
                     cx.theme().danger
                 } else {
@@ -476,10 +608,12 @@ impl Render for GitPanel {
                     .gap_2()
                     .items_center()
                     .rounded(cx.theme().radius)
+                    .when(selected, |s| s.bg(cx.theme().list_active))
                     .hover(|s| s.bg(cx.theme().accent))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
+                            this.selected_change = Some(rel.clone());
                             if conflicted {
                                 cx.emit(GitPanelEvent::OpenMerge {
                                     rel_path: rel.clone(),
@@ -491,6 +625,7 @@ impl Render for GitPanel {
                                 });
                             }
                             let _ = this;
+                            cx.notify();
                         }),
                     )
                     .child(
@@ -501,13 +636,23 @@ impl Render for GitPanel {
                             .child(mark),
                     )
                     .child(
-                        div()
+                        h_flex()
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
                             .whitespace_nowrap()
+                            .gap_1p5()
                             .text_size(px(12.))
-                            .child(change.path.clone()),
+                            .child(div().flex_none().child(filename))
+                            .when(!dir.is_empty(), |s| {
+                                s.child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(dir),
+                                )
+                            }),
                     )
                     .when(conflicted, |s| {
                         s.child(
@@ -525,8 +670,43 @@ impl Render for GitPanel {
                                 .child("staged"),
                         )
                     })
-            })
+                    .into_any_element()
+            }));
+            if hidden > 0 {
+                rows.push(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_size(px(11.))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(format!("还有 {} 个变更未展示,请用搜索/忽略规则收窄工作区", hidden))
+                        .into_any_element(),
+                );
+            }
+            rows
+        };
+        let tracked_total = self.changes.iter().filter(|c| c.status != "Untracked").count();
+        let unversioned_total = self.changes.iter().filter(|c| c.status == "Untracked").count();
+        let mut remaining = MAX_RENDERED_CHANGES;
+        let tracked: Vec<GitChange> = self
+            .changes
+            .iter()
+            .filter(|c| c.status != "Untracked")
+            .take(remaining)
+            .cloned()
             .collect();
+        remaining = remaining.saturating_sub(tracked.len());
+        let unversioned: Vec<GitChange> = self
+            .changes
+            .iter()
+            .filter(|c| c.status == "Untracked")
+            .take(remaining)
+            .cloned()
+            .collect();
+        let mut rows = render_group("Changes", tracked_total, tracked, cx);
+        rows.extend(render_group("Unversioned Files", unversioned_total, unversioned, cx));
+        let can_rollback = !self.busy && self.selected_change().is_some();
+        let busy = self.busy;
 
         v_flex()
             .size_full()
@@ -540,36 +720,114 @@ impl Render for GitPanel {
                     .border_color(cx.theme().border)
                     .child(
                         div()
+                            .flex_none()
                             .text_size(px(11.))
                             .text_color(cx.theme().muted_foreground)
                             .child("分支"),
                     )
-                    .child(div().text_size(px(12.)).child(self.branch.clone()))
-                    .child(div().flex_1())
                     .child(
-                        Button::new("pull")
-                            .ghost()
-                            .xsmall()
-                            .label("Pull")
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.sync_remote(false, cx))),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_size(px(12.))
+                            .child(self.branch.clone()),
                     )
                     .child(
-                        Button::new("push")
-                            .ghost()
-                            .xsmall()
-                            .label("Push")
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.sync_remote(true, cx))),
-                    )
-                    .child(
-                        Button::new("refresh")
-                            .ghost()
-                            .xsmall()
-                            .label("刷新")
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                        h_flex()
+                            .flex_none()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .rounded(cx.theme().radius)
+                                    .when(!busy, |w| w.hover(|s| s.bg(cx.theme().list_active)))
+                                    .child(
+                                        Button::new("pull")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("Pull")
+                                            .disabled(busy)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.sync_remote(false, cx)
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .rounded(cx.theme().radius)
+                                    .when(!busy, |w| w.hover(|s| s.bg(cx.theme().list_active)))
+                                    .child(
+                                        Button::new("push")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("Push")
+                                            .disabled(busy)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.sync_remote(true, cx)
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .rounded(cx.theme().radius)
+                                    .hover(|s| s.bg(cx.theme().list_active))
+                                    .child(
+                                        Button::new("refresh")
+                                            .ghost()
+                                            .xsmall()
+                                            .label("刷新")
+                                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                                    ),
+                            ),
                     ),
             )
+            .when(self.mode == GitPanelMode::Commit, |panel| {
+                panel.child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_2()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            div()
+                                .rounded(cx.theme().radius)
+                                .when(can_rollback, |w| w.hover(|s| s.bg(cx.theme().list_active)))
+                                .child(
+                                    Button::new("rollback")
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Rollback")
+                                        .disabled(!can_rollback)
+                                        .on_click(cx.listener(|this, _, _, cx| this.rollback_selected(cx))),
+                                ),
+                        )
+                        .when(self.selected_change.is_some(), |s| {
+                            s.child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_size(px(11.))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(self.selected_change.clone().unwrap_or_default()),
+                            )
+                        }),
+                )
+            })
+            .when(self.mode == GitPanelMode::Branches, |panel| {
+                panel.child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(div().flex_1().min_w_0().child(Input::new(&self.branch_filter))),
+                )
+            })
             .child(
                 v_flex()
                     .id("git-body")
@@ -589,9 +847,20 @@ impl Render for GitPanel {
                                 )
                             })
                             .children(rows),
-                        GitPanelMode::Branches => body
-                            .children(self.render_branches(cx))
-                            .child(
+                        GitPanelMode::Branches => {
+                            let branch_rows = self.render_branches(cx);
+                            body
+                                .when(branch_rows.is_empty(), |s| {
+                                    s.child(
+                                        div()
+                                            .p_2()
+                                            .text_size(px(12.))
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child("没有匹配的分支"),
+                                    )
+                                })
+                                .children(branch_rows)
+                                .child(
                                 div()
                                     .px_2()
                                     .py_1()
@@ -609,7 +878,8 @@ impl Render for GitPanel {
                                         }
                                     )),
                             )
-                            .children(self.render_log(cx)),
+                                .children(self.render_log(cx))
+                        }
                     }),
             )
             .when(self.mode == GitPanelMode::Commit, |panel| panel.child(
