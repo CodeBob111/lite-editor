@@ -765,6 +765,48 @@ impl Workbench {
 
         // quick-open / 文本跳转兜底用的文件清单:加载时预载,结构变化时也走同一方法刷新
         self.refresh_all_files(cx);
+
+        // 后台预热其余已开项目的目录树缓存 → 之后切到它们直接命中即时出树(大仓 depth-64 全量
+        // 遍历要数秒,不预热则每个项目首次切入都要空窗等遍历)。
+        self.prewarm_tree_cache(cx);
+    }
+
+    /// 后台预热所有已开项目(除当前与已缓存)的目录树缓存:逐个顺序遍历(避免多个大仓并发抢
+    /// CPU/IO),完成即写 tree_cache。之后切到这些项目直接命中缓存,不在切换路径上等遍历。
+    fn prewarm_tree_cache(&mut self, cx: &mut Context<Self>) {
+        let current = self.project_root.clone();
+        let roots: Vec<PathBuf> = self
+            .projects
+            .iter()
+            .map(|p| PathBuf::from(&p.path))
+            .filter(|r| *r != current && !self.tree_cache.contains_key(r))
+            .collect();
+        if roots.is_empty() {
+            return;
+        }
+        cx.spawn(async move |weak, cx| {
+            for root in roots {
+                // 期间可能已被切过去时的 reload_tree 缓存,跳过避免重复遍历。
+                let need = weak
+                    .read_with(cx, |this, _| !this.tree_cache.contains_key(&root))
+                    .unwrap_or(false);
+                if !need {
+                    continue;
+                }
+                let root_str = root.to_string_lossy().to_string();
+                if let Ok(node) = nib_core::fs::read_dir_tree(root_str, Some(64)).await {
+                    if weak
+                        .update(cx, |this, _| {
+                            this.tree_cache.insert(root.clone(), node);
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     /// 重建 quick-open 与文本跳转兜底用的全量文件清单。原来只在项目加载时生成一次,
