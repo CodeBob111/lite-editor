@@ -1,7 +1,7 @@
 use crate::rt::on_worker;
 use rayon::prelude::*;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -162,6 +162,10 @@ pub async fn git_status_batch(paths: Vec<String>) -> Vec<BatchResult<Vec<GitChan
 }
 
 pub fn parse_git_status(cwd: &str) -> Result<Vec<GitChange>, String> {
+    // -uall expands untracked directories so every file shows individually (IDEA 式),
+    // 而非把 .agents/ 这类目录折叠成一行——折叠态下目录条目无法 diff、计数也对不上。
+    // gitignore 已排除 target/node_modules 等产物目录(无论 -u 级别都不进 status),
+    // 渲染层又有 MAX_RENDERED_CHANGES 上限兜底,所以展开不会撑爆 UI。
     let output = run_git_raw(cwd, &["status", "--porcelain=v1", "-z", "-uall"])?;
     let mut changes = Vec::new();
     let mut entries = output.split('\0').filter(|entry| !entry.is_empty());
@@ -181,6 +185,7 @@ pub fn parse_git_status(cwd: &str) -> Result<Vec<GitChange>, String> {
                 old_path: old_path.clone(),
                 status: classify_status(index_status),
                 staged: true,
+                repo: cwd.to_string(),
             });
         }
         if worktree_status != ' ' {
@@ -190,6 +195,7 @@ pub fn parse_git_status(cwd: &str) -> Result<Vec<GitChange>, String> {
                 old_path,
                 status,
                 staged: false,
+                repo: cwd.to_string(),
             });
         }
     }
@@ -519,22 +525,43 @@ pub async fn git_checkout_conflict_side(cwd: String, rel_path: String, side: Str
     .await
 }
 
+fn move_to_trash_sync(path: PathBuf) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "Invalid path".to_string())?
+        .to_string_lossy()
+        .to_string();
+    let trash_dir = Path::new(&home).join(".Trash");
+    std::fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
+    let mut dest = trash_dir.join(&name);
+    if dest.exists() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        dest = trash_dir.join(format!("{name}.{ts}"));
+    }
+    std::fs::rename(&path, &dest).map_err(|e| format!("Failed to move to trash: {}", e))
+}
+
 /// Discard local changes to a single path (IDEA's "Rollback").
-/// - Untracked: no committed version exists, so rolling back removes the file.
-/// - Added (staged-new): unstage, then remove from the working tree.
+/// - Untracked: no committed version exists, so rolling back moves the file to trash.
+/// - Added (staged-new): unstage, then move from working tree to trash.
 /// - Tracked (Modified/Deleted/...): restore both index and working tree from HEAD.
 pub async fn git_discard_changes(cwd: String, rel_path: String, status: String) -> Result<String, String> {
     on_worker(move || {
         match status.as_str() {
             "Untracked" => {
-                std::fs::remove_file(Path::new(&cwd).join(&rel_path))
-                    .map_err(|e| format!("Failed to delete file: {}", e))?;
+                move_to_trash_sync(Path::new(&cwd).join(&rel_path))?;
                 Ok(String::new())
             }
             "Added" => {
                 run_git(&cwd, &["reset", "--quiet", "HEAD", "--", &rel_path])?;
-                std::fs::remove_file(Path::new(&cwd).join(&rel_path))
-                    .map_err(|e| format!("Failed to delete file: {}", e))?;
+                move_to_trash_sync(Path::new(&cwd).join(&rel_path))?;
                 Ok(String::new())
             }
             _ => run_git(&cwd, &["checkout", "HEAD", "--", &rel_path]),
@@ -629,6 +656,9 @@ pub struct GitChange {
     pub old_path: Option<String>,
     pub status: String,
     pub staged: bool,
+    /// 该改动所属 git 仓的绝对路径(多仓工作区下区分嵌套仓;单仓即项目根)。
+    /// path 是相对该 repo 的路径,绝对路径 = repo.join(path)。
+    pub repo: String,
 }
 
 pub async fn git_commit(cwd: String, files: Vec<String>, message: String) -> Result<String, String> {
@@ -661,6 +691,11 @@ pub(crate) fn show_head_file_sync(cwd: &str, rel_path: &str) -> Result<String, S
     run_git_raw(cwd, &["show", &format!("HEAD:{}", rel_path)])
 }
 
+pub(crate) fn head_file_size_sync(cwd: &str, rel_path: &str) -> Result<u64, String> {
+    let out = run_git(cwd, &["cat-file", "-s", &format!("HEAD:{}", rel_path)])?;
+    out.trim().parse::<u64>().map_err(|e| e.to_string())
+}
+
 pub async fn git_show_staged(cwd: String, rel_path: String) -> Result<String, String> {
     on_worker(move || run_git_raw(&cwd, &["show", &format!(":{}", rel_path)])).await
 }
@@ -685,29 +720,35 @@ pub async fn git_discover_repos(root: String) -> Vec<GitRepo> {
 
 fn git_discover_repos_sync(root: String) -> Vec<GitRepo> {
     let root_path = Path::new(&root);
-    if root_path.join(".git").exists() {
-        return vec![GitRepo {
+    let mut repos = Vec::new();
+    // 根目录本身若是仓,排在最前(多仓工作区里 rate-native 这种根也常是个仓)。
+    let has_root = root_path.join(".git").exists();
+    if has_root {
+        repos.push(GitRepo {
             name: root_path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| root.clone()),
-            path: root,
-        }];
+            path: root.clone(),
+        });
     }
-
-    let mut repos = Vec::new();
+    // 一级子目录里的嵌套仓(根是不是仓都要扫——多仓工作区根仓 + 子仓并存)。
     if let Ok(entries) = std::fs::read_dir(root_path) {
         for entry in entries.flatten() {
-            if entry.path().join(".git").exists() {
-                let name = entry.file_name().to_string_lossy().to_string();
+            let p = entry.path();
+            if p.is_dir() && p.join(".git").exists() {
                 repos.push(GitRepo {
-                    name,
-                    path: entry.path().to_string_lossy().to_string(),
+                    name: entry.file_name().to_string_lossy().to_string(),
+                    path: p.to_string_lossy().to_string(),
                 });
             }
         }
     }
-    repos.sort_by(|a, b| a.name.cmp(&b.name));
+    // 根仓固定首位,其余嵌套仓按名排序。
+    let nested_start = if has_root { 1 } else { 0 };
+    if nested_start < repos.len() {
+        repos[nested_start..].sort_by(|a, b| a.name.cmp(&b.name));
+    }
     repos
 }
 

@@ -16,13 +16,13 @@ use gpui_component::{
     menu::ContextMenuExt as _,
     v_flex, ActiveTheme, Disableable as _, Sizable as _,
 };
-use nib_core::git::{GitBranch, GitChange, GitCommit};
+use nib_core::git::{GitBranch, GitChange, GitCommit, GitRepo};
 
 const MAX_RENDERED_CHANGES: usize = 400;
 
 pub enum GitPanelEvent {
-    OpenDiff { rel_path: String, abs_path: PathBuf },
-    OpenMerge { rel_path: String },
+    OpenDiff { repo: String, rel_path: String, abs_path: PathBuf },
+    OpenMerge { repo: String, rel_path: String },
     /// 刷新拿到的 git status 结果(供 Workbench 据此建编辑器/树的改动标记,
     /// 不必再单独跑一次 git status——合并重复查询)。
     StatusUpdated(Vec<GitChange>),
@@ -39,10 +39,18 @@ pub enum GitPanelMode {
 pub struct GitPanel {
     window_handle: AnyWindowHandle,
     project_root: PathBuf,
+    /// 多仓工作区:项目下发现的所有 git 仓(根仓 + 一级嵌套仓);单仓项目只有一个。
+    /// 空 = 尚未发现或非 git 项目(refresh 时回退为 [project_root])。
+    repos: Vec<GitRepo>,
+    /// 「分支/历史」视图当前选中的仓索引(指向 repos);Commit 视图聚合所有仓不依赖它。
+    active_repo: usize,
     mode: GitPanelMode,
     branch: SharedString,
+    /// 所有仓的改动聚合(扁平;每条 GitChange.repo 标明所属仓,path 相对该仓)。
     changes: Vec<GitChange>,
+    /// 冲突文件的**绝对**路径(跨仓;= repo.join(rel))。
     conflicts: Vec<String>,
+    /// 当前选中的改动(用**绝对**路径唯一标识,跨仓不冲突)。
     selected_change: Option<String>,
     branches: Vec<GitBranch>,
     log: Vec<GitCommit>,
@@ -70,6 +78,18 @@ pub struct GitPanel {
 
 impl EventEmitter<GitPanelEvent> for GitPanel {}
 
+/// 改动文件的**绝对**路径(= 所属仓路径 join 仓内相对路径)。多仓下唯一标识一条改动。
+fn change_abs(c: &GitChange) -> String {
+    abs_in_repo(&c.repo, &c.path)
+}
+
+fn abs_in_repo(repo: &str, rel: &str) -> String {
+    std::path::Path::new(repo)
+        .join(rel)
+        .to_string_lossy()
+        .to_string()
+}
+
 impl GitPanel {
     pub fn new(project_root: PathBuf, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let message_input = cx.new(|cx| {
@@ -89,6 +109,8 @@ impl GitPanel {
         let mut this = Self {
             window_handle: window.window_handle(),
             project_root,
+            repos: Vec::new(),
+            active_repo: 0,
             mode: GitPanelMode::Commit,
             branch: "".into(),
             changes: Vec::new(),
@@ -167,10 +189,13 @@ impl GitPanel {
         self.branches.clear();
         self.log.clear();
         self.branch = "".into();
+        self.repos.clear();
+        self.active_repo = 0;
         self.refresh(cx);
     }
 
-    /// 拉取分支与变更(序号守卫:慢结果不覆盖新查询)
+    /// 拉取多仓的分支与变更(序号守卫:慢结果不覆盖新查询)。
+    /// 多仓工作区:Commit 视图聚合**所有**仓的改动;分支/历史只针对**活跃仓**(active_repo)。
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         // 全量刷新(开面板/手动/提交/切换后)回到「看当前分支历史」。watcher 的 refresh_light
         // 不动 selected_branch,这样浏览别的分支历史时文件变更不会把视图跳回当前分支。
@@ -179,36 +204,72 @@ impl GitPanel {
         self.log_seq += 1;
         let rseq = self.refresh_seq;
         let lseq = self.log_seq;
-        let cwd = self.project_root.to_string_lossy().to_string();
+        let root = self.project_root.to_string_lossy().to_string();
+        let active_repo = self.active_repo;
         cx.spawn(async move |weak, cx| {
-            // 四个独立 git 查询并行(core runtime 各占一个 worker),刷新延迟≈最慢单项
-            let (branch, changes, conflicts, branches) = futures::join!(
-                nib_core::git::git_current_branch(cwd.clone()),
-                nib_core::git::git_status(cwd.clone()),
-                nib_core::git::git_merge_conflicts(cwd.clone()),
-                nib_core::git::git_list_branches(cwd.clone()),
+            // 发现所有仓(根仓 + 一级嵌套);非 git 项目则回退为单一项目根。
+            let mut repos = nib_core::git::git_discover_repos(root.clone()).await;
+            if repos.is_empty() {
+                repos.push(GitRepo {
+                    name: std::path::Path::new(&root)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| root.clone()),
+                    path: root.clone(),
+                });
+            }
+            let repo_paths: Vec<String> = repos.iter().map(|r| r.path.clone()).collect();
+            // 所有仓改动并行(rayon),所有仓冲突并行;冲突文件存绝对路径供任意仓改动行判定。
+            let (batch, conflicts_per) = futures::join!(
+                nib_core::git::git_status_batch(repo_paths.clone()),
+                futures::future::join_all(repo_paths.iter().cloned().map(|p| async move {
+                    let c = nib_core::git::git_merge_conflicts(p.clone()).await;
+                    (p, c)
+                })),
+            );
+            let mut changes = Vec::new();
+            for b in batch {
+                if let Some(cs) = b.result {
+                    changes.extend(cs);
+                }
+            }
+            let mut conflicts = Vec::new();
+            for (repo_path, res) in conflicts_per {
+                if let Ok(cs) = res {
+                    for rel in cs {
+                        conflicts.push(abs_in_repo(&repo_path, &rel));
+                    }
+                }
+            }
+            // 活跃仓的分支/历史(分支天然 per-repo)。
+            let active_path = repos
+                .get(active_repo)
+                .or_else(|| repos.first())
+                .map(|r| r.path.clone())
+                .unwrap_or_else(|| root.clone());
+            let (branch, branches) = futures::join!(
+                nib_core::git::git_current_branch(active_path.clone()),
+                nib_core::git::git_list_branches(active_path.clone()),
             );
             let branch = branch.unwrap_or_default();
             let log = if branch.is_empty() {
                 Ok(Vec::new())
             } else {
-                nib_core::git::git_log(cwd, branch.clone(), Some(50)).await
+                nib_core::git::git_log(active_path, branch.clone(), Some(50)).await
             };
             let _ = weak.update(cx, |this, cx| {
-                // 轻量字段:与 refresh_light 共用 refresh_seq(最新一次生效)。
                 if this.refresh_seq == rseq {
+                    this.repos = repos;
                     this.branch = branch.into();
-                    this.changes = changes.unwrap_or_default();
-                    this.conflicts = conflicts.unwrap_or_default();
-                    if let Some(selected) = &this.selected_change {
-                        if !this.changes.iter().any(|c| c.path == *selected) {
+                    this.changes = changes;
+                    this.conflicts = conflicts;
+                    if let Some(sel) = &this.selected_change {
+                        if !this.changes.iter().any(|c| change_abs(c) == *sel) {
                             this.selected_change = None;
                         }
                     }
-                    // 把刚拿到的 status 结果递给宿主建改动标记,免 Workbench 再跑一次 git status
                     cx.emit(GitPanelEvent::StatusUpdated(this.changes.clone()));
                 }
-                // 重量字段:独立 log_seq,refresh_light 不动 → 文件变更风暴冲不掉分支列表/历史。
                 if this.log_seq == lseq {
                     this.branches = branches.unwrap_or_default();
                     this.log = log.unwrap_or_default();
@@ -226,22 +287,44 @@ impl GitPanel {
     pub fn refresh_light(&mut self, cx: &mut Context<Self>) {
         self.refresh_seq += 1;
         let seq = self.refresh_seq;
-        let cwd = self.project_root.to_string_lossy().to_string();
+        let root = self.project_root.to_string_lossy().to_string();
+        // 复用 refresh 已发现的仓;未发现则回退项目根。轻量刷新不重新发现仓(目录结构罕变)、
+        // 也不动 branch/branches/log(只刷所有仓的改动 + 冲突,够改动标记与变更列表用)。
+        let repo_paths: Vec<String> = if self.repos.is_empty() {
+            vec![root]
+        } else {
+            self.repos.iter().map(|r| r.path.clone()).collect()
+        };
         cx.spawn(async move |weak, cx| {
-            let (branch, changes, conflicts) = futures::join!(
-                nib_core::git::git_current_branch(cwd.clone()),
-                nib_core::git::git_status(cwd.clone()),
-                nib_core::git::git_merge_conflicts(cwd),
+            let (batch, conflicts_per) = futures::join!(
+                nib_core::git::git_status_batch(repo_paths.clone()),
+                futures::future::join_all(repo_paths.iter().cloned().map(|p| async move {
+                    let c = nib_core::git::git_merge_conflicts(p.clone()).await;
+                    (p, c)
+                })),
             );
+            let mut changes = Vec::new();
+            for b in batch {
+                if let Some(cs) = b.result {
+                    changes.extend(cs);
+                }
+            }
+            let mut conflicts = Vec::new();
+            for (repo_path, res) in conflicts_per {
+                if let Ok(cs) = res {
+                    for rel in cs {
+                        conflicts.push(abs_in_repo(&repo_path, &rel));
+                    }
+                }
+            }
             let _ = weak.update(cx, |this, cx| {
                 if this.refresh_seq != seq {
                     return;
                 }
-                this.branch = branch.unwrap_or_default().into();
-                this.changes = changes.unwrap_or_default();
-                this.conflicts = conflicts.unwrap_or_default();
-                if let Some(selected) = &this.selected_change {
-                    if !this.changes.iter().any(|c| c.path == *selected) {
+                this.changes = changes;
+                this.conflicts = conflicts;
+                if let Some(sel) = &this.selected_change {
+                    if !this.changes.iter().any(|c| change_abs(c) == *sel) {
                         this.selected_change = None;
                     }
                 }
@@ -267,9 +350,12 @@ impl GitPanel {
             cx.notify();
             return;
         }
-        let files: Vec<String> = self.changes.iter().map(|c| c.path.clone()).collect();
-        let cwd = self.project_root.to_string_lossy().to_string();
-        let branch = self.branch.to_string();
+        // 多仓:按仓分组待提交文件(各仓相对路径),每个仓单独 git_commit(共用同一条 message)。
+        let mut by_repo: HashMap<String, Vec<String>> = HashMap::new();
+        for c in &self.changes {
+            by_repo.entry(c.repo.clone()).or_default().push(c.path.clone());
+        }
+        let groups: Vec<(String, Vec<String>)> = by_repo.into_iter().collect();
         self.busy = true;
         self.status = if and_push { "提交并推送中…" } else { "提交中…" }.into();
         cx.notify();
@@ -277,19 +363,43 @@ impl GitPanel {
         let input = self.message_input.clone();
         let window_handle = self.window_handle;
         cx.spawn(async move |weak, cx| {
-            let mut result = nib_core::git::git_commit(cwd.clone(), files, message).await;
-            if result.is_ok() && and_push {
-                result = nib_core::git::git_push(cwd, branch).await;
+            let mut ok = 0usize;
+            let mut err: Option<String> = None;
+            for (repo, files) in groups {
+                match nib_core::git::git_commit(repo.clone(), files, message.clone()).await {
+                    Ok(_) => {
+                        ok += 1;
+                        // 推送各仓自己的当前分支(多仓各分支不同,逐仓查)。
+                        if and_push {
+                            let branch = nib_core::git::git_current_branch(repo.clone())
+                                .await
+                                .unwrap_or_default();
+                            if !branch.is_empty() {
+                                if let Err(e) = nib_core::git::git_push(repo, branch).await {
+                                    err.get_or_insert(e);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        err.get_or_insert(e);
+                    }
+                }
             }
             let _ = cx.update_window(window_handle, |_, window, cx| {
                 let _ = weak.update(cx, |this: &mut GitPanel, cx| {
                     this.busy = false;
-                    this.status = match &result {
-                        Ok(_) => {
+                    this.status = match &err {
+                        None => {
                             input.update(cx, |state, cx| state.set_value("", window, cx));
-                            if and_push { "已提交并推送 ✓" } else { "已提交 ✓" }.into()
+                            if and_push {
+                                format!("已提交 {} 个仓并推送 ✓", ok)
+                            } else {
+                                format!("已提交 {} 个仓 ✓", ok)
+                            }
+                            .into()
                         }
-                        Err(err) => format!("失败: {}", err).into(),
+                        Some(e) => format!("部分失败: {}", e).into(),
                     };
                     this.refresh(cx);
                     cx.notify();
@@ -306,7 +416,8 @@ impl GitPanel {
         self.busy = true;
         self.status = if push { "推送中…" } else { "拉取中…" }.into();
         cx.notify();
-        let cwd = self.project_root.to_string_lossy().to_string();
+        // Pull/Push 针对「分支/历史」视图当前选中的活跃仓。
+        let cwd = self.active_repo_path();
         let branch = self.branch.to_string();
         cx.spawn(async move |weak, cx| {
             let result = if push {
@@ -330,10 +441,18 @@ impl GitPanel {
         .detach();
     }
 
+    /// 活跃仓的路径(分支/历史/Pull/Push/checkout 针对它);越界则回退项目根。
+    fn active_repo_path(&self) -> String {
+        self.repos
+            .get(self.active_repo)
+            .map(|r| r.path.clone())
+            .unwrap_or_else(|| self.project_root.to_string_lossy().to_string())
+    }
+
     fn selected_change(&self) -> Option<GitChange> {
         self.selected_change
             .as_ref()
-            .and_then(|path| self.changes.iter().find(|c| c.path == *path))
+            .and_then(|abs| self.changes.iter().find(|c| change_abs(c) == *abs))
             .cloned()
     }
 
@@ -353,7 +472,8 @@ impl GitPanel {
         self.busy = true;
         self.status = format!("Rollback {} …", change.path).into();
         cx.notify();
-        let cwd = self.project_root.to_string_lossy().to_string();
+        // rollback 作用于该改动所属的仓(多仓:每条改动带 repo)。
+        let cwd = change.repo.clone();
         cx.spawn(async move |weak, cx| {
             let result =
                 nib_core::git::git_discard_changes(cwd, change.path.clone(), change.status).await;
@@ -377,7 +497,7 @@ impl GitPanel {
         self.busy = true;
         self.status = format!("切换到 {} …", branch).into();
         cx.notify();
-        let cwd = self.project_root.to_string_lossy().to_string();
+        let cwd = self.active_repo_path();
         cx.spawn(async move |weak, cx| {
             let result = nib_core::git::git_checkout(cwd, branch.clone(), None).await;
             let _ = weak.update(cx, |this: &mut GitPanel, cx| {
@@ -409,7 +529,7 @@ impl GitPanel {
         // 只动历史 → 用 log_seq(与 refresh / 别的 select 互不覆盖,且不受 refresh_light 影响)。
         self.log_seq += 1;
         let seq = self.log_seq;
-        let cwd = self.project_root.to_string_lossy().to_string();
+        let cwd = self.active_repo_path();
         cx.notify();
         cx.spawn(async move |weak, cx| {
             let log = nib_core::git::git_log(cwd, branch, Some(50)).await;
@@ -545,8 +665,7 @@ impl GitPanel {
 
 impl Render for GitPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let root = self.project_root.clone();
-        let render_group = |title: &'static str,
+        let render_group = |title: SharedString,
                             total: usize,
                             changes: Vec<GitChange>,
                             cx: &mut Context<Self>|
@@ -572,8 +691,12 @@ impl Render for GitPanel {
                 )
                 .into_any_element()];
             rows.extend(changes.into_iter().enumerate().map(|(ix, change)| {
-                let abs = root.join(&change.path);
+                // 绝对路径 = 所属仓 join 仓内相对路径(多仓);conflicts/selected_change 均按绝对路径比对。
+                let abs = std::path::Path::new(&change.repo).join(&change.path);
+                let abs_str = abs.to_string_lossy().to_string();
                 let rel = change.path.clone();
+                let repo = change.repo.clone();
+                let sel = abs_str.clone();
                 // 两段式显示(对齐 IDEA):文件名(前景亮) + 相对目录(muted 灰)
                 let p = std::path::Path::new(&change.path);
                 let filename: SharedString = p
@@ -587,8 +710,8 @@ impl Render for GitPanel {
                     .filter(|s| !s.is_empty())
                     .unwrap_or_default()
                     .into();
-                let conflicted = self.conflicts.contains(&change.path);
-                let selected = self.selected_change.as_ref() == Some(&change.path);
+                let conflicted = self.conflicts.iter().any(|c| c == &abs_str);
+                let selected = self.selected_change.as_deref() == Some(abs_str.as_str());
                 let color = if conflicted {
                     cx.theme().danger
                 } else {
@@ -613,13 +736,15 @@ impl Render for GitPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
-                            this.selected_change = Some(rel.clone());
+                            this.selected_change = Some(sel.clone());
                             if conflicted {
                                 cx.emit(GitPanelEvent::OpenMerge {
+                                    repo: repo.clone(),
                                     rel_path: rel.clone(),
                                 });
                             } else {
                                 cx.emit(GitPanelEvent::OpenDiff {
+                                    repo: repo.clone(),
                                     rel_path: rel.clone(),
                                     abs_path: abs.clone(),
                                 });
@@ -685,26 +810,25 @@ impl Render for GitPanel {
             }
             rows
         };
-        let tracked_total = self.changes.iter().filter(|c| c.status != "Untracked").count();
-        let unversioned_total = self.changes.iter().filter(|c| c.status == "Untracked").count();
+        // 多仓:按仓分组聚合——每个有改动的仓一个分组(标题=仓名,内含该仓全部改动)。
+        // 单仓时就一个分组。MAX_RENDERED_CHANGES 跨所有仓共享上限。
+        let mut rows: Vec<AnyElement> = Vec::new();
         let mut remaining = MAX_RENDERED_CHANGES;
-        let tracked: Vec<GitChange> = self
-            .changes
-            .iter()
-            .filter(|c| c.status != "Untracked")
-            .take(remaining)
-            .cloned()
-            .collect();
-        remaining = remaining.saturating_sub(tracked.len());
-        let unversioned: Vec<GitChange> = self
-            .changes
-            .iter()
-            .filter(|c| c.status == "Untracked")
-            .take(remaining)
-            .cloned()
-            .collect();
-        let mut rows = render_group("Changes", tracked_total, tracked, cx);
-        rows.extend(render_group("Unversioned Files", unversioned_total, unversioned, cx));
+        for repo in &self.repos {
+            let total = self.changes.iter().filter(|c| c.repo == repo.path).count();
+            if total == 0 {
+                continue;
+            }
+            let group: Vec<GitChange> = self
+                .changes
+                .iter()
+                .filter(|c| c.repo == repo.path)
+                .take(remaining)
+                .cloned()
+                .collect();
+            remaining = remaining.saturating_sub(group.len());
+            rows.extend(render_group(repo.name.clone().into(), total, group, cx));
+        }
         let can_rollback = !self.busy && self.selected_change().is_some();
         let busy = self.busy;
 
@@ -782,6 +906,50 @@ impl Render for GitPanel {
                             ),
                     ),
             )
+            // 多仓选择器(仅 repos>1 时):选中仓决定「分支/历史/Pull/Push/checkout」针对哪个仓;
+            // Commit 变更视图聚合所有仓,不依赖它。横向可滚动,容纳多仓。
+            .when(self.repos.len() > 1, |panel| {
+                let active_repo = self.active_repo;
+                panel.child(
+                    h_flex()
+                        .id("repo-selector")
+                        .px_2()
+                        .py_1()
+                        .gap_1p5()
+                        .items_center()
+                        .overflow_x_scroll()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .children(self.repos.iter().enumerate().map(|(i, r)| {
+                            let active = i == active_repo;
+                            div()
+                                .id(("repo-chip", i))
+                                .px_2()
+                                .py_0p5()
+                                .flex_none()
+                                .rounded(cx.theme().radius)
+                                .text_size(px(11.))
+                                .whitespace_nowrap()
+                                .when(active, |s| {
+                                    s.bg(cx.theme().list_active).text_color(cx.theme().foreground)
+                                })
+                                .when(!active, |s| {
+                                    s.text_color(cx.theme().muted_foreground)
+                                        .hover(|s| s.bg(cx.theme().accent))
+                                })
+                                .child(r.name.clone())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this: &mut GitPanel, _, _, cx| {
+                                        if this.active_repo != i {
+                                            this.active_repo = i;
+                                            this.refresh(cx);
+                                        }
+                                    }),
+                                )
+                        })),
+                )
+            })
             .when(self.mode == GitPanelMode::Commit, |panel| {
                 panel.child(
                     h_flex()

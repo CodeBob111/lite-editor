@@ -521,11 +521,13 @@ impl Workbench {
         let git_sub = cx.subscribe(
             &git_panel,
             |this: &mut Workbench, _, event: &GitPanelEvent, cx| match event {
-                GitPanelEvent::OpenDiff { rel_path, abs_path } => {
-                    this.open_diff(rel_path.clone(), abs_path.clone(), cx)
-                }
-                GitPanelEvent::OpenMerge { rel_path } => {
-                    this.open_merge(rel_path.clone(), cx)
+                GitPanelEvent::OpenDiff {
+                    repo,
+                    rel_path,
+                    abs_path,
+                } => this.open_diff(repo.clone(), rel_path.clone(), abs_path.clone(), cx),
+                GitPanelEvent::OpenMerge { repo, rel_path } => {
+                    this.open_merge(repo.clone(), rel_path.clone(), cx)
                 }
                 // git_panel 刷新已经跑过 git status,直接据此建改动标记,不再单独跑一次。
                 GitPanelEvent::StatusUpdated(changes) => this.apply_git_marks(changes, cx),
@@ -2900,11 +2902,11 @@ impl Workbench {
     }
 
     /// 打开 diff 浮层(diff 在 core runtime 计算,回主线程建视图)
-    fn open_diff(&mut self, rel_path: String, abs_path: PathBuf, cx: &mut Context<Self>) {
-        let cwd = self.project_root.to_string_lossy().to_string();
+    fn open_diff(&mut self, repo: String, rel_path: String, abs_path: PathBuf, cx: &mut Context<Self>) {
         let window_handle = self.window_handle;
         cx.spawn(async move |weak, cx| {
-            let diff = nib_core::diff::diff_file_against_head(cwd, rel_path.clone()).await;
+            // 多仓:diff 必须在该文件所属仓的 cwd 跑(嵌套仓的文件不在根仓 HEAD 里)。rel_path 已相对该仓。
+            let diff = nib_core::diff::diff_file_against_head(repo.clone(), rel_path.clone()).await;
             let _ = cx.update_window(window_handle, |_, window, cx| {
                 let _ = weak.update(cx, |this: &mut Workbench, cx| {
                     let diff = match diff {
@@ -2916,10 +2918,11 @@ impl Workbench {
                         }
                     };
                     let view = cx.new(|_| DiffView::new(rel_path.clone(), abs_path.clone(), diff));
+                    let repo_for_revert = repo.clone();
                     let sub = cx.subscribe_in(
                         &view,
                         window,
-                        |this: &mut Workbench, _, event: &DiffViewEvent, window, cx| match event {
+                        move |this: &mut Workbench, _, event: &DiffViewEvent, window, cx| match event {
                             DiffViewEvent::OpenFile(path) => {
                                 let path = path.clone();
                                 this.close_palette(window, cx);
@@ -2937,9 +2940,10 @@ impl Workbench {
                                 let (new_start, new_count) = (*new_start, *new_count);
                                 let old_content = old_content.clone();
                                 let rel = path
-                                    .strip_prefix(&this.project_root)
+                                    .strip_prefix(std::path::Path::new(&repo_for_revert))
                                     .ok()
                                     .map(|p| p.to_string_lossy().to_string());
+                                let repo_inner = repo_for_revert.clone();
                                 let window_handle = this.window_handle;
                                 cx.spawn(async move |weak, cx| {
                                     let p = path.to_string_lossy().to_string();
@@ -2965,7 +2969,12 @@ impl Workbench {
                                             this.git_panel.update(cx, |g, cx| g.refresh(cx));
                                             this.refresh_git_marks(cx);
                                             if let Some(rel) = rel.clone() {
-                                                this.open_diff(rel, path.clone(), cx);
+                                                this.open_diff(
+                                                    repo_inner.clone(),
+                                                    rel,
+                                                    path.clone(),
+                                                    cx,
+                                                );
                                             }
                                         });
                                     });
@@ -2985,9 +2994,9 @@ impl Workbench {
 
     /// 打开 3-way merge 浮层(Git 面板点击冲突文件进来)。解决成功后
     /// 关浮层并刷新 Git 面板;文件写回会触发 watcher,打开的标签自动重载。
-    fn open_merge(&mut self, rel_path: String, cx: &mut Context<Self>) {
-        let cwd = self.project_root.to_string_lossy().to_string();
-        let view = cx.new(|cx| MergeView::new(cwd, rel_path, cx));
+    fn open_merge(&mut self, repo: String, rel_path: String, cx: &mut Context<Self>) {
+        // 多仓:merge 在冲突文件所属仓的 cwd 跑。
+        let view = cx.new(|cx| MergeView::new(repo, rel_path, cx));
         let sub = cx.subscribe(
             &view,
             |this: &mut Workbench, _, event: &MergeViewEvent, cx| match event {
@@ -4112,7 +4121,11 @@ impl Workbench {
     fn apply_git_marks(&mut self, changes: &[nib_core::git::GitChange], cx: &mut Context<Self>) {
         let mut marks = std::collections::HashMap::new();
         for c in changes {
-            let abs = self.project_root.join(&c.path).to_string_lossy().to_string();
+            // 多仓:每条改动的绝对路径 = 所属仓 join 仓内相对路径(c.repo 由 git status 填)。
+            let abs = std::path::Path::new(&c.repo)
+                .join(&c.path)
+                .to_string_lossy()
+                .to_string();
             let ch = c.status.chars().next().unwrap_or(' ');
             // 同文件 staged+unstaged 两条:改动类标记优先于已暂存覆盖
             marks.entry(abs).or_insert(ch);
