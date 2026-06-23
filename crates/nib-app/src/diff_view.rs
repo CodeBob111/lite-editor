@@ -178,7 +178,7 @@ fn build_side_rows<'a>(rows: &'a [DiffRow], windows: &[(usize, usize)]) -> Vec<S
 }
 
 impl Render for DiffView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let added_bg = cx.theme().success.opacity(0.13);
         let removed_bg = cx.theme().danger.opacity(0.13);
         // 缺行 filler:某侧无对应行(纯删的右侧 / 纯增的左侧)给极淡中性底,示意「此侧无行」。
@@ -282,9 +282,14 @@ impl Render for DiffView {
             .collect();
 
         let abs = self.abs_path.clone();
+        // 并排卡片跟随窗口:宽取视口 92%(浮层父级无定宽,relative 失效,只能按视口算像素),
+        // 高取视口减去顶部 110 偏移与底部留白;给下限防极窄/极矮窗口下卡片塌掉。
+        let viewport = window.viewport_size();
+        let card_w = px((f32::from(viewport.width) * 0.92).max(640.));
+        let card_h = px((f32::from(viewport.height) - 150.).max(360.));
         v_flex()
-            .w(px(1080.))
-            .max_h(px(640.))
+            .w(card_w)
+            .max_h(card_h)
             .bg(cx.theme().popover)
             .border_1()
             .border_color(cx.theme().border)
