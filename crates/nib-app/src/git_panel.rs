@@ -459,39 +459,48 @@ impl GitPanel {
             .unwrap_or_else(|| self.project_root.to_string_lossy().to_string())
     }
 
-    fn selected_change(&self) -> Option<GitChange> {
-        self.selected_change
-            .as_ref()
-            .and_then(|abs| self.changes.iter().find(|c| change_abs(c) == *abs))
-            .cloned()
-    }
-
-    fn rollback_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(change) = self.selected_change() else {
-            self.status = "先选择一个变更".into();
-            cx.notify();
-            return;
-        };
-        self.rollback_change(change, cx);
-    }
-
-    fn rollback_change(&mut self, change: GitChange, cx: &mut Context<Self>) {
+    /// Rollback **所有勾选的**改动(跨仓,每条用其所属仓 cwd)。tracked 文件 discard 不可逆
+    /// (untracked 移废纸篓可恢复)——按勾选执行,用户用复选框控制范围。
+    fn rollback_checked(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
+        let targets: Vec<GitChange> = self
+            .changes
+            .iter()
+            .filter(|c| !self.unchecked.contains(&change_abs(c)))
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            self.status = "没有勾选的变更".into();
+            cx.notify();
+            return;
+        }
         self.busy = true;
-        self.status = format!("Rollback {} …", change.path).into();
+        self.status = format!("Rollback {} 个文件 …", targets.len()).into();
         cx.notify();
-        // rollback 作用于该改动所属的仓(多仓:每条改动带 repo)。
-        let cwd = change.repo.clone();
         cx.spawn(async move |weak, cx| {
-            let result =
-                nib_core::git::git_discard_changes(cwd, change.path.clone(), change.status).await;
+            let mut ok = 0usize;
+            let mut err: Option<String> = None;
+            for c in targets {
+                match nib_core::git::git_discard_changes(
+                    c.repo.clone(),
+                    c.path.clone(),
+                    c.status.clone(),
+                )
+                .await
+                {
+                    Ok(_) => ok += 1,
+                    Err(e) => {
+                        err.get_or_insert(e);
+                    }
+                }
+            }
             let _ = weak.update(cx, |this: &mut GitPanel, cx| {
                 this.busy = false;
-                this.status = match &result {
-                    Ok(_) => format!("已 rollback {}", change.path).into(),
-                    Err(err) => format!("Rollback 失败: {}", err).into(),
+                this.status = match &err {
+                    None => format!("已 rollback {} 个文件 ✓", ok).into(),
+                    Some(e) => format!("部分失败: {}", e).into(),
                 };
                 this.refresh_light(cx);
                 cx.notify();
@@ -969,7 +978,7 @@ impl Render for GitPanel {
             remaining = remaining.saturating_sub(group.len());
             rows.extend(render_group(repo.name.clone().into(), total, group, &conflict_set, cx));
         }
-        let can_rollback = !self.busy && self.selected_change().is_some();
+        let can_rollback = !self.busy && !self.changes.is_empty();
         let busy = self.busy;
 
         v_flex()
@@ -1108,7 +1117,7 @@ impl Render for GitPanel {
                                         .xsmall()
                                         .label("Rollback")
                                         .disabled(!can_rollback)
-                                        .on_click(cx.listener(|this, _, _, cx| this.rollback_selected(cx))),
+                                        .on_click(cx.listener(|this, _, _, cx| this.rollback_checked(cx))),
                                 ),
                         )
                         .when(self.selected_change.is_some(), |s| {
