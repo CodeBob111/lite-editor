@@ -3956,7 +3956,9 @@ impl Workbench {
             .px_3()
             .gap_2()
             .items_center()
-            .flex_none()
+            // 平分铺满整条编辑器标签栏(对齐项目标签栏的拉伸行为)
+            .flex_1()
+            .min_w_0()
             .border_r_1()
             .border_color(cx.theme().border)
             .when(active, |s| {
@@ -3982,6 +3984,9 @@ impl Workbench {
             )
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
                     .text_size(px(13.))
                     .whitespace_nowrap()
                     .when(icon.dim, |s| s.text_color(cx.theme().muted_foreground))
@@ -4495,7 +4500,6 @@ impl Render for Workbench {
                                         .id("editor-tabs")
                                         .h(px(36.))
                                         .w_full()
-                                        .overflow_x_scroll()
                                         .border_b_1()
                                         .border_color(cx.theme().border)
                                         .children(self.tabs.iter().enumerate().map(
