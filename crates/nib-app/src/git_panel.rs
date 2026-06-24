@@ -44,6 +44,9 @@ pub struct GitPanel {
     repos: Vec<GitRepo>,
     /// 「分支/历史」视图当前选中的仓索引(指向 repos);Commit 视图聚合所有仓不依赖它。
     active_repo: usize,
+    /// per-repo 分支/历史缓存(branch, branches, log):切仓时命中即时显示(大仓 git branch -r
+    /// 列海量远程分支 + git log 较慢),后台再刷新。键=仓路径。
+    branch_cache: HashMap<PathBuf, (SharedString, Vec<GitBranch>, Vec<GitCommit>)>,
     mode: GitPanelMode,
     branch: SharedString,
     /// 所有仓的改动聚合(扁平;每条 GitChange.repo 标明所属仓,path 相对该仓)。
@@ -111,6 +114,7 @@ impl GitPanel {
             project_root,
             repos: Vec::new(),
             active_repo: 0,
+            branch_cache: HashMap::new(),
             mode: GitPanelMode::Commit,
             branch: "".into(),
             changes: Vec::new(),
@@ -191,6 +195,7 @@ impl GitPanel {
         self.branch = "".into();
         self.repos.clear();
         self.active_repo = 0;
+        self.branch_cache.clear();
         self.refresh(cx);
     }
 
@@ -247,6 +252,7 @@ impl GitPanel {
                 .or_else(|| repos.first())
                 .map(|r| r.path.clone())
                 .unwrap_or_else(|| root.clone());
+            let active_path_key = active_path.clone();
             let (branch, branches) = futures::join!(
                 nib_core::git::git_current_branch(active_path.clone()),
                 nib_core::git::git_list_branches(active_path.clone()),
@@ -271,9 +277,18 @@ impl GitPanel {
                     cx.emit(GitPanelEvent::StatusUpdated(this.changes.clone()));
                 }
                 if this.log_seq == lseq {
-                    this.branches = branches.unwrap_or_default();
-                    this.log = log.unwrap_or_default();
+                    let branches = branches.unwrap_or_default();
+                    let log = log.unwrap_or_default();
+                    // 写入活跃仓的分支/历史缓存 → 下次切回该仓即时显示。
+                    this.branch_cache.insert(
+                        PathBuf::from(&active_path_key),
+                        (this.branch.clone(), branches.clone(), log.clone()),
+                    );
+                    this.branches = branches;
+                    this.log = log;
                 }
+                // 后台预热其余仓的分支/历史 → 切到它们即时(不在切仓路径上等 git branch -r)。
+                this.prewarm_branches(cx);
                 cx.notify();
             });
         })
@@ -531,33 +546,104 @@ impl GitPanel {
         }
         self.active_repo = i;
         self.selected_branch = "".into();
-        self.branch = "".into();
-        self.branches.clear();
-        self.log.clear();
         self.log_seq += 1;
         let lseq = self.log_seq;
         let path = self.repos[i].path.clone();
+        // 命中缓存 → 即时显示该仓分支/历史(消除切仓延迟);未命中 → 先清空(加载态)。
+        // 两种情况都在下面后台刷新并写回缓存。
+        match self.branch_cache.get(&PathBuf::from(&path)).cloned() {
+            Some((branch, branches, log)) => {
+                self.branch = branch;
+                self.branches = branches;
+                self.log = log;
+            }
+            None => {
+                self.branch = "".into();
+                self.branches.clear();
+                self.log.clear();
+            }
+        }
         cx.notify();
+        let path_async = path.clone();
         cx.spawn(async move |weak, cx| {
             let (branch, branches) = futures::join!(
-                nib_core::git::git_current_branch(path.clone()),
-                nib_core::git::git_list_branches(path.clone()),
+                nib_core::git::git_current_branch(path_async.clone()),
+                nib_core::git::git_list_branches(path_async.clone()),
             );
             let branch = branch.unwrap_or_default();
             let log = if branch.is_empty() {
                 Ok(Vec::new())
             } else {
-                nib_core::git::git_log(path, branch.clone(), Some(50)).await
+                nib_core::git::git_log(path_async, branch.clone(), Some(50)).await
             };
             let _ = weak.update(cx, |this: &mut GitPanel, cx| {
-                if this.log_seq != lseq {
+                let branch_ss: SharedString = branch.into();
+                let branches = branches.unwrap_or_default();
+                let log = log.unwrap_or_default();
+                // 无条件写缓存(即便已切走):下次切回即时命中。
+                this.branch_cache.insert(
+                    PathBuf::from(&path),
+                    (branch_ss.clone(), branches.clone(), log.clone()),
+                );
+                if this.log_seq == lseq {
+                    this.branch = branch_ss;
+                    this.branches = branches;
+                    this.log = log;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 后台预热所有仓的分支/历史缓存(除已缓存的)→ 之后切到任意仓即时,不只是切回。
+    /// 逐个顺序拉(大仓 git branch -r 重,避免并发抢 IO)。refresh 拿到 repos 后调用。
+    fn prewarm_branches(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<String> = self
+            .repos
+            .iter()
+            .map(|r| r.path.clone())
+            .filter(|p| !self.branch_cache.contains_key(&PathBuf::from(p)))
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        cx.spawn(async move |weak, cx| {
+            for path in paths {
+                let need = weak
+                    .read_with(cx, |this, _| {
+                        !this.branch_cache.contains_key(&PathBuf::from(&path))
+                    })
+                    .unwrap_or(false);
+                if !need {
+                    continue;
+                }
+                let (branch, branches) = futures::join!(
+                    nib_core::git::git_current_branch(path.clone()),
+                    nib_core::git::git_list_branches(path.clone()),
+                );
+                let branch = branch.unwrap_or_default();
+                let log = if branch.is_empty() {
+                    Ok(Vec::new())
+                } else {
+                    nib_core::git::git_log(path.clone(), branch.clone(), Some(50)).await
+                };
+                if weak
+                    .update(cx, |this: &mut GitPanel, _| {
+                        this.branch_cache.insert(
+                            PathBuf::from(&path),
+                            (
+                                branch.into(),
+                                branches.unwrap_or_default(),
+                                log.unwrap_or_default(),
+                            ),
+                        );
+                    })
+                    .is_err()
+                {
                     return;
                 }
-                this.branch = branch.into();
-                this.branches = branches.unwrap_or_default();
-                this.log = log.unwrap_or_default();
-                cx.notify();
-            });
+            }
         })
         .detach();
     }
@@ -946,9 +1032,11 @@ impl Render for GitPanel {
                             ),
                     ),
             )
-            // 多仓选择器(仅 repos>1 时):选中仓决定「分支/历史/Pull/Push/checkout」针对哪个仓;
-            // Commit 变更视图聚合所有仓,不依赖它。横向可滚动,容纳多仓。
-            .when(self.repos.len() > 1, |panel| {
+            // 多仓选择器:只在「分支/历史」视图显示(选中仓决定分支/历史/Pull/Push/checkout 针对谁)。
+            // Commit 变更视图已按仓分组展示改动,再放选择器多余 → 不显示。横向可滚动,容纳多仓。
+            .when(
+                self.repos.len() > 1 && self.mode == GitPanelMode::Branches,
+                |panel| {
                 let active_repo = self.active_repo;
                 panel.child(
                     h_flex()

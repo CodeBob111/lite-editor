@@ -14,7 +14,7 @@ pub struct GitRepo {
     pub path: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct GitBranch {
     pub name: String,
     pub current: bool,
@@ -25,7 +25,7 @@ pub struct GitBranch {
     pub upstream_gone: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct GitCommit {
     pub hash: String,
     pub short_hash: String,
