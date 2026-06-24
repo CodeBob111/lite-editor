@@ -3,8 +3,10 @@
 // take_dirty()→snapshot() 拉一帧已合并 run 的网格,8ms 节流,主线程零阻塞。
 // 配色对齐旧版 xterm theme(bg #0d1017 / cursor #3b82f6 / ANSI 8 色)。
 
+use std::cell::Cell;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -118,6 +120,7 @@ use nib_core::text::{byte_range_to_utf16, utf16_len, utf16_to_byte};
 struct TermTab {
     id: u64,
     name: SharedString,
+    project_root: PathBuf,
     session: Arc<TerminalSession>,
     snap: TermSnapshot,
     exited: bool,
@@ -151,6 +154,11 @@ pub struct TerminalPanel {
     _cc_watch: Option<nib_core::cc_watch::CcTurnWatcher>,
     /// CC Stop hook 事件目录监控句柄(全局,new 时起一次,不随项目重建)。
     _cc_event_watch: Option<nib_core::cc_watch::CcTurnWatcher>,
+    /// 终端网格在窗口中的 bounds(canvas prepaint 时写入);鼠标像素 → 单元格用。
+    /// 用 Rc<Cell> 而非字段直写:paint/prepaint 闭包里 entity.update 存不进来,Cell::set 必生效。
+    grid_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// 正在鼠标拖选(mouse down 起、move 中更新、松开止)。
+    selecting: bool,
 }
 
 impl TerminalPanel {
@@ -171,6 +179,8 @@ impl TerminalPanel {
             cc_done_at: None,
             _cc_watch: None,
             _cc_event_watch: None,
+            grid_bounds: Rc::new(Cell::new(None)),
+            selecting: false,
         };
         this.spawn_session(cx);
         this.start_cc_watch(cx);
@@ -247,16 +257,60 @@ impl TerminalPanel {
         self.tabs.get(self.active)
     }
 
+    fn active_project_tab_index(&self) -> Option<usize> {
+        if self
+            .tabs
+            .get(self.active)
+            .is_some_and(|tab| tab.project_root == self.project_root)
+        {
+            Some(self.active)
+        } else {
+            self.tabs
+                .iter()
+                .position(|tab| tab.project_root == self.project_root)
+        }
+    }
+
+    fn active_project_tab(&self) -> Option<&TermTab> {
+        self.active_project_tab_index()
+            .and_then(|ix| self.tabs.get(ix))
+    }
+
+    fn project_name(path: &PathBuf) -> String {
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
+    /// 窗口坐标 → 可视(行, 列)。grid_bounds 是网格 canvas 的 bounds(= term-grid padding box
+    /// 原点),内容从 padding(left 5 / top 4)起,与 cursor 叠层同款偏移。
+    fn pos_to_cell(&self, pos: Point<Pixels>) -> Option<(usize, usize)> {
+        let bounds = self.grid_bounds.get()?;
+        let cell_w = f32::from(self.cell_w?);
+        let x = f32::from(pos.x - bounds.origin.x) - 5.;
+        let y = f32::from(pos.y - bounds.origin.y) - 4.;
+        if x < 0. || y < 0. || cell_w <= 0. {
+            return None;
+        }
+        Some(((y / LINE_H) as usize, (x / cell_w) as usize))
+    }
+
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
     }
 
     pub fn set_project(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        // 当前 shell 不动(它有自己的 cwd);只影响之后的重启
-        self.project_root = root;
+        self.project_root = root.clone();
+        if let Some(ix) = self.tabs.iter().position(|tab| tab.project_root == root) {
+            self.active = ix;
+            self.status = "".into();
+        } else {
+            self.spawn_session(cx);
+        }
         // 换项目 → CC 会话目录也换:重建监控、清掉旧项目的红点
         self.cc_done = false;
         self.start_cc_watch(cx);
+        cx.notify();
     }
 
     pub fn set_right_inset(&mut self, inset: f32) {
@@ -289,14 +343,11 @@ impl TerminalPanel {
             Ok(session) => {
                 self.next_id += 1;
                 let id = self.next_id;
-                let project = self
-                    .project_root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "shell".into());
+                let project = Self::project_name(&self.project_root);
                 self.tabs.push(TermTab {
                     id,
                     name: format!("{} ({})", project, id).into(),
+                    project_root: self.project_root.clone(),
                     session: Arc::new(session),
                     snap: TermSnapshot::default(),
                     exited: false,
@@ -380,6 +431,14 @@ impl TerminalPanel {
         let session = tab.session.clone();
         let session = &session;
         let ks = &event.keystroke;
+        // cmd-c:有选区则复制选中文本(无选区不拦,让其冒泡走应用快捷键)
+        if ks.modifiers.platform && ks.key == "c" {
+            if let Some(text) = session.selection_text() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                cx.stop_propagation();
+                return;
+            }
+        }
         // cmd-v 粘贴进终端(bracketed-paste 语义在 core 处理;其余 cmd 组合冒泡)
         if ks.modifiers.platform && ks.key == "v" {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
@@ -390,6 +449,8 @@ impl TerminalPanel {
             return;
         }
         if let Some(bytes) = keystroke_bytes(ks) {
+            // 有按键输入 → 清掉旧选区(与常见终端一致:打字即取消高亮)
+            session.clear_selection();
             session.write(bytes);
             session.scroll_to_bottom();
             cx.stop_propagation();
@@ -417,7 +478,7 @@ impl TerminalPanel {
     }
 
     fn restart(&mut self, cx: &mut Context<Self>) {
-        let ix = self.active;
+        let ix = self.active_project_tab_index().unwrap_or(self.active);
         if ix < self.tabs.len() {
             let old = self.tabs.remove(ix);
             old.session.shutdown();
@@ -462,15 +523,22 @@ impl Render for TerminalPanel {
         let cols = ((avail_w / f32::from(cell_w)).floor() as u16).clamp(2, 500);
         let rows =
             (((self.panel_height - HEADER_H - PAD_V) / LINE_H).floor() as u16).clamp(2, 100);
+        // 把 self.active 对齐到「当前项目实际显示的 tab」。render/restart 用 active_project_tab_index,
+        // 但 on_key/on_scroll/sync_grid 用 self.active——两者错位时,打字/滚动/resize 会作用到隐藏的
+        // session,显示的终端像冻住、没反应、提示符不刷新。在这里(用 self.active 之前)对齐即根治。
+        if let Some(ix) = self.active_project_tab_index() {
+            self.active = ix;
+        }
         self.sync_grid(cols, rows);
 
-        let active_ix = self.active;
+        let active_ix = self.active_project_tab_index();
         let session_tabs: Vec<_> = self
             .tabs
             .iter()
             .enumerate()
+            .filter(|(_, tab)| tab.project_root == self.project_root)
             .map(|(ix, tab)| {
-                let selected = ix == active_ix;
+                let selected = Some(ix) == active_ix;
                 h_flex()
                     .id(("term-tab", ix))
                     .h(px(20.))
@@ -514,7 +582,7 @@ impl Render for TerminalPanel {
             })
             .collect();
 
-        let (rows_el, cursor, display_offset, exited) = match self.active_tab() {
+        let (rows_el, cursor, display_offset, exited, selection) = match self.active_project_tab() {
             Some(tab) => {
                 let rows_el: Vec<_> = tab
                     .snap
@@ -546,10 +614,32 @@ impl Render for TerminalPanel {
                     tab.snap.cursor,
                     tab.snap.display_offset,
                     tab.exited,
+                    tab.snap.selection,
                 )
             }
-            None => (Vec::new(), None, 0, false),
+            None => (Vec::new(), None, 0, false, None),
         };
+
+        // 选区高亮叠层(可视坐标 → 像素;多行时首行 sc..行尾、中间整行、末行 0..ec)
+        let selection_els: Vec<_> = selection
+            .map(|(sr, sc, er, ec)| {
+                (sr..=er)
+                    .map(|r| {
+                        let start_c = if r == sr { sc } else { 0 };
+                        let end_c = if r == er { ec } else { cols as usize };
+                        let w = (end_c.saturating_sub(start_c)) as f32 * f32::from(cell_w);
+                        div()
+                            .absolute()
+                            .top(px(4. + r as f32 * LINE_H))
+                            .left(px(5.) + cell_w * start_c as f32)
+                            .w(px(w))
+                            .h(px(LINE_H))
+                            .bg(hex(TERM_CURSOR))
+                            .opacity(0.3)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         v_flex()
             .size_full()
@@ -629,12 +719,45 @@ impl Render for TerminalPanel {
                     .on_scroll_wheel(cx.listener(Self::on_scroll))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
+                        cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                             window.focus(&this.focus_handle, cx);
                             this.cc_done = false; // 点开终端 = 已回看,清红点
+                            // 起一个新选区(点击空白即清旧选区);拖动时 on_mouse_move 更新终点
+                            if let Some((row, col)) = this.pos_to_cell(ev.position) {
+                                if let Some(session) =
+                                    this.active_project_tab().map(|t| t.session.clone())
+                                {
+                                    session.selection_start(row, col);
+                                    this.selecting = true;
+                                }
+                            }
+                            cx.notify();
                         }),
                     )
+                    .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                        if !this.selecting {
+                            return;
+                        }
+                        // 松开左键(可能漏了 mouse_up)→ 结束拖选
+                        if ev.pressed_button != Some(MouseButton::Left) {
+                            this.selecting = false;
+                            return;
+                        }
+                        if let Some((row, col)) = this.pos_to_cell(ev.position) {
+                            if let Some(session) =
+                                this.active_project_tab().map(|t| t.session.clone())
+                            {
+                                session.selection_update(row, col);
+                            }
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, _| this.selecting = false),
+                    )
                     .child(v_flex().children(rows_el))
+                    .children(selection_els)
                     .when_some(cursor, |s, (row, col)| {
                         // 块状光标覆盖层:等宽网格坐标 → 像素
                         s.child(
@@ -653,9 +776,11 @@ impl Render for TerminalPanel {
                         // canvas 不画东西,只借 paint 钩子调 window.handle_input;absolute+size_full
                         // 覆盖网格,其 bounds 即候选窗定位用的 element_bounds。无鼠标监听=不挡点击。
                         let entity = cx.entity();
+                        let grid_bounds = self.grid_bounds.clone();
                         let focus = self.focus_handle.clone();
                         canvas(
-                            |_, _, _| {},
+                            // prepaint:把网格 bounds 存进 Cell,供鼠标拖选像素→单元格换算
+                            move |bounds, _, _| grid_bounds.set(Some(bounds)),
                             move |bounds, _, window, cx| {
                                 window.handle_input(
                                     &focus,
@@ -664,7 +789,11 @@ impl Render for TerminalPanel {
                                 );
                             },
                         )
+                        // top/left=0 锚到网格左上角:不给 inset 时 absolute 元素落在「静态位置」
+                        // (排在 v_flex 行列表之后),bounds.origin 会被推到网格下方,鼠标像素→单元格全错。
                         .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
                         .size_full()
                     }),
             )

@@ -10,6 +10,8 @@ use std::sync::Arc;
 use alacritty_terminal::event::{Event, EventListener, Notify as _, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, Notifier};
 use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{test::TermSize, Config, Term};
@@ -42,6 +44,9 @@ pub struct TermSnapshot {
     /// 光标 (可视行, 列);回看历史(display_offset>0)时光标不在视口内为 None
     pub cursor: Option<(usize, usize)>,
     pub display_offset: usize,
+    /// 鼠标选区(可视坐标, 已归一化 start<=end):(起行, 起列, 止行, 止列);无选区为 None。
+    /// 渲染层据此画高亮叠层;复制走 TerminalSession::selection_text。
+    pub selection: Option<(usize, usize, usize, usize)>,
 }
 
 fn map_color(color: AnsiColor) -> TermColor {
@@ -335,10 +340,61 @@ impl TerminalSession {
             None
         };
 
+        // 选区:alacritty 的 grid 行号 → 可视行(+display_offset),归一化 start<=end
+        let selection = term
+            .selection
+            .clone()
+            .and_then(|s| s.to_range(&term))
+            .map(|r| {
+                let sr = (r.start.line.0 + display_offset as i32).max(0) as usize;
+                let er = (r.end.line.0 + display_offset as i32).max(0) as usize;
+                (sr, r.start.column.0, er, r.end.column.0)
+            });
+
         TermSnapshot {
             rows,
             cursor,
             display_offset,
+            selection,
+        }
+    }
+
+    /// 鼠标按下:在可视(row, col)处起一个新选区(同时清掉旧选区)。
+    pub fn selection_start(&self, viewport_row: usize, col: usize) {
+        let mut term = self.term.lock();
+        let offset = term.grid().display_offset() as i32;
+        let point = Point::new(Line(viewport_row as i32 - offset), Column(col));
+        term.selection = Some(Selection::new(SelectionType::Simple, point, Side::Left));
+        drop(term);
+        self.mark_dirty();
+    }
+
+    /// 鼠标拖动:把选区终点更新到可视(row, col)。Side::Right 让光标所在格被包含。
+    pub fn selection_update(&self, viewport_row: usize, col: usize) {
+        let mut term = self.term.lock();
+        let offset = term.grid().display_offset() as i32;
+        let point = Point::new(Line(viewport_row as i32 - offset), Column(col));
+        if let Some(sel) = term.selection.as_mut() {
+            sel.update(point, Side::Right);
+        }
+        drop(term);
+        self.mark_dirty();
+    }
+
+    /// 取选中文本(供 cmd+C 复制);无选区/空选区为 None。
+    pub fn selection_text(&self) -> Option<String> {
+        self.term
+            .lock()
+            .selection_to_string()
+            .filter(|s| !s.is_empty())
+    }
+
+    /// 清除选区(点击空白 / 新输入时)。
+    pub fn clear_selection(&self) {
+        let mut term = self.term.lock();
+        if term.selection.take().is_some() {
+            drop(term);
+            self.mark_dirty();
         }
     }
 
