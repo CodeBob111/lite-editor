@@ -11,6 +11,7 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::{
     button::{Button, ButtonVariants as _},
+    checkbox::Checkbox,
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{ContextMenuExt as _, PopupMenuItem},
@@ -55,6 +56,9 @@ pub struct GitPanel {
     conflicts: Vec<String>,
     /// 当前选中的改动(用**绝对**路径唯一标识,跨仓不冲突)。
     selected_change: Option<String>,
+    /// 用户**取消勾选**的改动(绝对路径)。默认空=全勾选(commit 提全部);取消的不提交。
+    /// refresh 时 retain 仍存在的 → 取消态跨刷新保留,新出现的文件默认勾选。
+    unchecked: HashSet<String>,
     branches: Vec<GitBranch>,
     log: Vec<GitCommit>,
     /// 「历史」区当前展示的是哪个分支的提交(左键点分支只看历史、不切换)。空=当前分支。
@@ -128,6 +132,7 @@ impl GitPanel {
             changes: Vec::new(),
             conflicts: Vec::new(),
             selected_change: None,
+            unchecked: HashSet::new(),
             branches: Vec::new(),
             log: Vec::new(),
             selected_branch: "".into(),
@@ -197,6 +202,7 @@ impl GitPanel {
         .detach();
         self.changes.clear();
         self.conflicts.clear();
+        self.unchecked.clear();
         self.selected_change = None;
         self.branches.clear();
         self.log.clear();
@@ -265,6 +271,9 @@ impl GitPanel {
                     this.branch = branch.into();
                     this.changes = changes;
                     this.conflicts = conflicts;
+                    // 勾选态:只保留仍存在的取消项 → 新文件默认勾选,取消态跨刷新保留。
+                    let cur: HashSet<String> = this.changes.iter().map(change_abs).collect();
+                    this.unchecked.retain(|p| cur.contains(p));
                     if let Some(sel) = &this.selected_change {
                         if !this.changes.iter().any(|c| change_abs(c) == *sel) {
                             this.selected_change = None;
@@ -319,6 +328,8 @@ impl GitPanel {
                 }
                 this.changes = changes;
                 this.conflicts = conflicts;
+                let cur: HashSet<String> = this.changes.iter().map(change_abs).collect();
+                this.unchecked.retain(|p| cur.contains(p));
                 if let Some(sel) = &this.selected_change {
                     if !this.changes.iter().any(|c| change_abs(c) == *sel) {
                         this.selected_change = None;
@@ -341,15 +352,18 @@ impl GitPanel {
             cx.notify();
             return;
         }
-        if self.changes.is_empty() {
-            self.status = "没有可提交的变更".into();
-            cx.notify();
-            return;
-        }
-        // 多仓:按仓分组待提交文件(各仓相对路径),每个仓单独 git_commit(共用同一条 message)。
+        // 多仓:按仓分组待提交文件(**只取勾选的**;各仓相对路径),每个仓单独 git_commit(共用 message)。
         let mut by_repo: HashMap<String, Vec<String>> = HashMap::new();
         for c in &self.changes {
+            if self.unchecked.contains(&change_abs(c)) {
+                continue;
+            }
             by_repo.entry(c.repo.clone()).or_default().push(c.path.clone());
+        }
+        if by_repo.is_empty() {
+            self.status = "没有勾选要提交的变更".into();
+            cx.notify();
+            return;
         }
         let groups: Vec<(String, Vec<String>)> = by_repo.into_iter().collect();
         self.busy = true;
@@ -743,6 +757,14 @@ impl Render for GitPanel {
                 return Vec::new();
             }
             let hidden = total.saturating_sub(changes.len());
+            // 组头复选框:勾全/取消全(作用于本组已渲染的文件)。group_checked=组内无取消项。
+            let group_abs: Vec<String> = changes
+                .iter()
+                .map(|c| abs_in_repo(&c.repo, &c.path))
+                .collect();
+            let group_checked = group_abs.iter().all(|a| !self.unchecked.contains(a));
+            let e_grp = cx.entity();
+            let grp_abs = group_abs.clone();
             let mut rows = vec![h_flex()
                 .px_2()
                 .py_1()
@@ -752,6 +774,24 @@ impl Render for GitPanel {
                 .bg(cx.theme().list_active)
                 .text_size(px(12.))
                 .font_weight(FontWeight::SEMIBOLD)
+                .child(
+                    Checkbox::new(SharedString::from(format!("grp-chk-{}", title)))
+                        .checked(group_checked)
+                        .on_click(move |_c: &bool, _w, cx: &mut App| {
+                            e_grp.update(cx, |this, cx| {
+                                if group_checked {
+                                    for a in &grp_abs {
+                                        this.unchecked.insert(a.clone());
+                                    }
+                                } else {
+                                    for a in &grp_abs {
+                                        this.unchecked.remove(a);
+                                    }
+                                }
+                                cx.notify();
+                            });
+                        }),
+                )
                 .child(title)
                 .child(
                     div()
@@ -793,6 +833,9 @@ impl Render for GitPanel {
                     .map(|c| c.to_string())
                     .unwrap_or_default()
                     .into();
+                let checked = !self.unchecked.contains(&abs_str);
+                let chk_abs = abs_str.clone();
+                let e_chk = cx.entity();
                 h_flex()
                     .id(ix)
                     .px_2()
@@ -802,68 +845,90 @@ impl Render for GitPanel {
                     .rounded(cx.theme().radius)
                     .when(selected, |s| s.bg(cx.theme().list_active))
                     .hover(|s| s.bg(cx.theme().accent))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
-                            this.selected_change = Some(sel.clone());
-                            if conflicted {
-                                cx.emit(GitPanelEvent::OpenMerge {
-                                    repo: repo.clone(),
-                                    rel_path: rel.clone(),
-                                });
-                            } else {
-                                cx.emit(GitPanelEvent::OpenDiff {
-                                    repo: repo.clone(),
-                                    rel_path: rel.clone(),
-                                    abs_path: abs.clone(),
-                                });
-                            }
-                            let _ = this;
-                            cx.notify();
-                        }),
-                    )
+                    // 勾选框:决定该文件是否纳入提交;独立于右侧「点击开 diff」区域(点框只切勾选)。
                     .child(
-                        div()
-                            .w(px(14.))
-                            .text_color(color)
-                            .font_weight(FontWeight::BOLD)
-                            .child(mark),
+                        Checkbox::new(("chk", ix)).checked(checked).on_click(
+                            move |_checked: &bool, _window, cx: &mut App| {
+                                e_chk.update(cx, |this, cx| {
+                                    // remove 返回 true=原本未勾选→现勾选;否则原本勾选→取消。
+                                    if !this.unchecked.remove(&chk_abs) {
+                                        this.unchecked.insert(chk_abs.clone());
+                                    }
+                                    cx.notify();
+                                });
+                            },
+                        ),
                     )
+                    // 点击区:开 diff / 选中(rollback 目标)。
                     .child(
                         h_flex()
                             .flex_1()
                             .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .gap_1p5()
-                            .text_size(px(12.))
-                            .child(div().flex_none().child(filename))
-                            .when(!dir.is_empty(), |s| {
+                            .gap_2()
+                            .items_center()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.selected_change = Some(sel.clone());
+                                    if conflicted {
+                                        cx.emit(GitPanelEvent::OpenMerge {
+                                            repo: repo.clone(),
+                                            rel_path: rel.clone(),
+                                        });
+                                    } else {
+                                        cx.emit(GitPanelEvent::OpenDiff {
+                                            repo: repo.clone(),
+                                            rel_path: rel.clone(),
+                                            abs_path: abs.clone(),
+                                        });
+                                    }
+                                    let _ = this;
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(14.))
+                                    .text_color(color)
+                                    .font_weight(FontWeight::BOLD)
+                                    .child(mark),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .gap_1p5()
+                                    .text_size(px(12.))
+                                    .child(div().flex_none().child(filename))
+                                    .when(!dir.is_empty(), |s| {
+                                        s.child(
+                                            div()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(dir),
+                                        )
+                                    }),
+                            )
+                            .when(conflicted, |s| {
                                 s.child(
                                     div()
-                                        .min_w_0()
-                                        .overflow_hidden()
+                                        .text_size(px(10.))
+                                        .text_color(cx.theme().danger)
+                                        .child("冲突"),
+                                )
+                            })
+                            .when(change.staged && !conflicted, |s| {
+                                s.child(
+                                    div()
+                                        .text_size(px(10.))
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(dir),
+                                        .child("staged"),
                                 )
                             }),
                     )
-                    .when(conflicted, |s| {
-                        s.child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(cx.theme().danger)
-                                .child("冲突"),
-                        )
-                    })
-                    .when(change.staged && !conflicted, |s| {
-                        s.child(
-                            div()
-                                .text_size(px(10.))
-                                .text_color(cx.theme().muted_foreground)
-                                .child("staged"),
-                        )
-                    })
                     .into_any_element()
             }));
             if hidden > 0 {
