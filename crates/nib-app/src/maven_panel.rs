@@ -224,7 +224,10 @@ impl Render for MavenPanel {
                     .children(dep_rows),
             )
             .child(
-                h_flex()
+                // 状态行用 w_full 的 div(非 h_flex):裸文本在 h_flex 里无界宽会溢出被面板裁掉;
+                // div + w_full 让长状态(如长模块名)按面板宽自动换行,完整显示。
+                div()
+                    .w_full()
                     .px_2()
                     .py_1()
                     .border_t_1()
