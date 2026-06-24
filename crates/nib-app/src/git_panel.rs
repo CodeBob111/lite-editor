@@ -56,9 +56,9 @@ pub struct GitPanel {
     conflicts: Vec<String>,
     /// 当前选中的改动(用**绝对**路径唯一标识,跨仓不冲突)。
     selected_change: Option<String>,
-    /// 用户**取消勾选**的改动(绝对路径)。默认空=全勾选(commit 提全部);取消的不提交。
-    /// refresh 时 retain 仍存在的 → 取消态跨刷新保留,新出现的文件默认勾选。
-    unchecked: HashSet<String>,
+    /// 用户**勾选**要提交/回退的改动(绝对路径)。默认空=都不勾(需显式勾选才纳入)。
+    /// refresh 时 retain 仍存在的 → 勾选态跨刷新保留,新出现的文件默认不勾。
+    checked: HashSet<String>,
     branches: Vec<GitBranch>,
     log: Vec<GitCommit>,
     /// 「历史」区当前展示的是哪个分支的提交(左键点分支只看历史、不切换)。空=当前分支。
@@ -132,7 +132,7 @@ impl GitPanel {
             changes: Vec::new(),
             conflicts: Vec::new(),
             selected_change: None,
-            unchecked: HashSet::new(),
+            checked: HashSet::new(),
             branches: Vec::new(),
             log: Vec::new(),
             selected_branch: "".into(),
@@ -202,7 +202,7 @@ impl GitPanel {
         .detach();
         self.changes.clear();
         self.conflicts.clear();
-        self.unchecked.clear();
+        self.checked.clear();
         self.selected_change = None;
         self.branches.clear();
         self.log.clear();
@@ -273,7 +273,7 @@ impl GitPanel {
                     this.conflicts = conflicts;
                     // 勾选态:只保留仍存在的取消项 → 新文件默认勾选,取消态跨刷新保留。
                     let cur: HashSet<String> = this.changes.iter().map(change_abs).collect();
-                    this.unchecked.retain(|p| cur.contains(p));
+                    this.checked.retain(|p| cur.contains(p));
                     if let Some(sel) = &this.selected_change {
                         if !this.changes.iter().any(|c| change_abs(c) == *sel) {
                             this.selected_change = None;
@@ -329,7 +329,7 @@ impl GitPanel {
                 this.changes = changes;
                 this.conflicts = conflicts;
                 let cur: HashSet<String> = this.changes.iter().map(change_abs).collect();
-                this.unchecked.retain(|p| cur.contains(p));
+                this.checked.retain(|p| cur.contains(p));
                 if let Some(sel) = &this.selected_change {
                     if !this.changes.iter().any(|c| change_abs(c) == *sel) {
                         this.selected_change = None;
@@ -355,7 +355,7 @@ impl GitPanel {
         // 多仓:按仓分组待提交文件(**只取勾选的**;各仓相对路径),每个仓单独 git_commit(共用 message)。
         let mut by_repo: HashMap<String, Vec<String>> = HashMap::new();
         for c in &self.changes {
-            if self.unchecked.contains(&change_abs(c)) {
+            if !self.checked.contains(&change_abs(c)) {
                 continue;
             }
             by_repo.entry(c.repo.clone()).or_default().push(c.path.clone());
@@ -468,7 +468,7 @@ impl GitPanel {
         let targets: Vec<GitChange> = self
             .changes
             .iter()
-            .filter(|c| !self.unchecked.contains(&change_abs(c)))
+            .filter(|c| self.checked.contains(&change_abs(c)))
             .cloned()
             .collect();
         if targets.is_empty() {
@@ -771,7 +771,7 @@ impl Render for GitPanel {
                 .iter()
                 .map(|c| abs_in_repo(&c.repo, &c.path))
                 .collect();
-            let group_checked = group_abs.iter().all(|a| !self.unchecked.contains(a));
+            let group_checked = !group_abs.is_empty() && group_abs.iter().all(|a| self.checked.contains(a));
             let e_grp = cx.entity();
             let grp_abs = group_abs.clone();
             let mut rows = vec![h_flex()
@@ -790,11 +790,11 @@ impl Render for GitPanel {
                             e_grp.update(cx, |this, cx| {
                                 if group_checked {
                                     for a in &grp_abs {
-                                        this.unchecked.insert(a.clone());
+                                        this.checked.remove(a);
                                     }
                                 } else {
                                     for a in &grp_abs {
-                                        this.unchecked.remove(a);
+                                        this.checked.insert(a.clone());
                                     }
                                 }
                                 cx.notify();
@@ -842,7 +842,7 @@ impl Render for GitPanel {
                     .map(|c| c.to_string())
                     .unwrap_or_default()
                     .into();
-                let checked = !self.unchecked.contains(&abs_str);
+                let checked = self.checked.contains(&abs_str);
                 let chk_abs = abs_str.clone();
                 let e_chk = cx.entity();
                 h_flex()
@@ -860,8 +860,8 @@ impl Render for GitPanel {
                             move |_checked: &bool, _window, cx: &mut App| {
                                 e_chk.update(cx, |this, cx| {
                                     // remove 返回 true=原本未勾选→现勾选;否则原本勾选→取消。
-                                    if !this.unchecked.remove(&chk_abs) {
-                                        this.unchecked.insert(chk_abs.clone());
+                                    if !this.checked.remove(&chk_abs) {
+                                        this.checked.insert(chk_abs.clone());
                                     }
                                     cx.notify();
                                 });
@@ -978,7 +978,7 @@ impl Render for GitPanel {
             remaining = remaining.saturating_sub(group.len());
             rows.extend(render_group(repo.name.clone().into(), total, group, &conflict_set, cx));
         }
-        let can_rollback = !self.busy && !self.changes.is_empty();
+        let can_rollback = !self.busy && !self.checked.is_empty();
         let busy = self.busy;
 
         v_flex()
@@ -1135,14 +1135,30 @@ impl Render for GitPanel {
                 )
             })
             .when(self.mode == GitPanelMode::Branches, |panel| {
-                panel.child(
-                    h_flex()
-                        .px_2()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(cx.theme().border)
-                        .child(div().flex_1().min_w_0().child(Input::new(&self.branch_filter))),
-                )
+                panel
+                    .child(
+                        h_flex()
+                            .px_2()
+                            .py_1()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .child(div().flex_1().min_w_0().child(Input::new(&self.branch_filter))),
+                    )
+                    // checkout/Pull/Push 的成败状态在分支视图也要可见(否则 checkout 被 git 拒绝
+                    // 〔如活跃仓有未提交改动〕时看着像「点了没反应」)。
+                    .when(!self.status.is_empty(), |p| {
+                        p.child(
+                            div()
+                                .w_full()
+                                .px_2()
+                                .py_1()
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .text_size(px(11.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(self.status.clone()),
+                        )
+                    })
             })
             .child(
                 v_flex()
