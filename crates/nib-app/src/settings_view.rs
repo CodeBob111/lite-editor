@@ -1,7 +1,7 @@
 // 设置页(对齐 settings.html):从旧 4 字段浮层扩成 3 栏完整页——
 // 左导航 212(编辑器=真分类 + 提案分类标灰)| 中内容(4 真字段:slider/分段/switch)| 右预览 392。
 // 4 个真字段(fontSize/tabSize/wordWrap/folding)实时生效(每次改动即 emit Apply,父级热应用)。
-// 提案分类(外观/Java/终端/Git/Arthas/Astore)无后端 → 标「提案」徽标、不可选,守 handoff 约束。
+// 提案分类(外观/Java/终端/Git/Arthas)无后端 → 标「提案」徽标、不可选,守 handoff 约束。
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;

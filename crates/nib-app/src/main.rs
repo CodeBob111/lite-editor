@@ -2,7 +2,6 @@
 // 性能纪律(RFC v2 §5):主线程零阻塞 IO——目录遍历/读写文件全部经 nib-core
 // 自持 runtime,结果回主线程更新实体;异步回灌一律带陈旧守卫。
 
-mod astore_panel;
 mod diff_view;
 mod file_icons;
 mod git_panel;
@@ -31,13 +30,13 @@ use gpui_component::{
     menu::ContextMenuExt,
     notification::{Notification, NotificationType},
     resizable::{h_resizable, resizable_panel, ResizableState},
+    tooltip::Tooltip,
     tree::{tree, TreeItem, TreeState},
     v_flex, ActiveTheme, Icon, IconName, Root, Theme, ThemeMode, ThemeRegistry, TitleBar, WindowExt,
 };
 
 use futures::StreamExt as _;
 use diff_view::{DiffView, DiffViewEvent};
-use astore_panel::AstorePanel;
 use git_panel::{GitPanel, GitPanelEvent, GitPanelMode};
 use maven_panel::MavenPanel;
 use merge_view::{MergeView, MergeViewEvent};
@@ -63,7 +62,6 @@ actions!(
         FindUsages,
         ToggleMdPreview,
         ToggleTerminal,
-        ToggleAstore,
         ShowRecentProjects,
         OpenSettings,
         ArthasWatch,
@@ -220,8 +218,6 @@ const MAX_TABS: usize = 30;
 pub const SIDEBAR_WIDTH: f32 = 256.;
 /// 活动栏宽(旧版 --activity-width: 48px)
 pub const ACTIVITY_WIDTH: f32 = 48.;
-/// Astore 右侧栏宽(旧版 --astore-width: 260px)
-pub const ASTORE_WIDTH: f32 = 260.;
 
 struct OpenTab {
     path: PathBuf,
@@ -313,11 +309,10 @@ enum PanelTab {
     Output,
 }
 
-/// 正在拖动调整哪个面板的尺寸(侧栏/Astore 宽,终端高)
+/// 正在拖动调整哪个面板的尺寸(侧栏宽,终端高)
 #[derive(Clone, Copy, PartialEq)]
 enum Resizing {
     Sidebar,
-    Astore,
     Terminal,
 }
 
@@ -340,15 +335,12 @@ enum LspPhase {
 struct Workbench {
     focus_handle: FocusHandle,
     sidebar_view: SidebarView,
-    astore_visible: bool,
-    /// 可拖动面板尺寸(侧栏/Astore 宽、终端高)+ 当前拖动目标
+    /// 可拖动面板尺寸(侧栏宽、终端高)+ 当前拖动目标
     sidebar_width: f32,
-    astore_width: f32,
     terminal_height: f32,
     resizing: Option<Resizing>,
     git_panel: Entity<GitPanel>,
     maven_panel: Entity<MavenPanel>,
-    astore_panel: Entity<AstorePanel>,
     _git_sub: Subscription,
     window_handle: AnyWindowHandle,
     project_root: PathBuf,
@@ -517,7 +509,6 @@ impl Workbench {
 
         let git_panel = cx.new(|cx| GitPanel::new(root.clone(), window, cx));
         let maven_panel = cx.new(|cx| MavenPanel::new(root.clone(), cx));
-        let astore_panel = cx.new(|cx| AstorePanel::new(root.clone(), window, cx));
         let git_sub = cx.subscribe(
             &git_panel,
             |this: &mut Workbench, _, event: &GitPanelEvent, cx| match event {
@@ -557,14 +548,11 @@ impl Workbench {
         let mut this = Self {
             focus_handle,
             sidebar_view: SidebarView::Files,
-            astore_visible: false,
             sidebar_width: SIDEBAR_WIDTH,
-            astore_width: ASTORE_WIDTH,
             terminal_height: terminal_panel::PANEL_HEIGHT,
             resizing: None,
             git_panel,
             maven_panel,
-            astore_panel,
             _git_sub: git_sub,
             window_handle: window.window_handle(),
             project_root: root.clone(),
@@ -757,8 +745,6 @@ impl Workbench {
         self.git_panel
             .update(cx, |panel, cx| panel.set_project(git_root.clone(), cx));
         self.maven_panel
-            .update(cx, |panel, cx| panel.set_project(git_root.clone(), cx));
-        self.astore_panel
             .update(cx, |panel, cx| panel.set_project(git_root, cx));
 
         // 检测到 Maven 工程但未配置 Maven → 主动弹提醒去设置(内网 amaven 工程依赖
@@ -1233,7 +1219,6 @@ impl Workbench {
         let y = f32::from(event.position.y);
         match kind {
             Resizing::Sidebar => self.sidebar_width = (x - ACTIVITY_WIDTH).clamp(160., 520.),
-            Resizing::Astore => self.astore_width = (f32::from(vp.width) - x).clamp(180., 560.),
             // 终端高 = 视口高 - 状态栏(24) - 光标 y
             Resizing::Terminal => {
                 self.terminal_height = (f32::from(vp.height) - 24. - y).clamp(120., 640.)
@@ -1571,7 +1556,7 @@ impl Workbench {
     }
 
     /// 面板边缘的拖动把手(absolute 贴边;按下记下拖动目标,根元素的 mouse_move 接管)。
-    /// 侧栏=右边、Astore=左边(竖条 col-resize);终端=顶边(横条 row-resize)。
+    /// 侧栏=右边(竖条 col-resize);终端=顶边(横条 row-resize)。
     fn resize_handle(
         &self,
         id: &'static str,
@@ -1594,12 +1579,6 @@ impl Workbench {
                 .top_0()
                 .bottom_0()
                 .right(px(-2.5))
-                .w(px(5.))
-                .cursor_col_resize(),
-            Resizing::Astore => base
-                .top_0()
-                .bottom_0()
-                .left(px(-2.5))
                 .w(px(5.))
                 .cursor_col_resize(),
             Resizing::Terminal => base
@@ -2677,15 +2656,6 @@ impl Workbench {
         cx.notify();
     }
 
-    fn on_toggle_astore(&mut self, _: &ToggleAstore, _: &mut Window, cx: &mut Context<Self>) {
-        self.astore_visible = !self.astore_visible;
-        if let Some(panel) = &self.terminal {
-            let inset = if self.astore_visible { ASTORE_WIDTH } else { 0. };
-            panel.update(cx, |p, _| p.set_right_inset(inset));
-        }
-        cx.notify();
-    }
-
     fn on_toggle_md_preview(
         &mut self,
         _: &ToggleMdPreview,
@@ -3304,26 +3274,18 @@ fn render_tree_item(
                 )
             })
     };
-    // 选中态:淡蓝底(ListItem 自带 list_active)+ 左侧 2px 蓝条(对齐设计稿 .row-t.sel::before)
-    // 多选态(cmd+click):tree 不知道,自己补底+左条
-    let primary = app.theme().primary;
+    // [圆润] IDEA 新 UI 风:选中/悬浮为圆角 pill(左右内缩 6px + rounded),去掉左侧 2px 竖条。
+    // 选中底色由 ListItem 内部按 selected 画(作用在 base,随 mx+rounded 内缩成圆角);
+    // 多选态(cmd+click)tree 不知道,自己补 list_active 底(同样内缩圆角)。
     let list_active = app.theme().list_active;
     let id = item.id.to_string();
     ListItem::new(ix)
         .relative()
+        .selected(selected)
+        .mx(px(6.))
+        .rounded(app.theme().radius)
         .pl(px(8.) + px(12.) * entry.depth() as f32)
         .when(in_multi, |li| li.bg(list_active))
-        .when(selected || in_multi, |li| {
-            li.child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .bottom_0()
-                    .w(px(2.))
-                    .bg(primary),
-            )
-        })
         // cmd+click 切换多选(stop_propagation 压住 tree 的 on_entry_click,不打开文件);
         // 普通点击清空多选回到单选(tree 自己处理打开)
         .on_mouse_down(MouseButton::Left, {
@@ -3369,12 +3331,16 @@ fn lang_display(lang: &str) -> &'static str {
 }
 
 impl Workbench {
-    /// 活动栏按钮(旧版 .activity-btn 40×40,激活态高亮)
+    /// 活动栏按钮(40×40)。[圆润] 激活态 = IDEA 新 UI 圆角填充高亮(蓝色调,区别于
+    /// hover 的中性 accent),取代旧的「仅图标变亮」。tip=悬浮工具提示;badge=右下角角标
+    /// 数(>0 才显,如 Git 改动数)。
     fn activity_btn(
         &self,
         id: &'static str,
         icon: IconName,
         view: SidebarView,
+        tip: &'static str,
+        badge: Option<usize>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active = self.sidebar_view == view;
@@ -3383,21 +3349,77 @@ impl Workbench {
         } else {
             cx.theme().muted_foreground
         };
+        let warning = cx.theme().warning;
+        // 角标描边/文字用 gutter 暗色(对齐蓝本 .badge:warning 底 + 深色字 + sidebar 描边)
+        let gutter = cx.theme().status_bar;
         div()
             .id(id)
+            .relative()
             .w(px(40.))
             .h(px(40.))
             .flex()
             .items_center()
             .justify_center()
             .rounded(cx.theme().radius)
-            .hover(|s| s.bg(cx.theme().accent))
+            .when(active, |s| s.bg(cx.theme().list_active))
+            .when(!active, |s| s.hover(|s| s.bg(cx.theme().accent)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| this.set_sidebar_view(view, cx)),
             )
-            // 选中态:仅图标变亮(对齐设计稿,无蓝条/底色块)
+            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
             .child(Icon::new(icon).size(px(20.)).text_color(color))
+            .when_some(badge.filter(|n| *n > 0), |s, n| {
+                s.child(
+                    div()
+                        .absolute()
+                        .right(px(3.))
+                        .bottom(px(3.))
+                        .min_w(px(14.))
+                        .h(px(14.))
+                        .px(px(3.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(7.))
+                        .bg(warning)
+                        .border_2()
+                        .border_color(gutter)
+                        .text_size(px(9.))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(gutter)
+                        .child(if n > 99 { "99+".to_string() } else { n.to_string() }),
+                )
+            })
+    }
+
+    /// 侧栏头部动作小按钮(22×22,文字字形 + 工具提示;悬浮整条侧栏才显)。
+    /// 复用已有 action/方法(新建文件/文件夹/定位),不新增后端。
+    fn side_action_btn(
+        &self,
+        id: &'static str,
+        glyph: &'static str,
+        tip: &'static str,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .w(px(22.))
+            .h(px(22.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(cx.theme().radius)
+            .text_size(px(13.))
+            .text_color(cx.theme().muted_foreground)
+            .hover(|s| s.bg(cx.theme().accent).text_color(cx.theme().foreground))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| on_click(this, window, cx)),
+            )
+            .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+            .child(glyph)
     }
 
     /// 欢迎/空态页(对齐 welcome.html):品牌 + tagline + 开始/最近两栏 + 快捷键速查。
@@ -3708,7 +3730,7 @@ impl Workbench {
                             .mb(px(40.))
                             .text_size(px(14.5))
                             .text_color(muted)
-                            .child("Java-first 原生代码编辑器,Rust + GPUI 构建。内置 jdtls 语言服务、完整 Git 客户端、Maven 依赖面板、集成终端,以及 Arthas 命令一键复制与 Astore 内网仓库直连。"),
+                            .child("Java-first 原生代码编辑器,Rust + GPUI 构建。内置 jdtls 语言服务、完整 Git 客户端、Maven 依赖面板、集成终端,以及 Arthas 命令一键复制。"),
                     )
                     // 两栏:开始 + 最近
                     .child(
@@ -3731,7 +3753,6 @@ impl Workbench {
                                         v_flex()
                                             .gap(px(4.))
                                             .child(start_open)
-                                            .child(proposal("⎘", "克隆 Astore 仓库…", "从内网 Astore 拉取代码", "建议 ⇧⌘C"))
                                             .child(proposal("＋", "新建文件", "空白缓冲区", "建议 ⌘N")),
                                     ),
                             )
@@ -3950,17 +3971,25 @@ impl Workbench {
         let active = self.active_tab == Some(ix);
         let icon = file_icons::file_icon_meta(&tab.title);
         let dirty = tab.dirty;
+        // tooltip 显完整相对路径(标签名被省略号截断后的兜底)
+        let rel_path: SharedString = tab
+            .path
+            .strip_prefix(&self.project_root)
+            .unwrap_or(&tab.path)
+            .to_string_lossy()
+            .to_string()
+            .into();
         h_flex()
             .id(ix)
-            .h_full()
+            // [A3/圆润] IDEA 风圆角标签卡片:高 30 底对齐、顶两角圆、去硬分隔线(改间隙)。
+            // 仍保留 flex_1 拉伸(刻意的 IDEA 行为);min_w(128) 防多标签挤成丝。
+            .h(px(30.))
             .px_3()
             .gap_2()
             .items_center()
-            // 平分铺满整条编辑器标签栏(对齐项目标签栏的拉伸行为)
             .flex_1()
-            .min_w_0()
-            .border_r_1()
-            .border_color(cx.theme().border)
+            .min_w(px(128.))
+            .rounded_t(cx.theme().radius)
             .when(active, |s| {
                 s.bg(cx.theme().background)
                     .border_t_2()
@@ -3975,6 +4004,7 @@ impl Workbench {
                 MouseButton::Left,
                 cx.listener(move |this, _, window, cx| this.activate_tab(ix, window, cx)),
             )
+            .tooltip(move |window, cx| Tooltip::new(rel_path.clone()).build(window, cx))
             .child(
                 div()
                     .text_size(px(11.))
@@ -4021,26 +4051,121 @@ impl Workbench {
             )
     }
 
-    /// 面包屑(旧版 #breadcrumb):项目名 › 相对路径段 › 文件名
+    /// 面包屑(旧版 #breadcrumb):项目名 › 相对路径段 › 文件名。
+    /// [A4] 每个目录段做成可悬浮 chip,点击在文件树中定位该目录;文件段带图标、不可点。
     fn render_breadcrumb(&self, path: &std::path::Path, cx: &mut Context<Self>) -> impl IntoElement {
         let rel = path
             .strip_prefix(&self.project_root)
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|_| path.to_path_buf());
-        let mut segs: Vec<String> = vec![self.project_name.to_string()];
-        segs.extend(rel.components().map(|c| c.as_os_str().to_string_lossy().to_string()));
-        let line = segs.join(" › ");
+        let comps: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect();
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let accent = cx.theme().accent;
+        let radius = cx.theme().radius;
+
+        let mut els: Vec<AnyElement> = Vec::new();
+        // 项目名段(导航到项目根)
+        {
+            let abs = self.project_root.clone();
+            els.push(
+                div()
+                    .id("cb-root")
+                    .px(px(6.))
+                    .py(px(1.))
+                    .rounded(radius)
+                    .cursor_pointer()
+                    .text_color(muted)
+                    .hover(|s| s.bg(accent).text_color(fg))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.locate_path_in_tree(abs.clone(), cx)
+                        }),
+                    )
+                    .child(self.project_name.to_string())
+                    .into_any_element(),
+            );
+        }
+        let n = comps.len();
+        for (i, c) in comps.iter().enumerate() {
+            els.push(
+                div()
+                    .px(px(1.))
+                    .text_color(muted.opacity(0.6))
+                    .child("›")
+                    .into_any_element(),
+            );
+            if i + 1 == n {
+                // 文件段:带文件图标,不可点
+                let meta = file_icons::file_icon_meta(c);
+                els.push(
+                    h_flex()
+                        .items_center()
+                        .gap(px(5.))
+                        .px(px(6.))
+                        .text_color(fg)
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(meta.color)
+                                .child(meta.glyph),
+                        )
+                        .child(c.clone())
+                        .into_any_element(),
+                );
+            } else {
+                let abs = self
+                    .project_root
+                    .join(comps[..=i].iter().map(|s| s.as_str()).collect::<PathBuf>());
+                els.push(
+                    div()
+                        .id(("cb", i))
+                        .px(px(6.))
+                        .py(px(1.))
+                        .rounded(radius)
+                        .cursor_pointer()
+                        .text_color(muted)
+                        .hover(|s| s.bg(accent).text_color(fg))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.locate_path_in_tree(abs.clone(), cx)
+                            }),
+                        )
+                        .child(c.clone())
+                        .into_any_element(),
+                );
+            }
+        }
+
         h_flex()
             .h(px(24.))
-            .px_3()
+            .px_2()
             .items_center()
+            .gap(px(2.))
             .border_b_1()
             .border_color(cx.theme().border)
             .text_size(px(11.))
-            .text_color(cx.theme().muted_foreground)
             .overflow_hidden()
             .whitespace_nowrap()
-            .child(line)
+            .children(els)
+    }
+
+    /// 在文件树中定位某目录/文件(面包屑段点击):切到 Files 视图 + 选中该路径。
+    fn locate_path_in_tree(&mut self, abs: PathBuf, cx: &mut Context<Self>) {
+        self.set_sidebar_view(SidebarView::Files, cx);
+        let name = abs
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| abs.to_string_lossy().to_string());
+        let item = TreeItem::new(abs.to_string_lossy().to_string(), name);
+        self.tree_state
+            .update(cx, |s, cx| s.set_selected_item(Some(&item), cx));
     }
 
     /// Explorer 头部的「定位当前文件」(旧版 btn-locate-file ⌖)
@@ -4243,7 +4368,6 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_nav_forward))
             .on_action(cx.listener(Self::on_toggle_md_preview))
             .on_action(cx.listener(Self::on_toggle_terminal))
-            .on_action(cx.listener(Self::on_toggle_astore))
             .on_action(cx.listener(Self::on_show_recents))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(|this: &mut Self, _: &ArthasWatch, _, cx| {
@@ -4370,10 +4494,17 @@ impl Render for Workbench {
                             .border_r_1()
                             .border_color(cx.theme().border)
                             .bg(cx.theme().sidebar)
-                            .child(self.activity_btn("act-files", IconName::Folder, SidebarView::Files, cx))
-                            .child(self.activity_btn("act-commit", IconName::Inbox, SidebarView::Commit, cx))
-                            .child(self.activity_btn("act-git", IconName::Github, SidebarView::Git, cx))
-                            .child(self.activity_btn("act-maven", IconName::GalleryVerticalEnd, SidebarView::Maven, cx))
+                            .child(self.activity_btn("act-files", IconName::Folder, SidebarView::Files, "资源管理器", None, cx))
+                            .child(self.activity_btn("act-commit", IconName::Inbox, SidebarView::Commit, "提交改动", None, cx))
+                            .child(self.activity_btn(
+                                "act-git",
+                                IconName::Github,
+                                SidebarView::Git,
+                                "Git",
+                                Some(self.git_panel.read(cx).change_count()),
+                                cx,
+                            ))
+                            .child(self.activity_btn("act-maven", IconName::GalleryVerticalEnd, SidebarView::Maven, "Maven 依赖", None, cx))
                             .child(div().flex_1())
                             .child(
                                 div()
@@ -4391,6 +4522,7 @@ impl Render for Workbench {
                                             this.on_open_settings(&OpenSettings, window, cx)
                                         }),
                                     )
+                                    .tooltip(|window, cx| Tooltip::new("设置").build(window, cx))
                                     .child(
                                         Icon::new(IconName::Settings)
                                             .size(px(19.))
@@ -4400,6 +4532,7 @@ impl Render for Workbench {
                     )
                     .child(
                         v_flex()
+                            .group(SharedString::from("sidebar"))
                             .w(px(self.sidebar_width))
                             .relative()
                             .h_full()
@@ -4421,20 +4554,45 @@ impl Render for Workbench {
                                             .text_color(cx.theme().muted_foreground)
                                             .child(self.sidebar_view.title().to_uppercase()),
                                     )
+                                    // [A2] Files 视图:把右键里已有的 新建文件/文件夹/定位 提到头部,
+                                    // 悬浮整条侧栏(group "sidebar")才显出(对齐蓝本 .side-actions)。
+                                    // 「全部折叠」按钮未做:TreeState 无 public collapse_all,不造假。
                                     .when(self.sidebar_view == SidebarView::Files, |s| {
                                         s.child(
-                                            div()
-                                                .id("locate-file")
-                                                .text_size(px(14.))
-                                                .text_color(cx.theme().muted_foreground)
-                                                .hover(|s| s.text_color(cx.theme().foreground))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(|this, _, _, cx| {
-                                                        this.locate_current_file(cx)
-                                                    }),
+                                            h_flex()
+                                                .gap(px(2.))
+                                                .opacity(0.)
+                                                .group_hover(
+                                                    SharedString::from("sidebar"),
+                                                    |s| s.opacity(1.),
                                                 )
-                                                .child("⌖"),
+                                                .child(self.side_action_btn(
+                                                    "sh-new-file",
+                                                    "＋",
+                                                    "新建文件",
+                                                    |this, window, cx| {
+                                                        this.on_new_file(&NewFile, window, cx)
+                                                    },
+                                                    cx,
+                                                ))
+                                                .child(self.side_action_btn(
+                                                    "sh-new-folder",
+                                                    "▤",
+                                                    "新建文件夹",
+                                                    |this, window, cx| {
+                                                        this.on_new_folder(&NewFolder, window, cx)
+                                                    },
+                                                    cx,
+                                                ))
+                                                .child(self.side_action_btn(
+                                                    "sh-locate",
+                                                    "⌖",
+                                                    "定位当前文件",
+                                                    |this, _window, cx| {
+                                                        this.locate_current_file(cx)
+                                                    },
+                                                    cx,
+                                                )),
                                         )
                                     }),
                             )
@@ -4500,6 +4658,12 @@ impl Render for Workbench {
                                         .id("editor-tabs")
                                         .h(px(36.))
                                         .w_full()
+                                        // [A3] 圆角标签卡片底对齐 + 间隙;接近 30 标签上限时
+                                        // 横向溢出滚动(配合单标签 min_w(128))不再挤成丝。
+                                        .items_end()
+                                        .gap(px(5.))
+                                        .px(px(6.))
+                                        .overflow_x_scroll()
                                         .border_b_1()
                                         .border_color(cx.theme().border)
                                         .children(self.tabs.iter().enumerate().map(
@@ -4671,30 +4835,7 @@ impl Render for Workbench {
                             .when(self.terminal_visible, |this| {
                                 this.child(self.render_bottom_panel(cx))
                             }),
-                    )
-                    .when(self.astore_visible, |row| {
-                        row.child(
-                            v_flex()
-                                .w(px(self.astore_width))
-                                .relative()
-                                .h_full()
-                                .border_l_1()
-                                .border_color(cx.theme().border)
-                                .bg(cx.theme().sidebar)
-                                .child(self.resize_handle("rz-astore", Resizing::Astore, cx))
-                                .child(
-                                    h_flex()
-                                        .h(px(30.))
-                                        .px_3()
-                                        .items_center()
-                                        .text_size(px(11.))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("ASTORE"),
-                                )
-                                .child(div().flex_1().min_h_0().child(self.astore_panel.clone())),
-                        )
-                    }),
+                    ),
             )
             .child(
                 h_flex()
@@ -4743,13 +4884,28 @@ impl Render for Workbench {
                             .sum();
                         bar.when(!branch.is_empty(), |s| {
                             s.child(
+                                // [A5] 分支段可点 → 切换分支(CheckoutBranch);hover 反馈 + tooltip
                                 h_flex()
+                                    .id("st-branch")
                                     .gap_1()
                                     .items_center()
                                     .max_w(px(260.))
                                     .min_w_0()
+                                    .px_1p5()
+                                    .rounded(cx.theme().radius)
+                                    .cursor_pointer()
                                     .overflow_hidden()
                                     .whitespace_nowrap()
+                                    .hover(|s| s.bg(cx.theme().accent))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            this.on_checkout_branch(&CheckoutBranch, window, cx)
+                                        }),
+                                    )
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new("切换分支").build(window, cx)
+                                    })
                                     .child(
                                         div().flex_none().text_color(cx.theme().info).child("⎇"),
                                     )
@@ -4780,9 +4936,26 @@ impl Render for Workbench {
                         })
                         .when(problems > 0, |s| {
                             s.child(
+                                // [A5] 问题段可点 → 打开底部面板并切到「问题」页
                                 div()
+                                    .id("st-problems")
+                                    .px_1p5()
+                                    .rounded(cx.theme().radius)
+                                    .cursor_pointer()
                                     .text_color(cx.theme().warning)
                                     .whitespace_nowrap()
+                                    .hover(|s| s.bg(cx.theme().accent))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.terminal_visible = true;
+                                            this.panel_tab = PanelTab::Problems;
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new("查看问题").build(window, cx)
+                                    })
                                     .child(format!("⚠ {problems}")),
                             )
                         })
@@ -4835,8 +5008,12 @@ impl Render for Workbench {
                         let accent = cx.theme().primary;
                         this.child(
                             h_flex()
+                                .id("st-jdtls")
                                 .items_center()
                                 .gap_1p5()
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Java 语言服务 (jdtls)").build(window, cx)
+                                })
                                 .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(dot))
                                 .child(div().text_color(muted).child(label))
                                 // 进度条:启动/索引阶段显示,有 % 就按比例填充(无 % 显示空槽)
@@ -4990,6 +5167,13 @@ fn main() {
         if let Some(config) = warm_earth {
             Theme::global_mut(cx).apply_config(&config);
         }
+        // [圆润] IDEA 新 UI 风:圆角整体提级(单一真源——app 内几乎所有 .rounded(theme.radius)
+        // / radius_lg 随之变圆,无需逐处改)。蓝本 --radius 6→8、--radius-lg 10→14。
+        {
+            let theme = Theme::global_mut(cx);
+            theme.radius = px(8.);
+            theme.radius_lg = px(14.);
+        }
 
         cx.on_action(|_: &Quit, cx| cx.quit());
         // 原生菜单栏(条目对齐旧版 lib.rs build_menu)
@@ -5013,11 +5197,10 @@ fn main() {
                 MenuItem::action("查找引用", FindUsages),
                 MenuItem::action("Markdown 预览", ToggleMdPreview),
             ]),
-            // 对齐旧版 View 菜单(Terminal 项;Git/Astore 在侧栏页签,不重复列)
+            // 对齐旧版 View 菜单(Terminal 项;Git/Maven 在侧栏页签,不重复列)
             Menu::new("View").items([
                 MenuItem::action("Markdown 预览  ⇧⌘V", ToggleMdPreview),
                 MenuItem::action("终端  ⌃`", ToggleTerminal),
-                MenuItem::action("Astore", ToggleAstore),
             ]),
         ]);
 

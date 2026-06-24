@@ -135,8 +135,6 @@ pub struct TerminalPanel {
     next_id: u64,
     /// 等宽字宽缓存(字体与字号固定,首帧实测一次即可)
     cell_w: Option<Pixels>,
-    /// 右侧占位宽(Astore 右侧栏开启时为其宽度),列数推算要扣掉
-    right_inset: f32,
     /// 终端内容区实际可用高(由 Workbench 按拖动后的面板高推入);grid 行数按它算,
     /// 不再用固定 PANEL_HEIGHT——否则拖高面板时网格仍只 ~12 行,TUI(如 Claude Code)展示不全。
     panel_height: f32,
@@ -170,7 +168,6 @@ impl TerminalPanel {
             active: 0,
             next_id: 0,
             cell_w: None,
-            right_inset: 0.,
             panel_height: PANEL_HEIGHT,
             status: "".into(),
             last_op: None,
@@ -311,10 +308,6 @@ impl TerminalPanel {
         self.cc_done = false;
         self.start_cc_watch(cx);
         cx.notify();
-    }
-
-    pub fn set_right_inset(&mut self, inset: f32) {
-        self.right_inset = inset;
     }
 
     /// Workbench 按拖动后的面板高推入内容区实际高;不 notify(本面板作为子元素随父重渲染,
@@ -518,7 +511,6 @@ impl Render for TerminalPanel {
         let avail_w = f32::from(viewport.width)
             - crate::ACTIVITY_WIDTH
             - crate::SIDEBAR_WIDTH
-            - self.right_inset
             - 10.;
         let cols = ((avail_w / f32::from(cell_w)).floor() as u16).clamp(2, 500);
         let rows =
