@@ -340,6 +340,13 @@ impl MavenPanel {
         goal: &'static str,
         cx: &mut Context<Self>,
     ) {
+        // 并发守卫:已有 goal 在跑就拒绝并给可见提示(捕获式只显示「运行中…」,
+        // 用户易以为没反应再点 → 同一 reactor 跑两个 mvn 抢写 target/ 会损坏)。
+        if let Some(running) = &self.running_goal {
+            self.status = format!("已有 goal 运行中({}),请等待完成", running).into();
+            cx.notify();
+            return;
+        }
         let module_dir = Path::new(&pom)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
