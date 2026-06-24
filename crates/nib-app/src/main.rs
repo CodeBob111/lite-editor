@@ -1968,6 +1968,29 @@ impl Workbench {
         session::save(&sess);
     }
 
+    /// Cmd+Q / 菜单退出:**同步**落盘当前项目的标签再退。普通 persist 的写盘是异步
+    /// fire-and-forget,cx.quit() 会赶在写盘前杀进程 → 最后一次 session 丢失(重启后该项目标签全没)。
+    fn on_quit(&mut self, _: &Quit, _: &mut Window, cx: &mut Context<Self>) {
+        let slot = self.current_project_slot();
+        match self.projects.iter().position(|p| p.path == slot.path) {
+            Some(ix) => {
+                self.projects[ix] = slot;
+                self.active_project = ix;
+            }
+            None => {
+                self.projects.push(slot);
+                self.active_project = self.projects.len() - 1;
+            }
+        }
+        let sess = session::PersistedSession {
+            version: 1,
+            projects: self.projects.clone(),
+            active_project_index: self.active_project,
+        };
+        session::save_sync(&sess);
+        cx.quit();
+    }
+
     fn on_save(&mut self, _: &SaveFile, _: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.active() else { return };
         let path = tab.path.clone();
@@ -2645,11 +2668,9 @@ impl Workbench {
         match view {
             SidebarView::Commit => self.git_panel.update(cx, |p, cx| {
                 p.set_mode(GitPanelMode::Commit, cx);
-                p.refresh(cx);
             }),
             SidebarView::Git => self.git_panel.update(cx, |p, cx| {
                 p.set_mode(GitPanelMode::Branches, cx);
-                p.refresh(cx);
             }),
             _ => {}
         }
@@ -4205,6 +4226,7 @@ impl Render for Workbench {
                 cx.listener(|this, ev: &MouseDownEvent, _, _| this.last_mouse = ev.position),
             )
             .on_action(cx.listener(Self::on_save))
+            .on_action(cx.listener(Self::on_quit))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_toggle_quick_open))
             .on_action(cx.listener(Self::on_toggle_search))

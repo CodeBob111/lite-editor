@@ -77,6 +77,16 @@ pub fn save(session: &PersistedSession) {
     }
 }
 
+/// 同步落盘(退出前用):普通 save 是 fire-and-forget,cx.quit() 会赶在异步写盘前杀进程 →
+/// 最后一次 session(含当前项目标签)丢失。退出路径直接同步 std::fs::write,保证写完再退。
+pub fn save_sync(session: &PersistedSession) {
+    if let Ok(json) = serde_json::to_string(session) {
+        let dir = data_dirs().app_data;
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("session.json"), json);
+    }
+}
+
 // ---- 编辑器偏好(沿用旧 Nib settings.json 的扁平键 schema) ----
 
 #[derive(Serialize, Deserialize, Clone)]
