@@ -71,6 +71,9 @@ pub(crate) fn should_skip(name: &str) -> bool {
             // 构建/产物目录:否则会搜到已删代码在编译/打包输出里的陈旧副本。
             | "build" | "dist" | "out" | "bin" | ".gradle" | ".next" | ".nuxt" | ".turbo"
             | "coverage" | ".settings" | ".metadata"
+            // Agent/索引工具的本地状态目录,不属于源码树。大仓库启动时把它们纳入文件树、
+            // quick-open 与搜索会造成重复扫盘和大量无意义节点。
+            | ".cocoindex_code" | ".trade-agent" | ".qoder" | ".kb" | ".claude" | ".playwright-mcp"
     )
 }
 
@@ -81,7 +84,8 @@ pub(crate) fn is_binary_ext(name: &str) -> bool {
         ".eot", ".otf", ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar", ".xz", ".pdf", ".doc",
         ".docx", ".xls", ".xlsx", ".pptx", ".exe", ".dll", ".so", ".dylib", ".class", ".jar",
         ".war", ".o", ".a", ".lib", ".pyc", ".pyo", ".mp3", ".mp4", ".avi", ".mov", ".wav",
-        ".flac", ".mkv", ".lock", ".min.js", ".min.css",
+        ".flac", ".mkv", ".lock", ".db", ".sqlite", ".sqlite3", ".mdb", ".ldb", ".min.js",
+        ".min.css",
     ]
     .iter()
     .any(|ext| name_lower.ends_with(ext))

@@ -1,3 +1,4 @@
+use crate::fs::should_skip;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -69,23 +70,11 @@ fn parse_package(content: &str) -> String {
 }
 
 fn collect_java_files(project_path: &str) -> Vec<PathBuf> {
-    let skip_dirs = [
-        "target",
-        "build",
-        ".git",
-        ".idea",
-        "node_modules",
-        ".settings",
-        "bin",
-        ".metadata",
-        ".classpath",
-    ];
-
     WalkDir::new(project_path)
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !skip_dirs.contains(&name.as_ref())
+            !should_skip(&name) && name != ".classpath"
         })
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "java"))

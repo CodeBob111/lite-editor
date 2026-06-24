@@ -5,6 +5,7 @@
 // 内存即权威:保存时只更新内存(大索引逐次写盘太慢);磁盘缓存在「构建」时写一次,
 // 下次启动按 mtime 增量重扫被改过的文件即可补齐——崩溃也不丢正确性。
 
+use crate::fs::should_skip;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -145,14 +146,11 @@ fn tokenize(content: &str) -> HashMap<String, Vec<u32>> {
 }
 
 fn collect_java_files(project_path: &str) -> Vec<PathBuf> {
-    let skip_dirs = [
-        "target", "build", ".git", ".idea", "node_modules", ".settings", "bin", ".metadata",
-    ];
     WalkDir::new(project_path)
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !skip_dirs.contains(&name.as_ref())
+            !should_skip(&name)
         })
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file() && e.path().extension().is_some_and(|ext| ext == "java"))

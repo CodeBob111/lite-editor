@@ -6,6 +6,8 @@ use crate::rt::on_worker;
 use serde::Serialize;
 use similar::{ChangeTag, TextDiff};
 
+const MAX_TEXT_DIFF_BYTES: u64 = 2 * 1024 * 1024;
+
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DiffKind {
     Same,
@@ -79,9 +81,22 @@ pub(crate) fn diff_lines_sync(old: &str, new: &str) -> LineDiff {
 /// 工作区文件 vs HEAD 的行级 diff(读盘+git show+diff 全在 core runtime)
 pub async fn diff_file_against_head(cwd: String, rel_path: String) -> Result<LineDiff, String> {
     on_worker(move || {
+        if crate::fs::is_binary_ext(&rel_path) {
+            return Err(format!("{} 是二进制文件,不生成文本 diff", rel_path));
+        }
+        let work_path = std::path::Path::new(&cwd).join(&rel_path);
+        if let Ok(meta) = std::fs::metadata(&work_path) {
+            if meta.len() > MAX_TEXT_DIFF_BYTES {
+                return Err(format!("{} 超过 2MB,不生成文本 diff", rel_path));
+            }
+        }
+        if let Ok(head_size) = crate::git::head_file_size_sync(&cwd, &rel_path) {
+            if head_size > MAX_TEXT_DIFF_BYTES {
+                return Err(format!("{} 的 HEAD 版本超过 2MB,不生成文本 diff", rel_path));
+            }
+        }
         let head = crate::git::show_head_file_sync(&cwd, &rel_path).unwrap_or_default();
-        let work = std::fs::read_to_string(std::path::Path::new(&cwd).join(&rel_path))
-            .unwrap_or_default();
+        let work = std::fs::read_to_string(work_path).unwrap_or_default();
         Ok(diff_lines_sync(&head, &work))
     })
     .await
