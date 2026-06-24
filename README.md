@@ -32,8 +32,8 @@ Performance discipline: all IO and subprocess work runs on the core runtime; asy
 
 ```bash
 cargo build --release -p nib-app   # release binary
-scripts/bundle-nib.sh              # → target/release/bundle/Nib.app (ad-hoc signed)
-cp -R target/release/bundle/Nib.app /Applications/
+scripts/bundle-nib.sh              # → target/release/bundle/Nib.app + .nib-runtime
+ditto target/release/bundle /Applications
 ```
 
 Tests and lints:
