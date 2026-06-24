@@ -420,6 +420,52 @@ pub async fn maven_dependency_tree(
     .await
 }
 
+/// 一次 mvn 生命周期 goal 运行的结果:goal 名 + 退出码 + 合并日志(stdout+stderr)。
+pub struct MavenGoalResult {
+    pub goal: String,
+    pub exit_code: i32,
+    pub log: String,
+}
+
+/// 运行任意 mvn 生命周期 goal(clean / compile / test / package / install 等),
+/// 在指定模块目录下执行,捕获 stdout+stderr 合并日志返回。退出码非 0 也返回日志
+/// (不当 Err),让面板把失败日志照样完整展示给用户——失败信息本身就是要看的内容。
+pub async fn maven_run_goal(
+    project_path: String,
+    goal: String,
+    cfg: MavenConfig,
+) -> Result<MavenGoalResult, String> {
+    on_worker(move || {
+        let output = Command::new(cfg.mvn_bin())
+            .arg(&goal)
+            .args(cfg.extra_args())
+            .current_dir(&project_path)
+            // 同 dependency:tree:Dock 启动拿不到 /opt/homebrew/bin,且 mvn 脚本要 JAVA_HOME。
+            .env("PATH", crate::lsp::augmented_path())
+            .env("JAVA_HOME", crate::lsp::java_home())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| format!("Failed to run mvn: {}", e))?;
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        let mut log = String::from_utf8_lossy(&output.stdout).into_owned();
+        let err = String::from_utf8_lossy(&output.stderr);
+        if !err.trim().is_empty() {
+            if !log.ends_with('\n') {
+                log.push('\n');
+            }
+            log.push_str(&err);
+        }
+        Ok(MavenGoalResult {
+            goal,
+            exit_code,
+            log,
+        })
+    })
+    .await
+}
+
 // ---- pom.xml exclusion 外科手术编辑 ----
 
 pub(crate) fn add_exclusion(
