@@ -3839,8 +3839,12 @@ impl Workbench {
         v_flex()
             .h(px(self.terminal_height))
             .relative()
-            .border_t_1()
+            // [§G] 终端=独立圆角卡片(原 border_top 改整圈边框圆角);不 overflow_hidden
+            // 以保顶部 resize 把手 top(-2.5) 落在 8px 间隙里可拖。
+            .rounded(px(10.))
+            .border_1()
             .border_color(border)
+            .bg(cx.theme().background)
             .child(self.resize_handle("rz-terminal", Resizing::Terminal, cx))
             .child(
                 h_flex()
@@ -4345,7 +4349,8 @@ impl Render for Workbench {
             .size_full()
             .relative()
             .track_focus(&self.focus_handle)
-            .bg(cx.theme().background)
+            // [§G Zed 风] 窗体根底色 = gutter(浮动卡片之间透出的暗色),卡片各自带 bg
+            .bg(cx.theme().status_bar)
             .key_context("Workbench")
             // 面板拖动:把手按下后,根元素的 mouse_move/up 实时改尺寸(仅 resizing 时生效)
             .on_mouse_move(cx.listener(Self::on_resize_drag))
@@ -4486,14 +4491,12 @@ impl Render for Workbench {
                     .min_h_0()
                     .child(
                         v_flex()
+                            // [§G] 活动栏贴左边、透明底(gutter 透出),不做卡片、无 border_r
                             .w(px(ACTIVITY_WIDTH))
                             .h_full()
                             .items_center()
                             .py_2()
                             .gap_1()
-                            .border_r_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().sidebar)
                             .child(self.activity_btn("act-files", IconName::Folder, SidebarView::Files, "资源管理器", None, cx))
                             .child(self.activity_btn("act-commit", IconName::Inbox, SidebarView::Commit, "提交改动", None, cx))
                             .child(self.activity_btn(
@@ -4530,13 +4533,22 @@ impl Render for Workbench {
                                     ),
                             ),
                     )
+                    // [§G] 浮动卡片区:侧栏 + 编辑器列各自圆角卡片,8px 内边距 + 8px 间隙,gutter 透出
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .p(px(8.))
+                            .gap(px(8.))
                     .child(
                         v_flex()
                             .group(SharedString::from("sidebar"))
                             .w(px(self.sidebar_width))
                             .relative()
                             .h_full()
-                            .border_r_1()
+                            // [§G] 侧栏圆角卡片(不 overflow_hidden:保 resize 把手 right(-2.5) 可拖)
+                            .rounded(px(10.))
+                            .border_1()
                             .border_color(cx.theme().border)
                             .bg(cx.theme().sidebar)
                             .child(self.resize_handle("rz-sidebar", Resizing::Sidebar, cx))
@@ -4652,6 +4664,17 @@ impl Render for Workbench {
                             .flex_1()
                             .h_full()
                             .min_w_0()
+                            .gap(px(8.))
+                            // [§G] 编辑区圆角卡片(标签 + 面包屑 + 代码),overflow_hidden 裁到圆角
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .rounded(px(10.))
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .overflow_hidden()
+                                    .bg(cx.theme().background)
                             .when(!self.tabs.is_empty(), |this| {
                                 this.child(
                                     h_flex()
@@ -4832,10 +4855,13 @@ impl Render for Workbench {
                                     }
                                 }
                             }))
+                            )
+                            // [§G] 终端=独立圆角卡片(render_bottom_panel 自带 rounded+border)
                             .when(self.terminal_visible, |this| {
                                 this.child(self.render_bottom_panel(cx))
                             }),
                     ),
+                    )
             )
             .child(
                 h_flex()
@@ -4843,9 +4869,8 @@ impl Render for Workbench {
                     .px_2()
                     .items_center()
                     .gap_3()
+                    // [§G] 状态栏融进 gutter:去与正文交界的 1px 边框(底色已是 gutter)
                     .bg(cx.theme().status_bar)
-                    .border_t_1()
-                    .border_color(cx.theme().status_bar_border)
                     .text_size(px(11.))
                     .text_color(cx.theme().muted_foreground)
                     // 状态栏左侧可点「终端」按钮(等价 ctrl+`):给底部终端一个显眼入口

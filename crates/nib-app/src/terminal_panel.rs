@@ -508,10 +508,13 @@ impl Render for TerminalPanel {
 
         // 面板宽 = 视口宽 - 活动栏 - 侧栏 - 右侧栏占位 - 边框;高 = 总高 - 把手 - 留白
         let viewport = window.viewport_size();
+        // §G 浮动卡片:终端卡片外有 work 容器左右内边距(8+8)+ 侧栏间隙(8)+ 卡片边框/内距(~10),
+        // 共约 34px。列数按真实可用宽算,否则 grid 过宽、文字溢出终端卡片右边框。
+        // (侧栏宽仍用 const 默认值;用户拖宽侧栏后列数会略偏,属既有限制。)
         let avail_w = f32::from(viewport.width)
             - crate::ACTIVITY_WIDTH
             - crate::SIDEBAR_WIDTH
-            - 10.;
+            - 34.;
         let cols = ((avail_w / f32::from(cell_w)).floor() as u16).clamp(2, 500);
         let rows =
             (((self.panel_height - HEADER_H - PAD_V) / LINE_H).floor() as u16).clamp(2, 100);
