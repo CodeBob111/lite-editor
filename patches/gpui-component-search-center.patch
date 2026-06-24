@@ -1,0 +1,62 @@
+diff --git a/crates/ui/src/input/search.rs b/crates/ui/src/input/search.rs
+index e9cd1ac3..467bbfe4 100644
+--- a/crates/ui/src/input/search.rs
++++ b/crates/ui/src/input/search.rs
+@@ -343,28 +343,47 @@ impl SearchPanel {
+         self.editor.focus_handle(cx).focus(window, cx);
+     }
+ 
+-    fn prev(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+-        let previous_match_ix = self.matcher.current_match_ix;
++    fn prev(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+         if let Some(range) = self.matcher.next_back() {
+-            let direction =
+-                Self::prev_scroll_direction(previous_match_ix, self.matcher.current_match_ix);
+             self.editor.update(cx, |state, cx| {
+-                state.scroll_to(range.start, direction, cx);
++                Self::select_and_center(state, range, window, cx);
+             });
+         }
+     }
+ 
+-    fn next(&mut self, _: &mut Window, cx: &mut Context<Self>) {
+-        let previous_match_ix = self.matcher.current_match_ix;
++    fn next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+         if let Some(range) = self.matcher.next() {
+-            let direction =
+-                Self::next_scroll_direction(previous_match_ix, self.matcher.current_match_ix);
+             self.editor.update(cx, |state, cx| {
+-                state.scroll_to(range.end, direction, cx);
++                Self::select_and_center(state, range, window, cx);
+             });
+         }
+     }
+ 
++    /// [nib patch] 选中当前匹配 + 把匹配行滚到编辑器视口垂直正中。**同步执行**(不用 on_next_frame——
++    /// 异步那帧 set_scroll_offset 实测不生效、视图停在原处)。原实现只 scroll_to 不动光标;现在:
++    /// ① selected_range 让光标落到匹配、选区高亮;② 直接算偏移 set_scroll_offset 把匹配行放视口正中
++    /// (不走 scroll_to 的 edge 启发式——那套只贴边);③ surrounding_lines=9999 让 layout_cursor 也
++    /// 固定在中点、不把偏移改回去(退出搜索/点击编辑器由 Nib on_mouse_up 调回 None)。
++    fn select_and_center(
++        state: &mut InputState,
++        range: std::ops::Range<usize>,
++        window: &mut Window,
++        cx: &mut Context<InputState>,
++    ) {
++        state.selected_range = range.into();
++        state.selection_reversed = false;
++        state.set_cursor_surrounding_lines(Some(9999), window, cx);
++        let Some(lh) = state.line_height() else {
++            return;
++        };
++        let row = state.cursor_position().line as i64;
++        let visible = state.visible_row_range().map(|r| r.len()).unwrap_or(20) as i64;
++        let target_top = (row - visible / 2).max(0) as f32;
++        let mut off = state.scroll_offset();
++        off.y = gpui::px(-(target_top * f32::from(lh)));
++        state.set_scroll_offset(off, cx);
++    }
++
+     pub(super) fn matcher(&self) -> Option<&SearchMatcher> {
+         if !self.open {
+             return None;

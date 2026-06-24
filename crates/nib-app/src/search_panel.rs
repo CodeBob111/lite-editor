@@ -38,6 +38,7 @@ pub struct SearchPanel {
     preview: Option<PreviewDoc>,
     /// 预览读盘防抖序号:连续切选区只让最后一次的异步读应用。
     preview_seq: u64,
+    result_scroll: UniformListScrollHandle,
     preview_scroll: UniformListScrollHandle,
     _subscription: Subscription,
 }
@@ -65,6 +66,7 @@ impl SearchPanel {
             query_seq: 0,
             preview: None,
             preview_seq: 0,
+            result_scroll: UniformListScrollHandle::default(),
             preview_scroll: UniformListScrollHandle::default(),
             _subscription: subscription,
         }
@@ -127,6 +129,7 @@ impl SearchPanel {
             // 选区发起的 read_file 会在清空后把陈旧预览写回到已清空的列表上。
             self.preview = None;
             self.preview_seq += 1;
+            self.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
             cx.notify();
             return;
         }
@@ -154,6 +157,7 @@ impl SearchPanel {
                 }
                 this.results = Arc::new(result.unwrap_or_default());
                 this.selected = 0;
+                this.result_scroll.scroll_to_item(0, ScrollStrategy::Top);
                 this.load_preview(cx);
                 this.searching = false;
                 cx.notify();
@@ -169,6 +173,8 @@ impl SearchPanel {
         }
         let next = (self.selected as i32 + delta).rem_euclid(len);
         self.selected = next as usize;
+        self.result_scroll
+            .scroll_to_item(self.selected, ScrollStrategy::Nearest);
         self.load_preview(cx);
         cx.notify();
     }
@@ -188,9 +194,8 @@ impl SearchPanel {
         self.confirm(cx);
     }
 
-    fn rel(&self, abs: &str) -> String {
-        let root = self.project_root.to_string_lossy();
-        abs.strip_prefix(root.as_ref())
+    fn rel_from(root: &str, abs: &str) -> String {
+        abs.strip_prefix(root)
             .map(|s| s.trim_start_matches('/').to_string())
             .unwrap_or_else(|| abs.to_string())
     }
@@ -200,49 +205,57 @@ impl Render for SearchPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let total = self.results.len();
         let mono = cx.theme().mono_font_family.clone();
-        // 列表行:代码片段(左,主)+ 相对路径:行(右,次)—— 对齐 IDEA Find in Files
-        let rows: Vec<_> = self
-            .results
-            .iter()
-            .take(MAX_SHOWN)
-            .enumerate()
-            .map(|(row, hit)| {
-                let rel = self.rel(&hit.path);
-                let selected = row == self.selected;
-                h_flex()
-                    .id(row)
-                    .w_full()
-                    .px_3()
-                    .py_1()
-                    .gap_3()
-                    .items_center()
-                    .rounded(cx.theme().radius)
-                    .when(selected, |s| s.bg(cx.theme().list_active))
-                    .hover(|s| s.bg(cx.theme().accent))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| this.select_and_open(row, cx)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .font_family(mono.clone())
-                            .text_size(px(12.5))
-                            .child(hit.text.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(11.))
-                            .text_color(cx.theme().muted_foreground)
-                            .whitespace_nowrap()
-                            .child(format!("{} {}", rel, hit.line + 1)),
-                    )
-            })
-            .collect();
+        let shown = total.min(MAX_SHOWN);
+        let rows_height = px(((shown as f32) * 28.).min(260.));
+        let root = self.project_root.to_string_lossy().to_string();
+        let results = self.results.clone();
+        let selected = self.selected;
+        let panel = cx.entity().clone();
+        // 列表行:代码片段(左,主)+ 相对路径:行(右,次)—— 对齐 IDEA Find in Files。
+        // 用 uniform_list + result_scroll 保证键盘上下移动时选中项不会被下方预览区遮住。
+        let rows = uniform_list("search-rows", shown, move |range, _, cx| {
+            let mono = mono.clone();
+            range
+                .map(|row| {
+                    let hit = &results[row];
+                    let rel = Self::rel_from(&root, &hit.path);
+                    let selected = row == selected;
+                    let panel = panel.clone();
+                    h_flex()
+                        .id(row)
+                        .w_full()
+                        .px_3()
+                        .py_1()
+                        .gap_3()
+                        .items_center()
+                        .rounded(cx.theme().radius)
+                        .when(selected, |s| s.bg(cx.theme().list_active))
+                        .hover(|s| s.bg(cx.theme().accent))
+                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                            panel.update(cx, |this, cx| this.select_and_open(row, cx));
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .font_family(mono.clone())
+                                .text_size(px(12.5))
+                                .child(hit.text.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.))
+                                .text_color(cx.theme().muted_foreground)
+                                .whitespace_nowrap()
+                                .child(format!("{} {}", rel, hit.line + 1)),
+                        )
+                })
+                .collect::<Vec<_>>()
+        })
+        .track_scroll(&self.result_scroll);
 
         // 下半:选中结果所在文件的代码预览(虚拟列表,可滑全文件,命中行高亮)。
         // 捕获两个 Arc(克隆廉价),只对可见行切片取文本,不碰全文、不建 Vec<String>。
@@ -324,14 +337,14 @@ impl Render for SearchPanel {
                     }),
             )
             .child(
-                v_flex()
+                div()
                     .id("search-rows")
                     .flex_none()
-                    .max_h(px(260.))
-                    .overflow_y_scroll()
+                    .h(rows_height)
                     .px_1()
                     .pb_1()
-                    .children(rows),
+                    .overflow_hidden()
+                    .child(rows.size_full()),
             )
             .when(has_preview, |c| {
                 c.child(
