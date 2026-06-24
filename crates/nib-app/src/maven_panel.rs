@@ -5,7 +5,11 @@ use std::path::PathBuf;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
-use gpui_component::{h_flex, v_flex, ActiveTheme};
+use gpui_component::{
+    h_flex,
+    menu::{ContextMenuExt as _, PopupMenuItem},
+    v_flex, ActiveTheme,
+};
 use nib_core::maven::{MavenConfig, MavenDepTree, MavenModule};
 
 pub struct MavenPanel {
@@ -131,12 +135,14 @@ impl MavenPanel {
 
 impl Render for MavenPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity();
         let module_rows: Vec<_> = self
             .modules
             .iter()
             .enumerate()
             .map(|(ix, m)| {
                 let selected = self.selected_module == Some(ix);
+                let e = entity.clone();
                 h_flex()
                     .id(ix)
                     .px_2()
@@ -146,10 +152,28 @@ impl Render for MavenPanel {
                     .text_size(px(12.))
                     .when(selected, |s| s.bg(cx.theme().list_active))
                     .hover(|s| s.bg(cx.theme().accent))
+                    // 单击只选中(不再直接跑 mvn);跑依赖树等操作走右键菜单(对齐 IDEA)。
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| this.load_deps(ix, cx)),
+                        cx.listener(move |this: &mut MavenPanel, _, _, cx| {
+                            this.selected_module = Some(ix);
+                            cx.notify();
+                        }),
                     )
+                    // 右键菜单:操作按钮(闭包直调本面板方法,绕开跨实体 action 分发)。
+                    .context_menu(move |menu, _w, _c| {
+                        let (ed, er) = (e.clone(), e.clone());
+                        menu.item(PopupMenuItem::new("查看依赖树 (dependency:tree)").on_click(
+                            move |_, _, cx| {
+                                ed.update(cx, |this, cx| this.load_deps(ix, cx));
+                            },
+                        ))
+                        .item(PopupMenuItem::new("刷新模块列表").on_click(
+                            move |_, _, cx| {
+                                er.update(cx, |this, cx| this.refresh_modules(cx));
+                            },
+                        ))
+                    })
                     .child(div().flex_1().min_w_0().overflow_hidden().child(m.name.clone()))
                     .child(
                         div()
