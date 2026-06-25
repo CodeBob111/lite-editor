@@ -29,7 +29,6 @@ use gpui_component::{
     list::ListItem,
     menu::ContextMenuExt,
     notification::{Notification, NotificationType},
-    resizable::{h_resizable, resizable_panel, ResizableState},
     tooltip::Tooltip,
     tree::{tree, TreeItem, TreeState},
     v_flex, ActiveTheme, Icon, IconName, Root, Theme, ThemeMode, ThemeRegistry, TitleBar, WindowExt,
@@ -429,8 +428,6 @@ struct Workbench {
     events_sink: Arc<ChannelSink>,
     settings: session::EditorSettings,
     md_preview: bool,
-    /// md 预览左右分栏的可拖动状态(记住拖动后的比例)
-    md_split_state: Entity<ResizableState>,
     /// md 预览滚动句柄:预览按标题分段渲染为子元素,点锚点 → scroll_to_top_of_item 滚到该段
     md_scroll: ScrollHandle,
     /// 编辑器标签栏横向滚动句柄:标签多到溢出时,激活某标签自动把它滚进可见区,
@@ -626,7 +623,6 @@ impl Workbench {
             events_sink: Arc::new(ChannelSink(tx)),
             settings: session::EditorSettings::default(),
             md_preview: false,
-            md_split_state: cx.new(|_| ResizableState::default()),
             md_scroll: ScrollHandle::new(),
             tab_scroll: ScrollHandle::new(),
             terminal: None,
@@ -4898,33 +4894,32 @@ impl Render for Workbench {
                                                         .into_any_element()
                                                     })
                                                     .collect();
-                                            // 左右两栏可拖动分隔(h_resizable + 持久状态)
+                                            // 左右两栏 50/50(编辑 | 预览)。改用纯 h_flex(各 flex_1
+                                            // +min_w_0)而非 h_resizable:后者在 §G overflow_hidden
+                                            // 编辑器卡片内会把预览栏压成 0(「闪一下就没」),
+                                            // 纯 flex 二分必然两栏都显示、随卡片宽自适应。
                                             this.child(
-                                                h_resizable("md-split")
-                                                    .with_state(&self.md_split_state)
+                                                h_flex()
+                                                    .size_full()
                                                     .child(
-                                                        resizable_panel()
-                                                            .size(px(560.))
-                                                            .child(
-                                                                div()
-                                                                    .size_full()
-                                                                    .min_w_0()
-                                                                    .child(editor_el),
-                                                            ),
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .h_full()
+                                                            .child(editor_el),
                                                     )
                                                     .child(
-                                                        resizable_panel().size(px(560.)).child(
-                                                            div()
-                                                                .id("md-preview")
-                                                                .size_full()
-                                                                .min_w_0()
-                                                                .overflow_y_scroll()
-                                                                .track_scroll(&self.md_scroll)
-                                                                .border_l_1()
-                                                                .border_color(cx.theme().border)
-                                                                .p_4()
-                                                                .children(section_els),
-                                                        ),
+                                                        div()
+                                                            .id("md-preview")
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .h_full()
+                                                            .overflow_y_scroll()
+                                                            .track_scroll(&self.md_scroll)
+                                                            .border_l_1()
+                                                            .border_color(cx.theme().border)
+                                                            .p_4()
+                                                            .children(section_els),
                                                     ),
                                             )
                                         } else {
