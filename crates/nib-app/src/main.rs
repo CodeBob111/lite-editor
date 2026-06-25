@@ -143,6 +143,49 @@ fn file_node_to_tree_item(
     }
 }
 
+// ===== 性能计时(主线程同步块定位)=====
+// 卡顿哨兵只记「停顿发生时最近的操作面包屑」,起点常远早于停顿(op_age≫drift)→ 未捕获。
+// 这里直接量「可疑同步块本身」的耗时,超阈值才落 perf.log(独立 writer 线程,O(1) send 不阻塞)。
+// 拿到硬数据后再决定治理哪个块,避免凭代码直觉修错目标。
+static PERF_TX: std::sync::OnceLock<std::sync::mpsc::Sender<String>> = std::sync::OnceLock::new();
+
+fn perf_tx() -> &'static std::sync::mpsc::Sender<String> {
+    PERF_TX.get_or_init(|| {
+        let path = session::data_dirs().app_data.join("perf.log");
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            while let Ok(line) = rx.recv() {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+        });
+        tx
+    })
+}
+
+/// 记一个主线程同步块的耗时(>3ms 才记,避免刷屏)。`n` 是该块处理的规模(条目/字节/诊断数)。
+pub(crate) fn perf_mark(block: &str, elapsed: std::time::Duration, n: usize) {
+    let ms = elapsed.as_secs_f64() * 1000.0;
+    if ms < 3.0 {
+        return;
+    }
+    let ts_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let line = format!("{{\"ts_ms\":{ts_ms},\"block\":{block:?},\"ms\":{ms:.1},\"n\":{n}}}\n");
+    let _ = perf_tx().send(line);
+}
+
 /// 目录树根节点 → 树控件 items(根本身不显示,显示其 children;无 children 则把根当单项)。
 fn tree_items_from_node(
     node: &nib_core::fs::FileNode,
@@ -740,19 +783,27 @@ impl Workbench {
         }
 
         self.reload_tree(cx);
+        let t_marks = Instant::now();
         self.refresh_git_marks(cx);
+        perf_mark("load_project.refresh_git_marks", t_marks.elapsed(), 0);
         let git_root = self.project_root.clone();
+        let t_git = Instant::now();
         self.git_panel
             .update(cx, |panel, cx| panel.set_project(git_root.clone(), cx));
+        perf_mark("load_project.git_panel.set_project", t_git.elapsed(), 0);
+        let t_mvn = Instant::now();
         self.maven_panel
             .update(cx, |panel, cx| panel.set_project(git_root, cx));
+        perf_mark("load_project.maven_panel.set_project", t_mvn.elapsed(), 0);
 
         // 检测到 Maven 工程但未配置 Maven → 主动弹提醒去设置(内网 amaven 工程依赖
         // 解析常需指定 settings.xml/私服;不主动提示用户不知道要去哪配)。
         self.maybe_prompt_maven_config(cx);
 
         // quick-open / 文本跳转兜底用的文件清单:加载时预载,结构变化时也走同一方法刷新
+        let t_files = Instant::now();
         self.refresh_all_files(cx);
+        perf_mark("load_project.refresh_all_files", t_files.elapsed(), 0);
 
         // 后台预热其余已开项目的目录树缓存 → 之后切到它们直接命中即时出树(大仓 depth-64 全量
         // 遍历要数秒,不预热则每个项目首次切入都要空窗等遍历)。
@@ -849,16 +900,21 @@ impl Workbench {
         // 命中缓存 → 立即出树(切项目瞬间不空窗/不陈旧);未命中(项目首开)→ 先清空,
         // 避免显示上一个项目的陈旧树。两种情况下面都会后台 walk 刷新。
         let cached = self.tree_cache.get(&root).cloned();
+        let t_build = Instant::now();
         let items = match &cached {
             Some(node) => tree_items_from_node(node, &expanded),
             None => Vec::new(),
         };
+        let n_items = items.len();
+        perf_mark("reload_tree.cache.build_items", t_build.elapsed(), n_items);
+        let t_set = Instant::now();
         self.tree_state.update(cx, |state, cx| {
             state.set_items(items, cx);
             if let Some((id, title)) = &active_item {
                 state.set_selected_item(Some(&TreeItem::new(id.clone(), title.clone())), cx);
             }
         });
+        perf_mark("reload_tree.cache.set_items", t_set.elapsed(), n_items);
         cx.notify();
 
         let tree_for_load = self.tree_state.clone();
@@ -893,13 +949,18 @@ impl Workbench {
             if !still_current {
                 return;
             }
+            let t_build = Instant::now();
             let items = tree_items_from_node(&node, &expanded);
+            let n_items = items.len();
+            perf_mark("reload_tree.bg.build_items", t_build.elapsed(), n_items);
+            let t_set = Instant::now();
             tree_for_load.update(cx, |state, cx| {
                 state.set_items(items, cx);
                 if let Some((id, title)) = active_item {
                     state.set_selected_item(Some(&TreeItem::new(id, title)), cx);
                 }
             });
+            perf_mark("reload_tree.bg.set_items", t_set.elapsed(), n_items);
             // set_items 只 notify tree_state(其 observe 仅处理选中变化)→ 显式 notify Workbench 重渲读新节点。
             let _ = weak.update(cx, |_, cx| cx.notify());
         })
@@ -1147,9 +1208,13 @@ impl Workbench {
         }
         self.tabs[tab_ix].diag_sig = sig;
         self.mark_op(format!("LSP诊断 {}", self.tabs[tab_ix].title));
+        let n_diag = params.diagnostics.len();
         self.tabs[tab_ix].editor.update(cx, |state, cx| {
+            let t_clone = Instant::now();
             let text = state.text().clone();
+            perf_mark("diag.text_clone", t_clone.elapsed(), text.len());
             if let Some(set) = state.diagnostics_mut() {
+                let t_reset = Instant::now();
                 set.reset(&text);
                 for d in &params.diagnostics {
                     let mut diag = gpui_component::highlighter::Diagnostic::new(
@@ -1161,6 +1226,7 @@ impl Workbench {
                     }
                     set.push(diag);
                 }
+                perf_mark("diag.reset+push", t_reset.elapsed(), n_diag);
             }
             cx.notify();
         });
@@ -3841,6 +3907,10 @@ impl Workbench {
 
         v_flex()
             .h(px(self.terminal_height))
+            // 宽度锁到编辑器列(w_full+min_w_0):终端卡片不被内部网格内容撑宽,
+            // 避免 ls -R 突发输出时把编辑器列宽推得逐帧左右抽动。
+            .w_full()
+            .min_w_0()
             .relative()
             // [§G] 终端=独立圆角卡片(原 border_top 改整圈边框圆角);不 overflow_hidden
             // 以保顶部 resize 把手 top(-2.5) 落在 8px 间隙里可拖。

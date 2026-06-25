@@ -382,7 +382,10 @@ impl TerminalPanel {
                 nib_core::dock::bump_badge();
             }
             if tab.session.take_dirty() {
+                let t_snap = std::time::Instant::now();
                 tab.snap = tab.session.snapshot();
+                let (cols, rows) = tab.grid;
+                crate::perf_mark("term.snapshot", t_snap.elapsed(), cols as usize * rows as usize);
                 tab.exited = tab.session.is_exited();
                 dirtied = Some(tab.name.clone());
                 cx.notify();
@@ -702,6 +705,10 @@ impl Render for TerminalPanel {
                     .id("term-grid")
                     .flex_1()
                     .min_h_0()
+                    // 宽度锁到父容器(不被终端行内容撑宽):ls -R 等突发输出时,行内容
+                    // 即便宽于卡片也由 overflow_hidden 裁掉,不再逐帧把编辑器列推得左右抽动。
+                    .w_full()
+                    .min_w_0()
                     .relative()
                     .px(px(5.))
                     .py(px(4.))

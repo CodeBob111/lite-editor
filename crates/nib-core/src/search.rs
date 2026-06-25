@@ -45,6 +45,15 @@ pub async fn search_in_files(
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(12);
         WalkBuilder::new(&project_path)
             .hidden(false) // 隐藏文件照常搜(.env/.github);.git 等由 should_skip 兜
+            // 不尊重 .gitignore:与文件树(read_dir_tree 只看 should_skip)保持一致。
+            // 否则「壳仓库」工程(rate-native 的 .gitignore 忽略 /rateplatform/ 等嵌套子仓)
+            // 在树里能看到、内容搜索却 0 结果,完全反直觉。可见性单一真源 = should_skip。
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false)
+            .require_git(false)
             .filter_entry(|e| !should_skip(&e.file_name().to_string_lossy()))
             .threads(threads)
             .build_parallel()
