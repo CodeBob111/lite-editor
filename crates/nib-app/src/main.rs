@@ -433,6 +433,9 @@ struct Workbench {
     md_split_state: Entity<ResizableState>,
     /// md 预览滚动句柄:预览按标题分段渲染为子元素,点锚点 → scroll_to_top_of_item 滚到该段
     md_scroll: ScrollHandle,
+    /// 编辑器标签栏横向滚动句柄:标签多到溢出时,激活某标签自动把它滚进可见区,
+    /// 避免活动标签被滚出视野(A3 的 overflow_x_scroll+min_w 引入的可视性问题)。
+    tab_scroll: ScrollHandle,
     terminal: Option<Entity<TerminalPanel>>,
     terminal_visible: bool,
     /// 底部面板当前 tab(问题/终端/输出)
@@ -625,6 +628,7 @@ impl Workbench {
             md_preview: false,
             md_split_state: cx.new(|_| ResizableState::default()),
             md_scroll: ScrollHandle::new(),
+            tab_scroll: ScrollHandle::new(),
             terminal: None,
             terminal_visible: false,
             panel_tab: PanelTab::Terminal,
@@ -1911,6 +1915,9 @@ impl Workbench {
         let label = format!("切换标签 {}", self.tabs[ix].title);
         self.mark_op(label);
         self.active_tab = Some(ix);
+        // 标签多到溢出滚动时,把刚激活的标签滚进可见区(否则活动标签可能在视野外,
+        // 出现「看到的标签 ≠ 面包屑/正文」的错位)。
+        self.tab_scroll.scroll_to_item(ix);
         self.tabs[ix].last_used = Instant::now();
         let path = self.tabs[ix].path.clone();
         let title = self.tabs[ix].title.clone();
@@ -4761,6 +4768,7 @@ impl Render for Workbench {
                                         .gap(px(5.))
                                         .px(px(6.))
                                         .overflow_x_scroll()
+                                        .track_scroll(&self.tab_scroll)
                                         .border_b_1()
                                         .border_color(cx.theme().border)
                                         .children(self.tabs.iter().enumerate().map(
@@ -4771,7 +4779,10 @@ impl Render for Workbench {
                                     this.child(self.render_breadcrumb(&tab.path, cx))
                                 })
                             })
-                            .child(div().flex_1().min_h_0().map(|this| {
+                            // w_full+min_w_0:在 §G 编辑器卡片(overflow_hidden)内锁定宽度,
+                            // 否则 md 预览的 h_resizable(两栏各 560)按内容宽 1120 渲染、被卡片裁掉,
+                            // 预览栏「闪一下就被压成 0」。锁宽后 resizable 在卡片宽内正常二分。
+                            .child(div().flex_1().min_h_0().w_full().min_w_0().map(|this| {
                                 match self.active() {
                                     Some(tab) => {
                                         // markdown 文件:右键菜单加"预览"项(标签随当前预览开关变化)
