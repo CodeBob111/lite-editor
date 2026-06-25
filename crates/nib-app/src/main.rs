@@ -1218,10 +1218,13 @@ impl Workbench {
         let x = f32::from(event.position.x);
         let y = f32::from(event.position.y);
         match kind {
-            Resizing::Sidebar => self.sidebar_width = (x - ACTIVITY_WIDTH).clamp(160., 520.),
-            // 终端高 = 视口高 - 状态栏(24) - 光标 y
+            // 侧栏宽 = 光标 x - 活动栏(48) - §G work 容器左内边距(8);卡片左缘据此对齐光标。
+            Resizing::Sidebar => {
+                self.sidebar_width = (x - ACTIVITY_WIDTH - 8.).clamp(160., 520.)
+            }
+            // 终端高 = 视口高 - 状态栏(24) - §G work 容器下内边距(8) - 光标 y。
             Resizing::Terminal => {
-                self.terminal_height = (f32::from(vp.height) - 24. - y).clamp(120., 640.)
+                self.terminal_height = (f32::from(vp.height) - 24. - 8. - y).clamp(120., 640.)
             }
         }
         cx.notify();
